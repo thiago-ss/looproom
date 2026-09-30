@@ -5,6 +5,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { access, mkdir, realpath, stat, readFile } from "node:fs/promises";
 import { z } from "zod";
+import { chooseFolder, droppedFolder } from "./folders.ts";
 import { Store } from "./store.ts";
 import { Runtime } from "./runtime.ts";
 import { Engine } from "./engine.ts";
@@ -308,6 +309,29 @@ const profile = z.object({
   model: z.string().regex(/^gpt-[\w.-]+$/),
   effort: z.enum(["low", "medium", "high", "xhigh", "max"]),
 });
+app.post(
+  "/api/folders/choose",
+  route(async (req, res) => {
+    const body = z
+      .object({ initial: z.string().max(4096).optional() })
+      .parse(req.body);
+    res.json({ path: await chooseFolder(appRoot, dataDir, body.initial) });
+  }),
+);
+app.post(
+  "/api/folders/drop",
+  route(async (req, res) => {
+    const body = z
+      .object({
+        names: z.array(z.string().max(255)).min(1).max(1),
+        uri: z.string().max(4096).optional(),
+      })
+      .parse(req.body);
+    res.json({
+      path: await droppedFolder(appRoot, dataDir, body.names, body.uri),
+    });
+  }),
+);
 app.post(
   "/api/settings",
   route((req, res) => {

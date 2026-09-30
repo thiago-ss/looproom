@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "component-docs": {
+      "source": "arla6ka/skills",
+      "sourceType": "github",
+      "skillPath": "skills/component-docs/SKILL.md",
+      "computedHash": "07fe2f9d4c3bfe439144a39e47dc7376d870cddd8318574d19b44c8b3c050a25"
+    },
+    "migrate-design-system": {
+      "source": "arla6ka/skills",
+      "sourceType": "github",
+      "skillPath": "skills/migrate-design-system/SKILL.md",
+      "computedHash": "5cd63b6a004edbc58ab6ce1f8cc18b8542287505e9685ce5be546c810aae4329"
+    }
+  }
+}

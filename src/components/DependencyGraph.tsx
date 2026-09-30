@@ -1,4 +1,6 @@
+import { Button } from "./ui/button";
 import StatusMark from "./ui/StatusMark";
+import { frontierState, frontierLabel } from "../lib/work";
 
 type Task = {
   id: string;
@@ -86,7 +88,8 @@ export default function DependencyGraph({
         {tasks.map((task) => {
           const position = positions.get(task.id)!;
           return (
-            <button
+            <Button
+              variant="ghost"
               key={task.id}
               className="dependency-node"
               style={{ left: position.x, top: position.y }}
@@ -107,13 +110,15 @@ export default function DependencyGraph({
               <span>
                 <strong>{task.title}</strong>
                 <small>
-                  {task.status.replaceAll("_", " ")} ·{" "}
+                  {frontierLabel(frontierState(task, tasks))} ·{" "}
                   {task.dependencies.length
-                    ? "depends on " + task.dependencies.length + " tasks"
-                    : "ready frontier"}
+                    ? "depends on " +
+                      task.dependencies.length +
+                      (task.dependencies.length === 1 ? " task" : " tasks")
+                    : "no prerequisites"}
                 </small>
               </span>
-            </button>
+            </Button>
           );
         })}
       </div>

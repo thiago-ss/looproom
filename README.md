@@ -6,7 +6,7 @@ A local macOS workspace for continuous, goal-directed agent work. Give a project
 
 ## Run
 
-Requires macOS, Node **22.13 or later**, Git, Codex CLI with named permission profiles (developed against **0.159.2**), and GitHub CLI for publishing PRs. Keep the requested models available on your ChatGPT account.
+Requires macOS, Node **22.13 or later**, Git, Codex CLI with named permission profiles (developed against **0.159.2**), Apple Command Line Tools for compiling the native folder picker, and GitHub CLI for publishing PRs. Keep the requested models available on your ChatGPT account.
 
 ```sh
 npm ci
@@ -46,10 +46,16 @@ Publishing requires a GitHub `origin` remote, an existing base branch on that re
 
 - **Goal:** persistent conversation, current work and contextual decisions.
 - **Work:** tasks, acceptance evidence and the actual dependency graph.
-- **Agent room:** role identities, real idle/thinking orb states and recorded handoffs.
+- **Agent room:** four distinct Orbkit identities in a selectable workflow map, live role inspector, task links and recorded handoffs.
 - **Review:** decision queue, PR diff/checks/reviewer evidence and revision approval.
-- **Memory:** project-scoped SQLite FTS5 search and source-linked outcome pages.
-- **Settings:** connection, model profiles, project boundaries/checks and pause/stop.
+- **Memory:** project-scoped SQLite FTS5 search, compact outcome library, Markdown reading pane and cited-source connections.
+- **Settings:** connection, shadcn model controls, project boundaries/checks, escalation sound and opt-in desktop alerts. A decision inbox remains available in the header.
+
+## Folder selection and alerts
+
+Choose folder opens a native macOS NSOpenPanel. Finder drops pass only folder names/URLs to the authenticated local broker; it resolves the drag pasteboard without uploading folder contents. Browsers that conceal the dropped path open the native picker as confirmation. New projects choose a parent folder and an editable new child path. Cancel preserves the draft. The small Swift helper is compiled locally on first use and cached by source hash in application data; it is not a signed distribution package.
+
+New open gates produce a Sonner toast with a Review action and a two-note Web Audio chime after browser audio is unlocked by interaction. The persistent header inbox shows all open decisions. Desktop notifications are opt-in in Settings and need browser permission; unsupported/blocked browsers retain inbox and sound. Keep the app and coordinator open. Preferences and delivered-gate IDs are saved for this browser; history does not replay on startup, and Web Locks deduplicate alerts across supported same-origin tabs.
 
 ## Execution and memory
 
@@ -65,6 +71,7 @@ Workflow adaptation and exact v0 boundaries: [Looproom v1](docs/workflows/loopro
 
 ```sh
 npm test
+npm run check:ui
 npm run build
 ```
 
@@ -76,4 +83,6 @@ Native independent review and PR round-trip; parallel task workers inside a proj
 
 ## License
 
-Looproom's original code is MIT. Incorporated third-party UI has separate terms: **ReactBits MIT + Commons Clause**, **DotMatrix custom product-use license**, and **Orbkit Hydrogen MIT**. This repository incorporates those sources as application UI, not a standalone component library. See [third-party notices](THIRD_PARTY.md) and `licenses/` before redistribution.
+Looproom's original code is MIT. Incorporated third-party UI has separate terms: **ReactBits MIT + Commons Clause**, **DotMatrix custom product-use license**, and **Orbkit original shaders MIT**. This repository incorporates those sources as application UI, not a standalone component library. See [third-party notices](THIRD_PARTY.md) and `licenses/` before redistribution.
+
+Goal fills the viewport and scrolls within the conversation. Work offers a grouped frontier/search and dependency graph; Review offers decision dossiers and revision-bound confirmation. All interactive form controls and disclosures use the shared shadcn layer.

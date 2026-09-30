@@ -2,6 +2,7 @@ import {
   lazy,
   Suspense,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
@@ -30,6 +31,27 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "./components/ui/button";
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from "./components/ui/select";
+import { Checkbox } from "./components/ui/checkbox";
+import {
+  Collapsible,
+  CollapsibleTrigger,
+  CollapsibleContent,
+} from "./components/ui/collapsible";
+import FolderPicker from "./components/FolderPicker";
+
+import {
+  NotificationCenter,
+  NotificationSettings,
+  useEscalations,
+} from "./components/Notifications";
+import { Toaster } from "./components/ui/sonner";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
 import {
@@ -43,9 +65,18 @@ import {
 import { DotmSquare3 } from "./components/ui/dotm-square-3";
 import Stepper, { Step } from "./components/ui/Stepper";
 import StatusMark from "./components/ui/StatusMark";
-import DependencyGraph from "./components/DependencyGraph";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
+import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from "./components/ui/popover";
+import Work from "./components/Work";
+import { frontierState, frontierLabel } from "./lib/work";
 import { api, type Data } from "./lib/api";
 
+const Memory = lazy(() => import("./components/Memory"));
+const Room = lazy(() => import("./components/AgentRoom"));
 const AgentOrb = lazy(() => import("./components/AgentOrb"));
 type View = "goal" | "work" | "room" | "review" | "memory" | "settings";
 const NAV = [
@@ -201,6 +232,10 @@ export default function App() {
       setBusy(false);
     }
   }
+  useEscalations(data?.gates, data?.projects, (projectId: string) => {
+    setSelectedId(projectId);
+    setView("review");
+  });
   if (!data)
     return (
       <main className="boot">
@@ -225,7 +260,10 @@ export default function App() {
     );
   const active = runs.filter((run) => run.status === "running");
   return (
-    <div className="app">
+    <div
+      className={"app" + (!onboarding && view === "goal" ? " goal-view" : "")}
+    >
+      <Toaster position="bottom-right" closeButton />
       {onboarding ? (
         <Onboarding
           data={data}
@@ -255,24 +293,28 @@ export default function App() {
             <label className="sr-only" htmlFor="project-picker">
               Project
             </label>
-            <select
-              id="project-picker"
+            <Select
               value={project?.id ?? ""}
-              onChange={(event) => {
-                setSelectedId(event.target.value);
+              onValueChange={(id) => {
+                setSelectedId(id);
                 setView("goal");
               }}
-              className="project-picker"
             >
-              {data.projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger id="project-picker" className="project-picker">
+                <SelectValue placeholder="Choose project" />
+              </SelectTrigger>
+              <SelectContent>
+                {data.projects.map((project) => (
+                  <SelectItem key={project.id} value={project.id}>
+                    {project.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <nav aria-label="Workspace">
               {NAV.map((item) => (
-                <button
+                <Button
+                  variant="ghost"
                   key={item.id}
                   className={view === item.id ? "selected" : ""}
                   onClick={() => setView(item.id)}
@@ -283,13 +325,17 @@ export default function App() {
                   {item.id === "review" && gates.length ? (
                     <span className="nav-count">{gates.length}</span>
                   ) : null}
-                </button>
+                </Button>
               ))}
             </nav>
-            <button className="new-project" onClick={() => setOnboarding(true)}>
+            <Button
+              variant="ghost"
+              className="new-project"
+              onClick={() => setOnboarding(true)}
+            >
               <Plus size={16} />
               New project
-            </button>
+            </Button>
             <div className="sidebar-bottom">
               <p>
                 <span
@@ -304,19 +350,22 @@ export default function App() {
                   ? "ChatGPT connected"
                   : "Account needed"}
               </p>
-              <button
+              <Button
+                variant="ghost"
                 onClick={() => setView("settings")}
                 className={view === "settings" ? "selected" : ""}
               >
                 <Settings2 size={17} />
                 Settings
-              </button>
+              </Button>
               <div className="local-label">
                 Local on this Mac <ShieldCheck size={13} />
               </div>
             </div>
           </aside>
-          <main className="workspace">
+          <main
+            className={"workspace" + (view === "goal" ? " goal-workspace" : "")}
+          >
             <header className="topbar">
               <div className="breadcrumb">
                 <FolderGit2 size={16} />
@@ -326,6 +375,14 @@ export default function App() {
                   {NAV.find((item) => item.id === view)?.label ?? "Settings"}
                 </span>
               </div>
+              <NotificationCenter
+                gates={data.gates}
+                projects={data.projects}
+                onOpen={(id: string) => {
+                  setSelectedId(id);
+                  setView("review");
+                }}
+              />
               {project ? (
                 <div className="project-controls">
                   <span className={"status " + project.status}>
@@ -358,7 +415,8 @@ export default function App() {
             {error || connectionError ? (
               <div className="error-banner" role="alert">
                 <span>{error || connectionError}</span>
-                <button
+                <Button
+                  variant="ghost"
                   aria-label="Dismiss error"
                   onClick={() => {
                     setError("");
@@ -366,7 +424,7 @@ export default function App() {
                   }}
                 >
                   <X size={16} />
-                </button>
+                </Button>
               </div>
             ) : null}
             {!project ? (
@@ -382,6 +440,7 @@ export default function App() {
               <>
                 {view === "goal" ? (
                   <Goal
+                    key={project.id}
                     project={project}
                     messages={messages}
                     active={active}
@@ -397,14 +456,17 @@ export default function App() {
                   <Work tasks={tasks} onSelect={setInspect} />
                 ) : null}
                 {view === "room" ? (
-                  <Room
-                    runs={runs}
-                    tasks={tasks}
-                    settings={data.settings}
-                    events={data.events.filter(
-                      (event) => event.project_id === project.id,
-                    )}
-                  />
+                  <Suspense fallback={<Pending label="Opening agent room" />}>
+                    <Room
+                      runs={runs}
+                      tasks={tasks}
+                      settings={data.settings}
+                      onSelectTask={setInspect}
+                      events={data.events.filter(
+                        (event) => event.project_id === project.id,
+                      )}
+                    />
+                  </Suspense>
                 ) : null}
                 {view === "review" ? (
                   <ReviewInbox
@@ -415,12 +477,15 @@ export default function App() {
                   />
                 ) : null}
                 {view === "memory" ? (
-                  <Memory
-                    project={project}
-                    pages={data.memory.filter(
-                      (page) => page.projectId === project.id,
-                    )}
-                  />
+                  <Suspense fallback={<Pending label="Opening memory" />}>
+                    <Memory
+                      key={project.id}
+                      project={project}
+                      pages={data.memory.filter(
+                        (page) => page.projectId === project.id,
+                      )}
+                    />
+                  </Suspense>
                 ) : null}
                 {view === "settings" ? (
                   <Settings
@@ -442,6 +507,7 @@ export default function App() {
             ? (data.tasks.find((task) => task.id === inspect.id) ?? inspect)
             : null
         }
+        tasks={data.tasks}
         onClose={() => setInspect(null)}
       />
     </div>
@@ -639,33 +705,30 @@ function Onboarding({
                 <p>Open a repository or start a new project.</p>
               </div>
               <div className="mode-picker">
-                <button
+                <Button
+                  variant="ghost"
                   className={draft.mode === "existing" ? "active" : ""}
                   onClick={() => update("mode", "existing")}
                 >
                   Existing repository
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="ghost"
                   className={draft.mode === "new" ? "active" : ""}
                   onClick={() => update("mode", "new")}
                 >
                   New project
-                </button>
+                </Button>
               </div>
               <label htmlFor="repo-path">
                 {draft.mode === "new"
                   ? "New project folder"
                   : "Repository folder"}
               </label>
-              <Input
-                id="repo-path"
-                autoFocus
-                placeholder="/Users/you/Projects/my-app"
+              <FolderPicker
                 value={draft.path}
-                onChange={(event) => update("path", event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void inspect();
-                }}
+                onChange={(path) => update("path", path)}
+                mode={draft.mode}
               />
               <Button
                 variant="outline"
@@ -735,7 +798,9 @@ function Onboarding({
                   <a href={authUrl} target="_blank" rel="noreferrer">
                     Open sign-in again
                   </a>
-                  <button onClick={refresh}>I’ve signed in · Refresh</button>
+                  <Button variant="ghost" onClick={refresh}>
+                    I’ve signed in · Refresh
+                  </Button>
                 </p>
               ) : null}
               <div className="model-summary">
@@ -759,11 +824,10 @@ function Onboarding({
               ) : null}
               {account?.type !== "chatgpt" ? (
                 <label className="connect-later">
-                  <input
-                    type="checkbox"
+                  <Checkbox
                     checked={draft.connectLater}
-                    onChange={(event) =>
-                      update("connectLater", event.target.checked)
+                    onCheckedChange={(checked) =>
+                      update("connectLater", checked === true)
                     }
                   />
                   Set up my account later
@@ -864,10 +928,26 @@ function Goal({
   openTask,
 }: any) {
   const [text, setText] = useState("");
-  const end = useRef<HTMLDivElement>(null);
+  const chat = useRef<HTMLDivElement>(null);
+  const flow = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  const [showLatest, setShowLatest] = useState(false);
+  function latest() {
+    if (chat.current) chat.current.scrollTop = chat.current.scrollHeight;
+    follow.current = true;
+    setShowLatest(false);
+  }
+  useLayoutEffect(latest, []);
+  useLayoutEffect(() => {
+    if (follow.current) latest();
+  }, [messages.length, gates.length, active.length]);
   useEffect(() => {
-    end.current?.scrollIntoView({ behavior: "instant", block: "end" });
-  }, [messages.length]);
+    const observer = new ResizeObserver(() => {
+      if (follow.current) latest();
+    });
+    if (flow.current) observer.observe(flow.current);
+    return () => observer.disconnect();
+  }, []);
   function send(event: FormEvent) {
     event.preventDefault();
     if (!text.trim()) return;
@@ -875,8 +955,18 @@ function Goal({
     void act(async () => {
       await api("/projects/" + project.id + "/messages", { text: value });
       setText("");
+      latest();
     });
   }
+  const context = (
+    <GoalContext
+      project={project}
+      tasks={tasks}
+      gates={gates}
+      active={active}
+      openTask={openTask}
+    />
+  );
   return (
     <div className="goal-layout">
       <section className="conversation">
@@ -887,88 +977,132 @@ function Goal({
             <span>·</span>
             <span>Goal conversation</span>
           </div>
-          <h1>{project.name}</h1>
+          <div className="goal-title-row">
+            <h1>{project.name}</h1>
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button variant="outline" size="sm" className="context-toggle">
+                  <Layers3 size={14} />
+                  Context
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="goal-context-popover">
+                {context}
+              </PopoverContent>
+            </Popover>
+          </div>
           <p>Move the goal forward. Keep the evidence close.</p>
         </div>
-        <div className="messages">
-          {messages.map((message: any) => (
-            <article key={message.id} className={"message " + message.role}>
-              <div className="message-byline">
-                {message.role === "human" ? (
-                  <span className="human-avatar">You</span>
-                ) : (
-                  <img src="/brand/looproom-mark.svg" alt="" />
-                )}
-                <strong>
-                  {message.role === "human" ? "You" : "Orchestrator"}
-                </strong>
-                <DateLabel date={message.createdAt} />
-              </div>
-              <div className="message-body">{message.text}</div>
-            </article>
-          ))}
-          {active.map((run: any) => (
-            <article key={run.id} className="message live">
-              <div className="message-byline">
-                <Orb active size={34} identity={run.role} />
-                <strong>{run.role}</strong>
-                <span className="live-label">Thinking</span>
-              </div>
-              <div className="message-body">
-                <Pending
-                  label={
-                    run.activity === "fileChange"
-                      ? "Updating the assigned worktree"
-                      : run.activity === "commandExecution"
-                        ? "Running a command in the project"
-                        : run.activity === "webSearch"
-                          ? "Checking source evidence"
-                          : run.role === "orchestrator"
-                            ? "Reading the project and finding the first useful step"
-                            : "Working on the assigned task"
+        <div
+          className="messages"
+          ref={chat}
+          tabIndex={0}
+          aria-label="Goal conversation"
+          onScroll={() => {
+            const element = chat.current!;
+            follow.current =
+              element.scrollHeight - element.scrollTop - element.clientHeight <
+              64;
+            setShowLatest(!follow.current);
+          }}
+        >
+          <div className="conversation-flow" ref={flow}>
+            {messages.map((message: any) => (
+              <article key={message.id} className={"message " + message.role}>
+                <div className="message-byline">
+                  {message.role === "human" ? (
+                    <span className="human-avatar">You</span>
+                  ) : (
+                    <img src="/brand/looproom-mark.svg" alt="" />
+                  )}
+                  <strong>
+                    {message.role === "human" ? "You" : "Orchestrator"}
+                  </strong>
+                  <DateLabel date={message.createdAt} />
+                </div>
+                <div className="message-body">{message.text}</div>
+              </article>
+            ))}
+            {active.map((run: any) => (
+              <article key={run.id} className="message live">
+                <div className="message-byline">
+                  <Orb active size={34} identity={run.role} />
+                  <strong>{run.role}</strong>
+                  <span className="live-label">Thinking</span>
+                </div>
+                <div className="message-body">
+                  <Pending
+                    label={
+                      run.activity === "fileChange"
+                        ? "Updating the assigned worktree"
+                        : run.activity === "commandExecution"
+                          ? "Running a command in the project"
+                          : run.activity === "webSearch"
+                            ? "Checking source evidence"
+                            : run.role === "orchestrator"
+                              ? "Reading the project and finding the first useful step"
+                              : "Working on the assigned task"
+                    }
+                  />
+                </div>
+              </article>
+            ))}
+            {!active.length && !tasks.length ? (
+              <div className="first-step">
+                <h2>Your goal is ready.</h2>
+                <p>
+                  Start the loop to get a sourced plan. Agents will implement in
+                  worktrees and bring PRs back here for review.
+                </p>
+                <Button
+                  disabled={busy}
+                  onClick={() =>
+                    act(() =>
+                      api("/projects/" + project.id + "/control", {
+                        action: "start",
+                      }),
+                    )
                   }
-                />
+                >
+                  <Play size={14} />
+                  Start planning
+                </Button>
               </div>
-            </article>
-          ))}
-          {!active.length && !tasks.length ? (
-            <div className="first-step">
-              <h2>Your goal is ready.</h2>
-              <p>
-                Start the loop to get a sourced plan. Agents will implement in
-                worktrees and bring PRs back here for review.
-              </p>
-              <Button
-                disabled={busy}
-                onClick={() =>
-                  act(() =>
-                    api("/projects/" + project.id + "/control", {
-                      action: "start",
-                    }),
-                  )
-                }
-              >
-                <Play size={14} />
-                Start planning
-              </Button>
-            </div>
-          ) : null}
-          {gates.length ? (
-            <button className="inline-gate" onClick={openReview}>
-              <span className="gate-square" />
-              <div>
+            ) : null}
+            {gates.length ? (
+              <div className="chat-gate">
+                <div className="chat-gate-label">
+                  <span className="gate-square" /> Human decision ·{" "}
+                  {gates.length} open
+                </div>
                 <strong>
                   {gates.length === 1
                     ? gates[0].title
-                    : gates.length + " decisions need you"}
+                    : `${gates.length} decisions need your judgment`}
                 </strong>
-                <p>{gates[0].detail?.slice(0, 160)}</p>
+                <p>
+                  {gates[0].detail?.slice(0, 180)}
+                  {gates[0].detail?.length > 180 ? "…" : ""}
+                </p>
+                <Button variant="outline" size="sm" onClick={openReview}>
+                  Review decision
+                  <ArrowRight size={14} />
+                </Button>
               </div>
-              <ArrowRight size={17} />
-            </button>
-          ) : null}
-          <div ref={end} />
+            ) : null}
+          </div>
         </div>
+        {showLatest ? (
+          <Button
+            className="latest-message"
+            variant="secondary"
+            size="sm"
+            onClick={latest}
+          >
+            <ArrowDown size={14} />
+            Latest messages
+          </Button>
+        ) : null}
         <form className="composer" onSubmit={send}>
           <label className="sr-only" htmlFor="message">
             Message your agents
@@ -993,252 +1127,79 @@ function Goal({
           </div>
         </form>
       </section>
-      <aside className="goal-context">
-        <h2>In motion</h2>
-        {active.length ? (
-          active.map((run: any) => (
-            <div className="context-agent" key={run.id}>
-              <Orb active />
-              <div>
-                <strong>{run.role}</strong>
-                <span>{run.model}</span>
-                <small>{run.effort} reasoning</small>
-              </div>
-            </div>
-          ))
-        ) : (
-          <p className="muted">
-            Agents are{" "}
-            {project.status === "paused"
-              ? "paused"
-              : gates.length
-                ? "waiting at a gate"
-                : "idle"}
-            .
-          </p>
-        )}
-        <div className="context-heading">
-          <h2>Work frontier</h2>
-          <span>
-            {tasks.filter((task: any) => task.status === "completed").length} /{" "}
-            {tasks.length}
-          </span>
-        </div>
-        {tasks.length ? (
-          tasks.slice(-6).map((task: any) => (
-            <button
-              className="context-task"
-              onClick={() => openTask(task)}
-              key={task.id}
-            >
-              <StatusMark
-                status={glyph(task.status)}
-                size={17}
-                label=""
-                color="#167a72"
-                doneColor="#25724b"
-              />
-              <div>
-                <strong>{task.title}</strong>
-                <span>{statusText(task.status)}</span>
-              </div>
-            </button>
-          ))
-        ) : (
-          <p className="muted">
-            The first plan will create a small set of useful tasks.
-          </p>
-        )}
-        <div className="context-authority">
-          <Square size={13} />
-          <p>
-            Human approval
-            <br />
-            <strong>Required for every merge</strong>
-          </p>
-        </div>
-      </aside>
+      <div className="goal-context-rail">{context}</div>
     </div>
   );
 }
 
-function Work({
-  tasks,
-  onSelect,
-}: {
-  tasks: any[];
-  onSelect: (task: any) => void;
-}) {
-  const [view, setView] = useState("list");
+function GoalContext({ project, tasks, gates, active, openTask }: any) {
   return (
-    <section className="page">
-      <div className="page-heading">
-        <div>
-          <h1>Work</h1>
-          <p>Useful steps, explicit dependencies.</p>
-        </div>
-        <div className="mode-picker compact">
-          <button
-            className={view === "list" ? "active" : ""}
-            onClick={() => setView("list")}
-          >
-            List
-          </button>
-          <button
-            className={view === "graph" ? "active" : ""}
-            onClick={() => setView("graph")}
-          >
-            Dependencies
-          </button>
-        </div>
-      </div>
-      {!tasks.length ? (
-        <Empty
-          title="A plan comes first"
-          text="Start the goal loop. The orchestrator will turn the outcome into bounded, verifiable tasks."
-        />
-      ) : view === "graph" ? (
-        <DependencyGraph tasks={tasks} onSelect={onSelect} />
-      ) : (
-        <div className={"work-list " + view}>
-          <div className="work-header">
-            <span>Task</span>
-            <span>State</span>
-            <span>Dependencies</span>
-            <span>Evidence</span>
+    <aside className="goal-context">
+      <h2>In motion</h2>
+      {active.length ? (
+        active.map((run: any) => (
+          <div className="context-agent" key={run.id}>
+            <Orb active identity={run.role} />
+            <div>
+              <strong>{run.role}</strong>
+              <span>{run.model}</span>
+              <small>{run.effort} reasoning</small>
+            </div>
           </div>
-          {tasks.map((task) => (
-            <button
-              className="work-row"
-              key={task.id}
-              onClick={() => onSelect(task)}
-            >
-              <div className="work-title">
-                <StatusMark
-                  status={glyph(task.status)}
-                  label=""
-                  size={20}
-                  color="#167a72"
-                  doneColor="#25724b"
-                />
-                <div>
-                  <strong>{task.title}</strong>
-                  <small>
-                    {task.kind} · {task.id.slice(0, 8)}
-                  </small>
-                </div>
-              </div>
-              <span className={"status " + task.status}>
-                {statusText(task.status)}
-              </span>
-              <span className="dependencies">
-                {task.dependencies.length
-                  ? task.dependencies
-                      .map(
-                        (id: string) =>
-                          tasks.find((t) => t.id === id)?.title ?? id,
-                      )
-                      .join(" → ")
-                  : "Ready frontier"}
-              </span>
-              <span>
-                {task.pr ? (
-                  <>
-                    <GitPullRequest size={14} />
-                    PR ready
-                  </>
-                ) : task.checks?.length ? (
-                  task.checks.filter((c: any) => c.code === 0).length +
-                  " checks passed"
-                ) : (
-                  "—"
-                )}
-              </span>
-            </button>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function Room({ runs, tasks, settings, events }: any) {
-  const roles = ["orchestrator", "implementation", "review", "research"];
-  return (
-    <section className="page">
-      <div className="page-heading">
-        <div>
-          <h1>Agent room</h1>
-          <p>One shared goal. Clear ownership and handoffs.</p>
-        </div>
-        <span className="mono">Local runtime</span>
-      </div>
-      <div className="agent-room">
-        {roles.map((role) => {
-          const active = runs.find(
-            (r: any) => r.role === role && r.status === "running",
-          );
-          const latest = runs.filter((r: any) => r.role === role).at(-1);
-          const profile =
-            role === "orchestrator" ? settings.orchestrator : settings.subagent;
-          const task = tasks.find((t: any) => t.id === active?.taskId);
-          return (
-            <article className="agent-row" key={role}>
-              <Orb active={!!active} size={76} identity={role} />
-              <div className="agent-info">
-                <h2>{role[0].toUpperCase() + role.slice(1)}</h2>
-                <p>
-                  {task?.title ??
-                    (active
-                      ? "Researching the next useful step"
-                      : latest?.error
-                        ? "Last run needs attention"
-                        : "Waiting for assigned work")}
-                </p>
-                <span className="mono">
-                  {profile.model} · {profile.effort}
-                </span>
-              </div>
-              <span className={"status " + (active ? "running" : "idle")}>
-                <span />
-                {active ? "Thinking" : "Idle"}
-              </span>
-            </article>
-          );
-        })}
-      </div>
-      <div className="section-heading">
-        <h2>Handoffs and events</h2>
-        <span>Recorded by the coordinator</span>
-      </div>
-      {events.length ? (
-        <ol className="event-list">
-          {events.slice(0, 25).map((event: any) => (
-            <li key={event.seq}>
-              <span
-                className={
-                  event.type.includes("gate") ? "gate-square" : "event-dot"
-                }
-              />
-              <div>
-                <strong>{event.type.replaceAll("-", " ")}</strong>
-                <p>
-                  {event.data.title ??
-                    event.data.command ??
-                    event.data.summary ??
-                    event.data.role ??
-                    event.data.pr ??
-                    "Project state recorded"}
-                </p>
-              </div>
-              <DateLabel date={event.created_at} />
-            </li>
-          ))}
-        </ol>
+        ))
       ) : (
-        <p className="muted">Real handoffs will appear after the first run.</p>
+        <p className="muted">
+          Agents are{" "}
+          {project.status === "paused"
+            ? "paused"
+            : gates.length
+              ? "waiting at a gate"
+              : "idle"}
+          .
+        </p>
       )}
-    </section>
+      <div className="context-heading">
+        <h2>Work frontier</h2>
+        <span>
+          {tasks.filter((task: any) => task.status === "completed").length} /{" "}
+          {tasks.length}
+        </span>
+      </div>
+      {tasks.length ? (
+        tasks.slice(-6).map((task: any) => (
+          <Button
+            variant="ghost"
+            className="context-task"
+            onClick={() => openTask(task)}
+            key={task.id}
+          >
+            <StatusMark
+              status={glyph(task.status)}
+              size={17}
+              label=""
+              color="#167a72"
+              doneColor="#25724b"
+            />
+            <div>
+              <strong>{task.title}</strong>
+              <span>{frontierLabel(frontierState(task, tasks))}</span>
+            </div>
+          </Button>
+        ))
+      ) : (
+        <p className="muted">
+          The first plan will create a small set of useful tasks.
+        </p>
+      )}
+      <div className="context-authority">
+        <Square size={13} />
+        <p>
+          Human approval
+          <br />
+          <strong>Required for every merge</strong>
+        </p>
+      </div>
+    </aside>
   );
 }
 
@@ -1248,7 +1209,9 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
     [pr, setPr] = useState<any>(null),
     [diff, setDiff] = useState(""),
     [loadError, setLoadError] = useState(""),
-    [confirm, setConfirm] = useState(false),
+    [confirm, setConfirm] = useState<{ gateId: string; sha: string } | null>(
+      null,
+    ),
     [loading, setLoading] = useState(false);
   const gate = gates.find((gate: any) => gate.id === selected) ?? gates[0];
   const task = tasks.find((task: any) => task.id === gate?.taskId);
@@ -1257,6 +1220,8 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
     setDiff("");
     setAnswer("");
     setLoadError("");
+    setLoading(false);
+    setConfirm(null);
     if (!gate || gate.type !== "pr") return;
     let alive = true;
     setLoading(true);
@@ -1283,17 +1248,83 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
   if (!gates.length)
     return (
       <section className="page">
-        <h1>Review</h1>
-        <Empty
-          title="Nothing needs your judgment."
-          text="Agents will bring a decision here when they need your authority, access, or a PR merge."
-        />
+        <div className="page-heading">
+          <div>
+            <p className="eyebrow">Your judgment, at the right moment</p>
+            <h1>Review</h1>
+            <p>The decisions only you can make.</p>
+          </div>
+        </div>
+        <div className="review-clear">
+          <ShieldCheck size={40} />
+          <h2>Everything is clear.</h2>
+          <p>
+            Agents can keep moving. Access decisions and verified pull requests
+            will arrive here when your judgment is needed.
+          </p>
+          <div>
+            <span className="gate-square" /> Every merge still requires your
+            approval.
+          </div>
+        </div>
       </section>
     );
+  const response = (
+    <div className="decision-response">
+      <label htmlFor="gate-answer">
+        {gate.type === "pr" ? "Request changes" : "Your decision or resolution"}
+      </label>
+      <Textarea
+        id="gate-answer"
+        rows={3}
+        value={answer}
+        onChange={(event) => setAnswer(event.target.value)}
+        placeholder={
+          gate.type === "pr"
+            ? "Describe what should change before merging…"
+            : "Answer the question, or describe what you fixed…"
+        }
+      />
+      <div className="response-actions">
+        <Button
+          variant="outline"
+          disabled={busy || !answer.trim()}
+          onClick={() =>
+            act(() =>
+              api("/gates/" + gate.id + "/resolve", {
+                answer,
+                retry: true,
+              }),
+            )
+          }
+        >
+          {gate.type === "pr" ? "Request changes" : "Resolve & retry"}
+          <ArrowRight size={14} />
+        </Button>
+        {gate.taskId && gate.type !== "pr" ? (
+          <Button
+            variant="ghost"
+            disabled={busy || !answer.trim()}
+            onClick={() =>
+              act(() =>
+                api("/gates/" + gate.id + "/resolve", {
+                  answer,
+                  retry: false,
+                }),
+              )
+            }
+          >
+            Skip this task
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
   return (
     <section className="page review-page">
       <div className="page-heading">
         <div>
+          <p className="eyebrow">Your judgment, at the right moment</p>
           <h1>Review</h1>
           <p>
             {gates.length} {gates.length === 1 ? "decision" : "decisions"}{" "}
@@ -1307,21 +1338,31 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
       </div>
       <div className="review-layout">
         <div className="review-queue">
+          <div className="review-queue-label">
+            Decision inbox <span>{gates.length}</span>
+          </div>
           {gates.map((item: any) => (
-            <button
+            <Button
+              variant="ghost"
               key={item.id}
               className={item.id === gate.id ? "active" : ""}
+              aria-pressed={item.id === gate.id}
               onClick={() => setSelected(item.id)}
             >
               <span className="gate-square" />
               <div>
+                <small className="gate-kind">
+                  {item.type === "pr"
+                    ? "Pull request"
+                    : item.type.replaceAll("_", " ")}
+                </small>
                 <strong>{item.title}</strong>
                 <span>
                   {tasks.find((task: any) => task.id === item.taskId)?.title ??
                     "Project direction"}
                 </span>
               </div>
-            </button>
+            </Button>
           ))}
         </div>
         <article className="review-document">
@@ -1330,8 +1371,69 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
             <span>·</span>
             <DateLabel date={gate.createdAt} />
           </div>
-          <h2>{task?.title ?? gate.title}</h2>
-          <p className="review-summary">{gate.detail}</p>
+          <div className="dossier-heading">
+            <span className="gate-square" />
+            <span>Awaiting your decision</span>
+          </div>
+          <h2>{gate.title}</h2>
+          {task ? (
+            <p className="dossier-task">
+              <Layers3 size={14} />
+              {task.title}
+            </p>
+          ) : null}
+          <div
+            className="decision-brief"
+            tabIndex={0}
+            aria-label="Decision context"
+          >
+            <p className="review-summary">{gate.detail}</p>
+          </div>
+          {gate.type !== "pr" ? response : null}
+          {gate.type !== "pr" && task ? (
+            <Tabs
+              key={gate.id}
+              defaultValue="contract"
+              className="decision-evidence"
+            >
+              <TabsList variant="line">
+                <TabsTrigger value="contract">Task contract</TabsTrigger>
+                <TabsTrigger value="checks">Recorded checks</TabsTrigger>
+              </TabsList>
+              <TabsContent value="contract">
+                <p>{task.description}</p>
+                {task.acceptance?.length ? (
+                  <ul>
+                    {task.acceptance.map((criterion: string, index: number) => (
+                      <li key={index}>{criterion}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </TabsContent>
+              <TabsContent value="checks">
+                {task.checks?.length ? (
+                  <ul className="check-list">
+                    {task.checks.map((check: any, index: number) => (
+                      <li key={index}>
+                        <StatusMark
+                          status={check.code === 0 ? "done" : "failed"}
+                          label=""
+                          size={16}
+                        />
+                        <span className="mono">{check.command}</span>
+                        <span>Exit {check.code}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">
+                    No coordinator checks recorded yet. Agent reports do not
+                    replace verification.
+                  </p>
+                )}
+              </TabsContent>
+            </Tabs>
+          ) : null}
           {gate.type === "pr" ? (
             <>
               <a
@@ -1371,7 +1473,11 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                   <ul className="check-list">
                     {task?.checks?.map((check: any, i: number) => (
                       <li key={i}>
-                        <Check size={15} />
+                        <StatusMark
+                          status={check.code === 0 ? "done" : "failed"}
+                          size={15}
+                          label=""
+                        />
                         <span className="mono">{check.command}</span>
                         <span>Exit {check.code}</span>
                       </li>
@@ -1394,10 +1500,29 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                       </li>
                     ))}
                   </ul>
-                  <details>
-                    <summary>Read the full diff</summary>
-                    <pre className="diff">{diff || "No diff returned."}</pre>
-                  </details>
+                  <Tabs defaultValue="files" className="review-diff-tabs">
+                    <TabsList>
+                      <TabsTrigger value="files">Change summary</TabsTrigger>
+                      <TabsTrigger value="diff">Full diff</TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="files">
+                      <p className="muted">
+                        {pr.files?.length ?? 0} files · +
+                        {pr.files?.reduce(
+                          (sum: number, file: any) => sum + file.additions,
+                          0,
+                        ) ?? 0}{" "}
+                        / −
+                        {pr.files?.reduce(
+                          (sum: number, file: any) => sum + file.deletions,
+                          0,
+                        ) ?? 0}
+                      </p>
+                    </TabsContent>
+                    <TabsContent value="diff">
+                      <pre className="diff">{diff || "No diff returned."}</pre>
+                    </TabsContent>
+                  </Tabs>
                   <Button
                     className="merge-button"
                     disabled={
@@ -1406,7 +1531,9 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                       pr.state !== "OPEN" ||
                       pr.mergeable !== "MERGEABLE"
                     }
-                    onClick={() => setConfirm(true)}
+                    onClick={() =>
+                      setConfirm({ gateId: gate.id, sha: pr.headRefOid })
+                    }
                   >
                     <GitPullRequest size={15} />
                     Approve & merge
@@ -1415,60 +1542,15 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
               ) : null}
             </>
           ) : null}
-          <div className="decision-response">
-            <label htmlFor="gate-answer">
-              {gate.type === "pr"
-                ? "Request changes"
-                : "Your decision or resolution"}
-            </label>
-            <Textarea
-              id="gate-answer"
-              rows={3}
-              value={answer}
-              onChange={(event) => setAnswer(event.target.value)}
-              placeholder={
-                gate.type === "pr"
-                  ? "Describe what should change before merging…"
-                  : "Answer the question, or describe what you fixed…"
-              }
-            />
-            <div className="response-actions">
-              <Button
-                variant="outline"
-                disabled={busy || !answer.trim()}
-                onClick={() =>
-                  act(() =>
-                    api("/gates/" + gate.id + "/resolve", {
-                      answer,
-                      retry: true,
-                    }),
-                  )
-                }
-              >
-                {gate.type === "pr" ? "Request changes" : "Resolve & retry"}
-                <ArrowRight size={14} />
-              </Button>
-              {gate.taskId && gate.type !== "pr" ? (
-                <Button
-                  variant="ghost"
-                  disabled={busy || !answer.trim()}
-                  onClick={() =>
-                    act(() =>
-                      api("/gates/" + gate.id + "/resolve", {
-                        answer,
-                        retry: false,
-                      }),
-                    )
-                  }
-                >
-                  Skip this task
-                </Button>
-              ) : null}
-            </div>
-          </div>
+          {gate.type === "pr" ? response : null}
         </article>
       </div>
-      <Dialog open={confirm} onOpenChange={setConfirm}>
+      <Dialog
+        open={!!confirm}
+        onOpenChange={(open) => {
+          if (!open) setConfirm(null);
+        }}
+      >
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Merge this revision?</DialogTitle>
@@ -1477,19 +1559,20 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
               check the commit again before submitting the merge.
             </DialogDescription>
           </DialogHeader>
-          <p className="mono confirm-sha">{pr?.headRefOid}</p>
+          <p className="mono confirm-sha">{confirm?.sha}</p>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirm(false)}>
+            <Button variant="outline" onClick={() => setConfirm(null)}>
               Keep reviewing
             </Button>
             <Button
               disabled={busy}
               onClick={() =>
                 act(async () => {
-                  await api("/gates/" + gate.id + "/approve", {
-                    sha: pr.headRefOid,
+                  if (!confirm) return;
+                  await api("/gates/" + confirm.gateId + "/approve", {
+                    sha: confirm.sha,
                   });
-                  setConfirm(false);
+                  setConfirm(null);
                 })
               }
             >
@@ -1498,91 +1581,6 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </section>
-  );
-}
-
-function Memory({ project, pages }: any) {
-  const [query, setQuery] = useState(""),
-    [results, setResults] = useState<any[] | null>(null),
-    [error, setError] = useState("");
-  async function search(event: FormEvent) {
-    event.preventDefault();
-    try {
-      setResults(
-        await api(
-          "/projects/" + project.id + "/memory?q=" + encodeURIComponent(query),
-        ),
-      );
-      setError("");
-    } catch (error) {
-      setError((error as Error).message);
-    }
-  }
-  return (
-    <section className="page reading-page">
-      <div className="page-heading">
-        <div>
-          <h1>Project memory</h1>
-          <p>Outcomes, sources, and a history that survives restarts.</p>
-        </div>
-        <span className="mono">SQLite FTS5 + LLM wiki</span>
-      </div>
-      <form onSubmit={search} className="memory-search">
-        <label className="sr-only" htmlFor="memory-query">
-          Search project memory
-        </label>
-        <Input
-          id="memory-query"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search decisions, findings, and outcomes"
-        />
-        <Button variant="outline" type="submit">
-          <Search size={15} />
-          Search
-        </Button>
-      </form>
-      {error ? <p role="alert">{error}</p> : null}
-      {(results ?? pages).length ? (
-        (results ?? pages).map((page: any) => (
-          <article className="memory-document" key={page.id}>
-            <h2>{page.title}</h2>
-            <p>{page.content}</p>
-            <div className="evidence">
-              <strong>Agent-reported outcome</strong>
-              <span>Verification lives with the task and PR.</span>
-            </div>
-            {page.sources?.length ? (
-              <ul>
-                {page.sources.map((source: string, i: number) => (
-                  <li key={i}>
-                    <span className="source-marker">[{i + 1}]</span>
-                    {/^https:\/\//.test(source) ? (
-                      <a href={source} target="_blank" rel="noreferrer">
-                        {source}
-                      </a>
-                    ) : (
-                      <span className="mono">{source}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="muted">No external sources cited.</p>
-            )}
-          </article>
-        ))
-      ) : (
-        <Empty
-          title={
-            query
-              ? "No matching memory yet."
-              : "Knowledge starts with evidence."
-          }
-          text="Completed agent runs will create Markdown pages, source records, an index, and an append-only log."
-        />
-      )}
     </section>
   );
 }
@@ -1696,41 +1694,49 @@ function Settings({ data, project, act, busy, refresh }: any) {
                 ? "Orchestrator"
                 : "Implementation & subagents"}
             </label>
-            <select
-              id={role + "-model"}
+            <Select
               value={settings[role].model}
-              onChange={(event) =>
+              onValueChange={(model) =>
                 setSettings({
                   ...settings,
-                  [role]: { ...settings[role], model: event.target.value },
+                  [role]: { ...settings[role], model },
                 })
               }
             >
-              {models.map((model) => (
-                <option key={model.model} value={model.model}>
-                  {model.displayName}
-                </option>
-              ))}
-            </select>
+              <SelectTrigger id={role + "-model"}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {models.map((model) => (
+                  <SelectItem key={model.model} value={model.model}>
+                    {model.displayName}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <label className="sr-only" htmlFor={role + "-effort"}>
               {role} reasoning effort
             </label>
-            <select
-              id={role + "-effort"}
+            <Select
               value={settings[role].effort}
-              onChange={(event) =>
+              onValueChange={(effort) =>
                 setSettings({
                   ...settings,
-                  [role]: { ...settings[role], effort: event.target.value },
+                  [role]: { ...settings[role], effort },
                 })
               }
             >
-              {["low", "medium", "high", "xhigh", "max"].map((effort) => (
-                <option key={effort} value={effort}>
-                  {effort} reasoning
-                </option>
-              ))}
-            </select>
+              <SelectTrigger id={role + "-effort"}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {["low", "medium", "high", "xhigh", "max"].map((effort) => (
+                  <SelectItem key={effort} value={effort}>
+                    {effort} reasoning
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         ))}
         <label htmlFor="concurrency">Concurrent project runs</label>
@@ -1763,6 +1769,7 @@ function Settings({ data, project, act, busy, refresh }: any) {
           Save model settings
         </Button>
       </section>
+      <NotificationSettings />
       <section className="setting-section">
         <h2>Project boundaries</h2>
         <label htmlFor="settings-constraints">Scope and exclusions</label>
@@ -1825,7 +1832,15 @@ function Settings({ data, project, act, busy, refresh }: any) {
   );
 }
 
-function TaskDetail({ task, onClose }: { task: any; onClose: () => void }) {
+function TaskDetail({
+  task,
+  tasks,
+  onClose,
+}: {
+  task: any;
+  tasks: any[];
+  onClose: () => void;
+}) {
   return (
     <Dialog
       open={!!task}
@@ -1837,7 +1852,9 @@ function TaskDetail({ task, onClose }: { task: any; onClose: () => void }) {
         <DialogHeader>
           <DialogTitle>{task?.title}</DialogTitle>
           <DialogDescription>
-            {task ? statusText(task.status) + " · " + task.kind : ""}
+            {task
+              ? frontierLabel(frontierState(task, tasks)) + " · " + task.kind
+              : ""}
           </DialogDescription>
         </DialogHeader>
         {task ? (
@@ -1862,12 +1879,24 @@ function TaskDetail({ task, onClose }: { task: any; onClose: () => void }) {
               </>
             ) : null}
             {task.checks?.map((check: any, i: number) => (
-              <details key={i}>
-                <summary className="mono">
-                  {check.command} · exit {check.code}
-                </summary>
-                <pre>{check.output}</pre>
-              </details>
+              <Collapsible key={i} className="task-check">
+                <CollapsibleTrigger asChild>
+                  <Button variant="ghost" className="task-check-trigger">
+                    <StatusMark
+                      label=""
+                      status={check.code === 0 ? "done" : "failed"}
+                      size={15}
+                    />
+                    <span className="mono">
+                      {check.command} · exit {check.code}
+                    </span>
+                    <ChevronRight size={14} />
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent>
+                  <pre>{check.output}</pre>
+                </CollapsibleContent>
+              </Collapsible>
             ))}
             {task.pr ? (
               <a

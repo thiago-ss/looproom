@@ -6,6 +6,8 @@ Default profiles live in config/model-profiles.json: GPT-6.1 Sol / High orchestr
 
 Product development runs in Git worktrees. Every product PR merge requires human approval for the exact revision. Keep credentials and external mutations in the coordinator broker; no broad sandbox fallback. Preserve the Looproom brand and simple goal-first flow. Use actual supplied UI components with their retained license notices.
 
-Document work as proposed, researched, implemented or verified accurately. This is a working local v0; authenticated model execution, real GitHub round-trips and measured self-improvement remain unverified or planned as described in README.md. Do not replace those gaps with fake data or motion.
+Document work as proposed, researched, implemented or verified accurately. This is a working local v0; native independent review, real GitHub round-trips and measured self-improvement remain unverified or planned as described in README.md. Do not replace those gaps with fake data or motion.
 
 Run meaningful tests for persistence, scheduling, execution boundaries and merge authority when changing them. Keep node_modules, dist, runtime data and account credentials out of commits.
+
+The user excluded Impeccable and Anti UI Slop from this project work. Do not apply those skills. Product controls use the shared shadcn primitives; run npm run check:ui before handing off UI changes. New design references are curated in docs/ui-reference-selection.md.

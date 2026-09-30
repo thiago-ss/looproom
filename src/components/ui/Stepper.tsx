@@ -1,4 +1,5 @@
-"use client";
+import { Button } from "./button";
+("use client");
 
 import React, {
   useState,
@@ -145,7 +146,8 @@ export default function Stepper({
               className={`mt-10 flex ${currentStep !== 1 ? "justify-between" : "justify-end"}`}
             >
               {currentStep !== 1 && (
-                <button
+                <Button
+                  variant="ghost"
                   onClick={handleBack}
                   className={`duration-350 rounded px-2 py-1 transition ${
                     currentStep === 1
@@ -155,15 +157,16 @@ export default function Stepper({
                   {...backButtonProps}
                 >
                   {backButtonText}
-                </button>
+                </Button>
               )}
-              <button
+              <Button
+                variant="ghost"
                 onClick={isLastStep ? handleComplete : handleNext}
                 className="duration-350 flex items-center justify-center rounded-full bg-green-500 py-1.5 px-3.5 font-medium tracking-tight text-white transition hover:bg-green-600 active:bg-green-700"
                 {...nextButtonProps}
               >
                 {isLastStep ? finalButtonText : nextButtonText}
-              </button>
+              </Button>
             </div>
           </div>
         )}

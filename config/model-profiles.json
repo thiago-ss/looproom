@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "implemented-defaults; live account entitlement unverified",
+  "status": "implemented-defaults; native orchestration and implementation verified; full worker verification and independent review pending",
   "transport": "codex-app-server",
   "funding": "chatgpt-plan-oauth",
   "profiles": {
