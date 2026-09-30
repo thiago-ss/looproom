@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Shdr11 } from "./ui/shdr-11";
+import { Shdr13 } from "./ui/shdr-13";
 import { Shdr12 } from "./ui/shdr-12";
 import { Shdr16 } from "./ui/shdr-16";
 import { Shdr23 } from "./ui/shdr-23";
@@ -8,6 +9,7 @@ const identities = {
   implementation: Shdr12,
   review: Shdr23,
   research: Shdr16,
+  judge: Shdr13,
 };
 export default function AgentOrb({
   active,

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "status": "implemented-defaults; native orchestration and implementation verified; full worker verification and independent review pending",
+  "status": "implemented-defaults; native orchestration, implementation and read-only judge verified; full worker checks, independent review and PR round-trip pending",
   "transport": "codex-app-server",
   "funding": "chatgpt-plan-oauth",
   "profiles": {
@@ -18,7 +18,8 @@
     "implementation": "subagent",
     "research": "subagent",
     "review": "subagent",
-    "experiment": "subagent"
+    "experiment": "subagent",
+    "judge": "subagent"
   },
   "fallback": "human-gate",
   "persistRequestedAndEffectiveProfilePerRun": true

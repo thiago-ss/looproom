@@ -14,6 +14,7 @@ import {
   Check,
   ChevronRight,
   CircleHelp,
+  CornerDownRight,
   ExternalLink,
   FolderGit2,
   GitBranch,
@@ -71,6 +72,8 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from "./components/ui/popover";
+import ConversationMessages from "./components/ConversationMessages";
+import { Switch } from "./components/ui/switch";
 import Work from "./components/Work";
 import { frontierState, frontierLabel } from "./lib/work";
 import { api, type Data } from "./lib/api";
@@ -89,7 +92,7 @@ const NAV = [
 function Pending({ label }: { label: string }) {
   return (
     <span className="pending" role="status">
-      <DotmSquare3 size={18} dotSize={3} color="#167a72" />
+      <DotmSquare3 size={18} dotSize={3} color="var(--lr-signal)" />
       <span>{label}</span>
     </span>
   );
@@ -239,7 +242,7 @@ export default function App() {
   if (!data)
     return (
       <main className="boot">
-        <img src="/brand/looproom-mark.svg" alt="Looproom" />
+        <img src="/brand/looproom-mark.svg?v=3" alt="Looproom" />
         <Pending label="Opening your workspace" />
         {connectionError ? (
           <div role="alert">
@@ -262,6 +265,7 @@ export default function App() {
   return (
     <div
       className={"app" + (!onboarding && view === "goal" ? " goal-view" : "")}
+      data-view={view}
     >
       <Toaster position="bottom-right" closeButton />
       {onboarding ? (
@@ -287,7 +291,7 @@ export default function App() {
                 setView("goal");
               }}
             >
-              <img src="/brand/looproom-mark-reverse.svg" alt="" />
+              <img src="/brand/looproom-mark-reverse.svg?v=3" alt="" />
               looproom
             </a>
             <label className="sr-only" htmlFor="project-picker">
@@ -446,6 +450,9 @@ export default function App() {
                     active={active}
                     tasks={tasks}
                     gates={gates}
+                    historyGates={data.gates.filter(
+                      (gate) => gate.projectId === project.id,
+                    )}
                     act={act}
                     busy={busy}
                     openReview={() => setView("review")}
@@ -470,6 +477,7 @@ export default function App() {
                 ) : null}
                 {view === "review" ? (
                   <ReviewInbox
+                    bypass={Boolean(project.bypass)}
                     gates={gates}
                     tasks={tasks}
                     act={act}
@@ -623,7 +631,7 @@ function Onboarding({
     <main className="onboarding">
       <header>
         <a className="wordmark light" href="#">
-          <img src="/brand/looproom-mark.svg" alt="" />
+          <img src="/brand/looproom-mark.svg?v=3" alt="" />
           looproom
         </a>
         {onBack ? (
@@ -652,7 +660,7 @@ function Onboarding({
           <img
             className="brand-sculpture"
             src="/brand/brand-sculpture.png"
-            alt="Two continuous graphite and teal loops meeting at a vermilion gate"
+            alt="Two continuous loops meeting at a human gate"
           />
           <div className="onboarding-promise">
             <ShieldCheck size={18} />
@@ -922,12 +930,20 @@ function Goal({
   active,
   tasks,
   gates,
+  historyGates,
   act,
   busy,
   openReview,
   openTask,
 }: any) {
   const [text, setText] = useState("");
+  const [replyId, setReplyId] = useState<string | null>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const replyGate = historyGates.find((gate: any) => gate.id === replyId);
+  function reply(gate: any) {
+    setReplyId(gate.id);
+    input.current?.focus();
+  }
   const chat = useRef<HTMLDivElement>(null);
   const flow = useRef<HTMLDivElement>(null);
   const follow = useRef(true);
@@ -953,8 +969,14 @@ function Goal({
     if (!text.trim()) return;
     const value = text;
     void act(async () => {
-      await api("/projects/" + project.id + "/messages", { text: value });
+      if (replyId)
+        await api("/gates/" + replyId + "/resolve", {
+          answer: value,
+          retry: true,
+        });
+      else await api("/projects/" + project.id + "/messages", { text: value });
       setText("");
+      setReplyId(null);
       latest();
     });
   }
@@ -970,28 +992,25 @@ function Goal({
   return (
     <div className="goal-layout">
       <section className="conversation">
-        <div className="page-intro">
+        <h1 className="sr-only">Goal</h1>
+        <div className="page-intro goal-toolbar">
           <div className="repo-line">
             <GitBranch size={13} />
             {project.branch}
             <span>·</span>
-            <span>Goal conversation</span>
+            <span>Conversation</span>
           </div>
-          <div className="goal-title-row">
-            <h1>{project.name}</h1>
-            <Popover>
-              <PopoverTrigger asChild>
-                <Button variant="outline" size="sm" className="context-toggle">
-                  <Layers3 size={14} />
-                  Context
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent align="end" className="goal-context-popover">
-                {context}
-              </PopoverContent>
-            </Popover>
-          </div>
-          <p>Move the goal forward. Keep the evidence close.</p>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className="context-toggle">
+                <Layers3 size={14} />
+                Context
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="goal-context-popover">
+              {context}
+            </PopoverContent>
+          </Popover>
         </div>
         <div
           className="messages"
@@ -1007,22 +1026,12 @@ function Goal({
           }}
         >
           <div className="conversation-flow" ref={flow}>
-            {messages.map((message: any) => (
-              <article key={message.id} className={"message " + message.role}>
-                <div className="message-byline">
-                  {message.role === "human" ? (
-                    <span className="human-avatar">You</span>
-                  ) : (
-                    <img src="/brand/looproom-mark.svg" alt="" />
-                  )}
-                  <strong>
-                    {message.role === "human" ? "You" : "Orchestrator"}
-                  </strong>
-                  <DateLabel date={message.createdAt} />
-                </div>
-                <div className="message-body">{message.text}</div>
-              </article>
-            ))}
+            <ConversationMessages
+              messages={messages}
+              gates={historyGates}
+              onReply={reply}
+              onReview={openReview}
+            />
             {active.map((run: any) => (
               <article key={run.id} className="message live">
                 <div className="message-byline">
@@ -1050,10 +1059,7 @@ function Goal({
             {!active.length && !tasks.length ? (
               <div className="first-step">
                 <h2>Your goal is ready.</h2>
-                <p>
-                  Start the loop to get a sourced plan. Agents will implement in
-                  worktrees and bring PRs back here for review.
-                </p>
+                <p>Turn your goal into a plan.</p>
                 <Button
                   disabled={busy}
                   onClick={() =>
@@ -1066,27 +1072,6 @@ function Goal({
                 >
                   <Play size={14} />
                   Start planning
-                </Button>
-              </div>
-            ) : null}
-            {gates.length ? (
-              <div className="chat-gate">
-                <div className="chat-gate-label">
-                  <span className="gate-square" /> Human decision ·{" "}
-                  {gates.length} open
-                </div>
-                <strong>
-                  {gates.length === 1
-                    ? gates[0].title
-                    : `${gates.length} decisions need your judgment`}
-                </strong>
-                <p>
-                  {gates[0].detail?.slice(0, 180)}
-                  {gates[0].detail?.length > 180 ? "…" : ""}
-                </p>
-                <Button variant="outline" size="sm" onClick={openReview}>
-                  Review decision
-                  <ArrowRight size={14} />
                 </Button>
               </div>
             ) : null}
@@ -1104,11 +1089,30 @@ function Goal({
           </Button>
         ) : null}
         <form className="composer" onSubmit={send}>
+          {replyGate ? (
+            <div className="composer-reply">
+              <CornerDownRight size={14} />
+              <span>
+                {replyGate.status === "open" ? "Reply to" : "Already answered"}{" "}
+                · {replyGate.title}
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Cancel escalation reply"
+                onClick={() => setReplyId(null)}
+              >
+                <X size={14} />
+              </Button>
+            </div>
+          ) : null}
           <label className="sr-only" htmlFor="message">
             Message your agents
           </label>
           <Textarea
             id="message"
+            ref={input}
             value={text}
             onChange={(event) => setText(event.target.value)}
             placeholder="Add context, clarify the goal, or leave a direction…"
@@ -1119,9 +1123,17 @@ function Goal({
             }}
           />
           <div>
-            <span>⌘ Enter to send · Context stays with this project</span>
-            <Button type="submit" disabled={busy || !text.trim()} size="sm">
-              Send
+            <span aria-label="Command Enter to send">⌘ ↵</span>
+            <Button
+              type="submit"
+              disabled={
+                busy ||
+                !text.trim() ||
+                (!!replyGate && replyGate.status !== "open")
+              }
+              size="sm"
+            >
+              {replyGate ? "Reply & retry" : "Send"}
               <ArrowRight size={14} />
             </Button>
           </div>
@@ -1177,8 +1189,8 @@ function GoalContext({ project, tasks, gates, active, openTask }: any) {
               status={glyph(task.status)}
               size={17}
               label=""
-              color="#167a72"
-              doneColor="#25724b"
+              color="var(--lr-signal)"
+              doneColor="var(--lr-verified)"
             />
             <div>
               <strong>{task.title}</strong>
@@ -1187,23 +1199,17 @@ function GoalContext({ project, tasks, gates, active, openTask }: any) {
           </Button>
         ))
       ) : (
-        <p className="muted">
-          The first plan will create a small set of useful tasks.
-        </p>
+        <p className="muted">No tasks yet.</p>
       )}
       <div className="context-authority">
         <Square size={13} />
-        <p>
-          Human approval
-          <br />
-          <strong>Required for every merge</strong>
-        </p>
+        <p>Approval before every merge</p>
       </div>
     </aside>
   );
 }
 
-function ReviewInbox({ gates, tasks, act, busy }: any) {
+function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
   const [selected, setSelected] = useState<string>(""),
     [answer, setAnswer] = useState(""),
     [pr, setPr] = useState<any>(null),
@@ -1248,23 +1254,13 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
   if (!gates.length)
     return (
       <section className="page">
-        <div className="page-heading">
-          <div>
-            <p className="eyebrow">Your judgment, at the right moment</p>
-            <h1>Review</h1>
-            <p>The decisions only you can make.</p>
-          </div>
-        </div>
+        <h1 className="sr-only">Review</h1>
         <div className="review-clear">
           <ShieldCheck size={40} />
-          <h2>Everything is clear.</h2>
-          <p>
-            Agents can keep moving. Access decisions and verified pull requests
-            will arrive here when your judgment is needed.
-          </p>
+          <h2>No decisions waiting.</h2>
+
           <div>
-            <span className="gate-square" /> Every merge still requires your
-            approval.
+            <span className="gate-square" /> Approval before every merge
           </div>
         </div>
       </section>
@@ -1272,7 +1268,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
   const response = (
     <div className="decision-response">
       <label htmlFor="gate-answer">
-        {gate.type === "pr" ? "Request changes" : "Your decision or resolution"}
+        {gate.type === "pr" ? "Request changes" : "Your decision"}
       </label>
       <Textarea
         id="gate-answer"
@@ -1282,7 +1278,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
         placeholder={
           gate.type === "pr"
             ? "Describe what should change before merging…"
-            : "Answer the question, or describe what you fixed…"
+            : "How should the agents proceed?"
         }
       />
       <div className="response-actions">
@@ -1322,18 +1318,14 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
   );
   return (
     <section className="page review-page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">Your judgment, at the right moment</p>
-          <h1>Review</h1>
-          <p>
-            {gates.length} {gates.length === 1 ? "decision" : "decisions"}{" "}
-            waiting for you.
-          </p>
-        </div>
+      <h1 className="sr-only">Review</h1>
+      <div className="workspace-caption">
+        <span className="mono">
+          {gates.length} {gates.length === 1 ? "decision" : "decisions"} waiting
+        </span>
         <span className="approval-note">
           <Square size={12} />
-          Human gate
+          Human approval required
         </span>
       </div>
       <div className="review-layout">
@@ -1371,10 +1363,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
             <span>·</span>
             <DateLabel date={gate.createdAt} />
           </div>
-          <div className="dossier-heading">
-            <span className="gate-square" />
-            <span>Awaiting your decision</span>
-          </div>
+
           <h2>{gate.title}</h2>
           {task ? (
             <p className="dossier-task">
@@ -1389,6 +1378,28 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
           >
             <p className="review-summary">{gate.detail}</p>
           </div>
+          {gate.type !== "pr" && gate.judgeStatus ? (
+            <div className="judge-assessment">
+              <strong>Judge</strong>
+              <p>
+                {gate.judgeAnswer ??
+                  gate.judgeError ??
+                  "Reviewing this escalation…"}
+              </p>
+              {bypass && gate.judgeStatus !== "running" ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() =>
+                    act(() => api("/gates/" + gate.id + "/judge", {}))
+                  }
+                >
+                  Ask judge again
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
           {gate.type !== "pr" ? response : null}
           {gate.type !== "pr" && task ? (
             <Tabs
@@ -1426,10 +1437,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                     ))}
                   </ul>
                 ) : (
-                  <p className="muted">
-                    No coordinator checks recorded yet. Agent reports do not
-                    replace verification.
-                  </p>
+                  <p className="muted">No recorded checks.</p>
                 )}
               </TabsContent>
             </Tabs>
@@ -1586,13 +1594,18 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
 }
 
 function Settings({ data, project, act, busy, refresh }: any) {
-  const [settings, setSettings] = useState(data.settings),
+  const [settings, setSettings] = useState({
+      ...data.settings,
+      judge: data.settings.judge ?? data.settings.subagent,
+    }),
+    [bypass, setBypass] = useState(!!project.bypass),
     [checks, setChecks] = useState(project.checks.join("\n")),
     [constraints, setConstraints] = useState(project.constraints),
     [authUrl, setAuthUrl] = useState("");
   useEffect(() => {
     setChecks(project.checks.join("\n"));
     setConstraints(project.constraints);
+    setBypass(!!project.bypass);
   }, [project.id]);
   async function login() {
     const result = await api("/runtime/login", {});
@@ -1621,17 +1634,16 @@ function Settings({ data, project, act, busy, refresh }: any) {
           model: settings.subagent.model,
           displayName: settings.subagent.model,
         },
+        {
+          model: settings.judge.model,
+          displayName: settings.judge.model,
+        },
       ].map((model: any) => [model.model, model]),
     ).values(),
   ] as any[];
   return (
     <section className="page settings-page">
-      <div className="page-heading">
-        <div>
-          <h1>Settings</h1>
-          <p>Choose how the room works.</p>
-        </div>
-      </div>
+      <h1 className="sr-only">Settings</h1>
       <section className="setting-section">
         <h2>ChatGPT connection</h2>
         <div className="account-row">
@@ -1687,12 +1699,14 @@ function Settings({ data, project, act, busy, refresh }: any) {
       <section className="setting-section">
         <h2>Models</h2>
         <p>Defaults apply to future runs. Unavailable models create a gate.</p>
-        {(["orchestrator", "subagent"] as const).map((role) => (
+        {(["orchestrator", "subagent", "judge"] as const).map((role) => (
           <div className="model-setting" key={role}>
             <label htmlFor={role + "-model"}>
               {role === "orchestrator"
                 ? "Orchestrator"
-                : "Implementation & subagents"}
+                : role === "judge"
+                  ? "Escalation judge"
+                  : "Implementation & subagents"}
             </label>
             <Select
               value={settings[role].model}
@@ -1739,7 +1753,7 @@ function Settings({ data, project, act, busy, refresh }: any) {
             </Select>
           </div>
         ))}
-        <label htmlFor="concurrency">Concurrent project runs</label>
+        <label htmlFor="concurrency">Concurrent workflows</label>
         <Input
           id="concurrency"
           type="number"
@@ -1761,6 +1775,7 @@ function Settings({ data, project, act, busy, refresh }: any) {
               api("/settings", {
                 orchestrator: settings.orchestrator,
                 subagent: settings.subagent,
+                judge: settings.judge,
                 concurrency: settings.concurrency,
               }),
             )
@@ -1772,6 +1787,17 @@ function Settings({ data, project, act, busy, refresh }: any) {
       <NotificationSettings />
       <section className="setting-section">
         <h2>Project boundaries</h2>
+        <div className="bypass-setting">
+          <div>
+            <label htmlFor="bypass-mode">Judge bypass</label>
+            <p>Judge answers escalations. You approve every PR merge.</p>
+          </div>
+          <Switch
+            id="bypass-mode"
+            checked={bypass}
+            onCheckedChange={setBypass}
+          />
+        </div>
         <label htmlFor="settings-constraints">Scope and exclusions</label>
         <Textarea
           id="settings-constraints"
@@ -1802,6 +1828,7 @@ function Settings({ data, project, act, busy, refresh }: any) {
                   .map((line: string) => line.trim())
                   .filter(Boolean),
                 constraints,
+                bypass,
               }),
             )
           }

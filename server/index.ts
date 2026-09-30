@@ -37,7 +37,10 @@ try {
     "settings",
   );
 }
+if (!store.get("settings").judge)
+  store.patch("settings", { judge: { ...store.get("settings").subagent } });
 store.recover();
+store.syncConversation();
 const runtime = new Runtime(
   process.env.CODEX_BINARY ?? "codex",
   join(dataDir, "codex"),
@@ -140,7 +143,7 @@ app.get("/api/state", (_req, res) =>
     tasks: store.all("task"),
     gates: store.all("gate"),
     agents: store.all("agent"),
-    messages: store.all("message"),
+    messages: store.conversation(),
     runs: store.all("run").map(({ output, ...run }) => run),
     memory: store.all("memory"),
     events: store.events(),
@@ -339,6 +342,7 @@ app.post(
       .object({
         orchestrator: profile,
         subagent: profile,
+        judge: profile.optional(),
         concurrency: z.number().int().min(1).max(4),
       })
       .parse(req.body);
@@ -353,6 +357,7 @@ app.post(
       .object({
         checks: z.array(z.string().trim().min(1).max(500)).max(8),
         constraints: z.string().max(6000),
+        bypass: z.boolean().optional(),
       })
       .parse(req.body);
     res.json(store.patch(String(req.params.id), settings));
@@ -394,6 +399,20 @@ app.post(
       })
       .parse(req.body);
     await engine.resolve(String(req.params.id), body.answer, body.retry);
+    res.json({ ok: true });
+  }),
+);
+app.post(
+  "/api/gates/:id/judge",
+  route((req, res) => {
+    const gate = store.get(String(req.params.id)),
+      project = store.get(gate.projectId);
+    if (!project.bypass || gate.status !== "open" || gate.type === "pr")
+      throw new Error("Judge bypass is unavailable for this gate.");
+    if (gate.judgeStatus === "running")
+      throw new Error("The judge is already working.");
+    store.patch(gate.id, { judgeStatus: "pending", judgeError: null });
+    engine.changed("judge-requested", { gateId: gate.id }, project.id);
     res.json({ ok: true });
   }),
 );

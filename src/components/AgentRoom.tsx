@@ -1,7 +1,5 @@
 import { lazy, Suspense, useState } from "react";
 import {
-  ArrowUpRight,
-  GitBranch,
   Radio,
   Check,
   Circle,
@@ -9,6 +7,7 @@ import {
   ArrowRight,
   Terminal,
   History,
+  CircleHelp,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
@@ -20,29 +19,22 @@ const roles = [
     id: "orchestrator",
     name: "Orchestrator",
     job: "Sets the destination",
-    short: "Plan",
-    number: "01",
   },
   {
     id: "research",
     name: "Researcher",
     job: "Finds the evidence",
-    short: "Research",
-    number: "02",
   },
   {
     id: "implementation",
     name: "Builder",
     job: "Makes it real",
-    short: "Build",
-    number: "03",
   },
+  { id: "judge", name: "Judge", job: "Answers escalations; merges stay human" },
   {
     id: "review",
     name: "Reviewer",
     job: "Challenges the result",
-    short: "Verify",
-    number: "04",
   },
 ];
 export default function AgentRoom({
@@ -60,7 +52,11 @@ export default function AgentRoom({
   const latest = active ?? roleRuns.at(-1);
   const task = tasks.find((task: any) => task.id === latest?.taskId);
   const profile =
-    selected === "orchestrator" ? settings.orchestrator : settings.subagent;
+    selected === "orchestrator"
+      ? settings.orchestrator
+      : selected === "judge"
+        ? (settings.judge ?? settings.subagent)
+        : settings.subagent;
   const activeCount = runs.filter(
     (run: any) => run.status === "running",
   ).length;
@@ -74,12 +70,8 @@ export default function AgentRoom({
   );
   return (
     <section className="page room-page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">The collective</p>
-          <h1>Agent room</h1>
-          <p>Follow the work. Get closer when something catches your eye.</p>
-        </div>
+      <h1 className="sr-only">Agent room</h1>
+      <div className="workspace-caption">
         <Badge variant="outline" className="room-live">
           <Radio size={13} />
           {activeCount ? `${activeCount} active` : "Standing by"}
@@ -87,10 +79,6 @@ export default function AgentRoom({
       </div>
       <div className="room-layout">
         <div className="room-stage">
-          <div className="stage-caption">
-            <span className="mono">Shared workflow</span>
-            <span>Select an agent to inspect</span>
-          </div>
           <div className="agent-constellation" aria-label="Agent workflow">
             <svg
               className="room-wires"
@@ -98,70 +86,107 @@ export default function AgentRoom({
               preserveAspectRatio="none"
               aria-hidden="true"
             >
-              <path d="M150 110 H450 V330 H150 V110" />
-              <path d="M150 110 L450 330" className="secondary-wire" />
+              <path d="M150 110 C150 30 450 30 450 110 C550 110 550 330 450 330 C450 410 150 410 150 330 C50 330 50 110 150 110" />
+              <path
+                d="M150 110 C300 110 300 330 450 330"
+                className="secondary-wire"
+              />
             </svg>
-            {roles.map((item) => {
-              const running = runs.some(
-                (run: any) => run.role === item.id && run.status === "running",
-              );
-              return (
-                <Tooltip key={item.id}>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      className={`agent-station station-${item.id} ${selected === item.id ? "is-selected" : ""} ${running ? "is-active" : ""}`}
-                      onClick={() => setSelected(item.id)}
-                      aria-pressed={selected === item.id}
-                      aria-label={`Inspect ${item.name}, ${running ? "thinking" : "idle"}`}
-                    >
-                      <span className="station-number mono">
-                        {item.number} / {item.short}
-                      </span>
-                      <span className="station-orb">
-                        <Suspense
-                          fallback={<span className="orb-placeholder" />}
-                        >
-                          <Orb active={running} size={110} identity={item.id} />
-                        </Suspense>
-                      </span>
-                      <strong>{item.name}</strong>
-                      <span className="station-status">
-                        <i />
-                        {running ? "Thinking" : "Idle"}
-                      </span>
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>
-                    {item.job} · select to inspect
-                  </TooltipContent>
-                </Tooltip>
-              );
-            })}
-            <div className="room-center">
-              <img src="/brand/looproom-mark.svg" alt="" />
-              <span className="mono">One shared goal</span>
-            </div>
-          </div>
-          <div className="stage-footer">
-            <GitBranch size={14} />
-            <span>Plans → evidence → worktrees → independent review</span>
-            <span className="mono">Human approves promotion</span>
+            {roles
+              .filter((item) => item.id !== "judge")
+              .map((item) => {
+                const running = runs.some(
+                  (run: any) =>
+                    run.role === item.id && run.status === "running",
+                );
+                return (
+                  <Tooltip key={item.id}>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        className={`agent-station station-${item.id} ${selected === item.id ? "is-selected" : ""} ${running ? "is-active" : ""}`}
+                        onClick={() => setSelected(item.id)}
+                        aria-pressed={selected === item.id}
+                        aria-label={`Inspect ${item.name}, ${running ? "thinking" : "idle"}`}
+                      >
+                        <span className="station-orb">
+                          <Suspense
+                            fallback={<span className="orb-placeholder" />}
+                          >
+                            <Orb
+                              active={running}
+                              size={110}
+                              identity={item.id}
+                            />
+                          </Suspense>
+                        </span>
+                        <strong>{item.name}</strong>
+                        <span className="station-status">
+                          <i />
+                          {running ? "Thinking" : "Idle"}
+                        </span>
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {item.job} · select to inspect
+                    </TooltipContent>
+                  </Tooltip>
+                );
+              })}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  className={`agent-station station-judge ${selected === "judge" ? "is-selected" : ""}`}
+                  aria-label="Inspect Judge"
+                  aria-pressed={selected === "judge"}
+                  onClick={() => setSelected("judge")}
+                >
+                  <Suspense fallback={<span className="orb-placeholder" />}>
+                    <Orb
+                      active={runs.some(
+                        (run: any) =>
+                          run.role === "judge" && run.status === "running",
+                      )}
+                      size={56}
+                      identity="judge"
+                    />
+                  </Suspense>
+                  <strong>Judge</strong>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                Answers escalations; you approve every merge.
+              </TooltipContent>
+            </Tooltip>
           </div>
         </div>
         <aside className="agent-inspector" aria-label={`${role.name} details`}>
           <div className="inspector-heading">
-            <span className="eyebrow">Agent {role.number}</span>
-            <ArrowUpRight size={17} />
+            <Badge variant="outline">{active ? "Thinking" : "Idle"}</Badge>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="About workflow connections"
+                >
+                  <CircleHelp size={15} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>
+                Connections show planned handoffs. Activity records actual
+                events.
+              </TooltipContent>
+            </Tooltip>
           </div>
           <h2>{role.name}</h2>
-          <p>{role.job}</p>
           <div className="agent-profile">
             <span className="mono">{profile.model}</span>
             <Badge variant="outline">{profile.effort}</Badge>
           </div>
           <div className="inspector-section">
-            <span className="eyebrow">Current assignment</span>
+            <span className="eyebrow">Assignment</span>
             {task ? (
               <Button
                 variant="ghost"
@@ -172,15 +197,10 @@ export default function AgentRoom({
                 <ChevronRight size={16} />
               </Button>
             ) : (
-              <p>
-                {active
-                  ? "Reading the project and planning the next useful step."
-                  : "Ready when the coordinator assigns work."}
-              </p>
+              <p>{active ? "Planning" : "No assignment"}</p>
             )}
           </div>
           <div className="inspector-section">
-            <span className="eyebrow">Runtime</span>
             <dl>
               <div>
                 <dt>State</dt>
@@ -215,16 +235,11 @@ export default function AgentRoom({
             </div>
           ) : null}
           {latest?.error ? <p className="field-error">{latest.error}</p> : null}
-          <p className="inspector-note">
-            Connections show the workflow contract. Activity below records what
-            actually happened.
-          </p>
         </aside>
       </div>
       <div className="section-heading">
         <div>
-          <h2>Activity & handoffs</h2>
-          <p className="muted">A shared record of the work</p>
+          <h2>Activity</h2>
         </div>
         <Tabs value={feed} onValueChange={setFeed}>
           <TabsList>

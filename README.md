@@ -59,7 +59,7 @@ New open gates produce a Sonner toast with a Review action and a two-note Web Au
 
 ## Execution and memory
 
-One coordinator owns dispatch, SQLite writes and publication. Up to four projects can run concurrently, with one active task per project. Each bounded task has its own worktree. Native nested agents are disabled so every role uses an explicit model profile.
+One coordinator owns dispatch, SQLite writes and publication. One to four concurrent workflows share capacity across planning, task pipelines and judges; independent ready tasks can run within the same project. Task gates block only affected work and its actual dependents. Runtime wiki writes are serialized per project. Each bounded task has its own worktree. Native nested agents are disabled so every role uses an explicit model profile.
 
 Named Codex permission profiles deny reads outside the assigned workspace and minimum toolchain paths, keep Git metadata read-only, carve out environment/key files and deny direct network access. The native macOS smoke test verifies these boundaries for broker check commands. Model/auth service traffic is separate from worker shell traffic. See [the permission documentation](https://learn.chatgpt.com/docs/permissions).
 
@@ -75,14 +75,20 @@ npm run check:ui
 npm run build
 ```
 
-Tests cover persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
+Twenty tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
 
 ## Remaining work
 
-Native independent review and PR round-trip; parallel task workers inside a project; contradiction review and versioned memory synthesis; protected experiment harness and evaluator promotion; Jev comparison against FTS5; accessibility and performance benchmarks with representative projects; signed macOS distribution. Runtime threads are recorded for audit; retries currently use a fresh thread with preserved worktree and project memory.
+Native independent review and PR round-trip; simultaneous native task/PR pipelines; contradiction review and versioned memory synthesis; protected experiment harness and evaluator promotion; Jev comparison against FTS5; accessibility and performance benchmarks with representative projects; signed macOS distribution. Runtime threads are recorded for audit; retries currently use a fresh thread with preserved worktree and project memory.
 
 ## License
 
 Looproom's original code is MIT. Incorporated third-party UI has separate terms: **ReactBits MIT + Commons Clause**, **DotMatrix custom product-use license**, and **Orbkit original shaders MIT**. This repository incorporates those sources as application UI, not a standalone component library. See [third-party notices](THIRD_PARTY.md) and `licenses/` before redistribution.
 
 Goal fills the viewport and scrolls within the conversation. Work offers a grouped frontier/search and dependency graph; Review offers decision dossiers and revision-bound confirmation. All interactive form controls and disclosures use the shared shadcn layer.
+
+## Product identity
+
+The current interface uses continuous plum surfaces, soft citron actions and readable supporting text. Selected items use tonal fills; keyboard focus retains a visible outline. See [identity rules and verification](docs/identity-v2.md).
+
+Goal preserves linked escalation requests and replies, including migrated history. Human messages use a single byline; the composer can answer a selected non-PR gate directly. Judge bypass is opt-in under Project boundaries. Its read-only model is configured separately in Settings; genuine capability blockers remain open, and every PR merge needs human approval. Native GPT-6 Sol / Medium judge inference was verified on an isolated routine-choice gate; no PR or live gate was approved by that test.

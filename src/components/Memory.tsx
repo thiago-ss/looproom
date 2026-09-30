@@ -11,11 +11,12 @@ import {
   Copy,
   Check,
   ChevronRight,
+  CircleHelp,
 } from "lucide-react";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import { Badge } from "./ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
+import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
 import { api } from "../lib/api";
 function excerpt(content: string) {
   return content
@@ -133,17 +134,8 @@ export default function Memory({ project, pages }: any) {
   }
   return (
     <section className="page memory-page">
-      <div className="page-heading">
-        <div>
-          <p className="eyebrow">The project archive</p>
-          <h1>Memory</h1>
-          <p>What we found. What we tried. What comes next.</p>
-        </div>
-        <span className="memory-durability">
-          <span />
-          <span>Saved on your Mac</span>
-        </span>
-      </div>
+      <h1 className="sr-only">Memory</h1>
+
       <div className="memory-toolbar">
         <form onSubmit={search} className="memory-search-field">
           <Search size={17} />
@@ -209,16 +201,11 @@ export default function Memory({ project, pages }: any) {
         <span>
           <strong>{sourceGroups.length}</strong> cited sources
         </span>
-        <span className="mono">SQLite FTS5 / LLM wiki</span>
       </div>
       {view === "connections" ? (
         <div className="source-atlas">
           <div className="source-atlas-intro">
             <Link2 size={26} />
-            <h2>Follow the evidence</h2>
-            <p>
-              Explore the sources connecting your project’s recorded outcomes.
-            </p>
           </div>
           {sourceGroups.map(([source, records]) => (
             <Button
@@ -319,10 +306,22 @@ export default function Memory({ project, pages }: any) {
               </div>
               <article className="memory-reader" aria-label="Selected memory">
                 <div className="reader-top">
-                  <Badge variant="outline">
-                    <FileText size={12} />
-                    Agent-reported outcome
-                  </Badge>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="outcome-provenance"
+                      >
+                        <FileText size={12} /> Agent outcome{" "}
+                        <CircleHelp size={13} />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      Agent report. Verified checks and approvals are recorded
+                      in Work and Review.
+                    </TooltipContent>
+                  </Tooltip>
                   <Button
                     variant="ghost"
                     size="icon-sm"
@@ -369,13 +368,7 @@ export default function Memory({ project, pages }: any) {
                     {page.content}
                   </Markdown>
                 </div>
-                <div className="memory-evidence-note">
-                  <span className="evidence-bracket">[ ]</span>
-                  <p>
-                    Agent reports preserve findings. Check results and human
-                    approvals remain separate evidence in Work and Review.
-                  </p>
-                </div>
+
                 <div className="reader-sources">
                   <h3>
                     Cited sources <span>{page.sources?.length ?? 0}</span>
@@ -428,7 +421,7 @@ export default function Memory({ project, pages }: any) {
               <p>
                 {results
                   ? "Try a different term, or clear your search to browse all outcomes."
-                  : "Completed agent runs become source-linked outcomes here. Your project’s knowledge survives the next restart."}
+                  : "Agent outcomes and their sources will appear here."}
               </p>
               {results ? (
                 <Button

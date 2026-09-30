@@ -38,6 +38,12 @@ const Review = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
 });
+const Judgment = z.object({
+  action: z.enum(["retry", "skip", "wait"]),
+  answer: z.string().trim().min(1).max(6000),
+  summary: z.string(),
+  sources: z.array(z.string()),
+});
 export function validateDependencies(tasks: { dependencies: number[] }[]) {
   const active = new Set<number>(),
     done = new Set<number>();
@@ -64,6 +70,7 @@ const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder
 
 export class Engine extends EventEmitter {
   busy = new Set<string>();
+  documentation = new Map<string, Promise<void>>();
   timer?: ReturnType<typeof setInterval>;
   constructor(
     public store: Store,
@@ -101,17 +108,23 @@ export class Engine extends EventEmitter {
         (g) => g.status === "open" && g.taskId === taskId && g.title === title,
       );
     if (existing) return existing;
-    const gate = this.store.put("gate", {
-      projectId,
-      taskId,
-      title,
-      detail,
-      type,
-      status: "open",
-      createdAt: new Date().toISOString(),
-      ...extra,
+    const gate = this.store.transaction(() => {
+      const gate = this.store.put("gate", {
+        projectId,
+        taskId,
+        title,
+        detail,
+        type,
+        status: "open",
+        createdAt: new Date().toISOString(),
+        scope: taskId ? "task" : type === "planning" ? "planning" : "project",
+        authorRole: "coordinator",
+        ...extra,
+      });
+      if (taskId) this.store.patch(taskId, { status: "blocked" });
+      this.store.recordEscalation(gate);
+      return gate;
     });
-    if (taskId) this.store.patch(taskId, { status: "blocked" });
     this.changed("gate-opened", { gateId: gate.id, title }, projectId);
     return gate;
   }
@@ -125,7 +138,11 @@ export class Engine extends EventEmitter {
   ) {
     const settings = this.settings(),
       profile =
-        role === "orchestrator" ? settings.orchestrator : settings.subagent;
+        role === "orchestrator"
+          ? settings.orchestrator
+          : role === "judge"
+            ? (settings.judge ?? settings.subagent)
+            : settings.subagent;
     let agent = this.store
       .all("agent", project.id)
       .find((agent) => agent.role === role);
@@ -194,13 +211,14 @@ export class Engine extends EventEmitter {
               project.id,
             );
           }
-          if (method === "human-gate")
+          if (method === "human-gate" && role !== "judge")
             this.gate(
               project.id,
               "Agent needs your decision",
               data.detail,
               "runtime",
               task?.id,
+              { authorRole: role, runId: run.id },
             );
         },
       });
@@ -228,9 +246,11 @@ export class Engine extends EventEmitter {
         output: stream,
         finishedAt: new Date().toISOString(),
       });
-      if (paused && task) this.store.patch(task.id, { status: "ready" });
+      if (paused && task && role !== "judge")
+        this.store.patch(task.id, { status: "ready" });
       else if (
         !paused &&
+        role !== "judge" &&
         !this.store
           .all("gate", project.id)
           .some((gate) => gate.status === "open" && gate.taskId === task?.id)
@@ -243,11 +263,33 @@ export class Engine extends EventEmitter {
           message,
           "runtime",
           task?.id,
+          { authorRole: role, runId: run.id },
         );
       throw error;
     }
   }
   async document(
+    projectId: string,
+    title: string,
+    content: string,
+    sources: string[],
+    runId: string,
+  ) {
+    const previous = this.documentation.get(projectId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => {})
+      .then(() =>
+        this.writeDocument(projectId, title, content, sources, runId),
+      );
+    this.documentation.set(projectId, next);
+    try {
+      await next;
+    } finally {
+      if (this.documentation.get(projectId) === next)
+        this.documentation.delete(projectId);
+    }
+  }
+  async writeDocument(
     projectId: string,
     title: string,
     content: string,
@@ -318,14 +360,14 @@ export class Engine extends EventEmitter {
       .map((page) => page.title + ": " + page.content)
       .join("\n");
     const replies = this.store
-      .all("message", project.id)
+      .conversation(project.id)
       .slice(-12)
       .map((message) => message.role + ": " + message.text)
       .join("\n");
     const plan = await this.run(
       project,
       "orchestrator",
-      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. Dependencies are zero-based task indices. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
+      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. Dependencies are zero-based task indices and must reflect actual required inputs, not a preferred execution order. Keep independent research, usability and implementation work available while another task waits at a gate. Never bypass a genuine dependency or fabricate a completed prerequisite. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
       Plan,
     );
     validateDependencies(plan.tasks);
@@ -355,11 +397,18 @@ export class Engine extends EventEmitter {
       );
       this.store.patch(project.id, {
         planned: true,
-        ...(tasks.length ? {} : { status: "idle" }),
+        ...(tasks.length || plan.gate ? {} : { status: "idle" }),
       });
     });
     if (plan.gate)
-      this.gate(project.id, "Clarify project direction", plan.gate, "planning");
+      this.gate(
+        project.id,
+        "Clarify project direction",
+        plan.gate,
+        "planning",
+        undefined,
+        { authorRole: "orchestrator" },
+      );
     this.changed(
       "plan-created",
       { summary: plan.summary, taskCount: plan.tasks.length },
@@ -392,7 +441,8 @@ export class Engine extends EventEmitter {
       );
     this.store.patch(task.id, { status: "running", attempt: task.attempt + 1 });
     const context = this.store
-      .all("message", project.id)
+      .conversation(project.id)
+      .filter((message) => !message.taskId || message.taskId === task.id)
       .slice(-6)
       .map((m) => m.text)
       .join("\n");
@@ -416,6 +466,9 @@ export class Engine extends EventEmitter {
         result.humanQuestion,
         "decision",
         task.id,
+        {
+          authorRole: task.kind === "research" ? "research" : "implementation",
+        },
       );
       return;
     }
@@ -489,6 +542,7 @@ export class Engine extends EventEmitter {
         review.summary,
         "review",
         task.id,
+        { authorRole: "review" },
       );
       return;
     }
@@ -670,6 +724,12 @@ export class Engine extends EventEmitter {
         resolvedAt: new Date().toISOString(),
       });
       this.store.patch(gate.taskId, { status: "completed" });
+      this.store.recordGateResponse(
+        gate,
+        `Approved and merged revision ${reviewedSha}.`,
+        "human",
+        new Date().toISOString(),
+      );
       this.store.put("approval", {
         projectId: project.id,
         gateId,
@@ -685,55 +745,233 @@ export class Engine extends EventEmitter {
       project.id,
     );
   }
-  async resolve(gateId: string, answer: string, retry = true) {
+  async resolve(
+    gateId: string,
+    answer: string,
+    retry = true,
+    actor: "human" | "judge" = "human",
+    runId?: string,
+  ) {
     const gate = this.store.get(gateId);
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
+    if (actor === "judge" && gate.type === "pr")
+      throw new Error("Every PR merge requires human approval.");
     if (gate.type === "github")
       this.store.patch(
         gate.projectId,
         await inspectRepo(this.store.get(gate.projectId).path),
       );
     this.store.transaction(() => {
+      const current = this.store.get(gateId),
+        project = this.store.get(gate.projectId);
+      if (current.status !== "open")
+        throw new Error("Gate is already resolved.");
+      if (
+        actor === "judge" &&
+        (!project.bypass || project.status !== "running")
+      )
+        throw new Error("Judge bypass is no longer active.");
+      const resolvedAt = new Date().toISOString();
       this.store.patch(gateId, {
         status: "resolved",
         answer,
-        resolvedAt: new Date().toISOString(),
+        resolvedBy: actor,
+        resolvedAt,
       });
-      this.store.put("message", {
-        projectId: gate.projectId,
-        role: "human",
-        text: answer,
-        createdAt: new Date().toISOString(),
-      });
-      if (gate.taskId)
-        this.store.patch(gate.taskId, {
+      this.store.recordGateResponse(gate, answer, actor, resolvedAt, runId);
+      if (gate.taskId) {
+        const task = this.store.get(gate.taskId);
+        this.store.patch(task.id, {
           status: retry ? "ready" : "cancelled",
-          attempt: 0,
+          attempt: actor === "human" ? 0 : task.attempt,
+          judgeRetries:
+            actor === "human" ? 0 : (task.judgeRetries ?? 0) + Number(retry),
+          feedback: `${actor === "judge" ? "Judge" : "Human"} answered escalation: ${gate.detail}\n${answer}`,
         });
-      else this.store.patch(gate.projectId, { planned: false });
+      } else if (
+        !this.store
+          .all("task", gate.projectId)
+          .some((task) => !["completed", "cancelled"].includes(task.status))
+      )
+        this.store.patch(gate.projectId, { planned: false });
       this.store.patch(gate.projectId, { status: "running" });
     });
-    this.changed("gate-resolved", { gateId, retry }, gate.projectId);
+    this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
+  }
+  async judge(project: RecordData, gate: RecordData) {
+    if (gate.type === "pr") return;
+    const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
+    this.store.patch(gate.id, { judgeStatus: "running", judgeError: null });
+    this.changed("judge-started", { gateId: gate.id }, project.id);
+    try {
+      const context = this.store
+        .conversation(project.id)
+        .filter((message) => !message.taskId || message.taskId === gate.taskId)
+        .slice(-10);
+      const result = await this.run(
+        project,
+        "judge",
+        `You are the independent escalation judge. Bypass mode delegates routine decisions to you; you are an agent, never a human approver. Read actual repository evidence before answering. Goal: ${project.goal}\nScope: ${project.constraints}\nEscalation: ${gate.title}\n${gate.detail}\nTask: ${task ? JSON.stringify({ title: task.title, description: task.description, acceptance: task.acceptance, feedback: task.feedback, checks: task.checks }) : "Project planning"}\nConversation: ${JSON.stringify(context)}\nReturn a clear answer, rationale summary and evidence sources. Action retry means your answer is sufficient to continue within existing authority. Action skip means the task is unnecessary and should be cancelled, with an explicit reason. Action wait means actual access, credentials, external setup, missing facts or permission changes are required; explain the concrete blocker. Do not claim to have fixed files, executed checks, installed software or granted permissions. You cannot approve or merge any PR, change scope, weaken the sandbox or change acceptance checks. Never retry a factual environment denial just by recommending a command. A read-only answer cannot grant spawn, network or filesystem access.`,
+        Judgment,
+        task,
+        false,
+      );
+      const run = this.store
+        .all("run", project.id)
+        .filter((run) => run.role === "judge")
+        .at(-1)!;
+      const current = this.store.get(gate.id),
+        currentProject = this.store.get(project.id);
+      if (current.status !== "open") return;
+      let action = result.action,
+        answer = result.answer;
+      if (
+        action === "retry" &&
+        task &&
+        (this.store.get(task.id).judgeRetries ?? 0) >= 3
+      ) {
+        action = "wait";
+        answer +=
+          "\nThree judge retries did not clear this task. Human intervention is required before another retry.";
+      }
+      this.store.transaction(() => {
+        this.store.patch(gate.id, {
+          judgeStatus: "answered",
+          judgeAnswer: answer,
+          judgeAction: action,
+          judgeRunId: run.id,
+        });
+        this.store.recordGateResponse(
+          gate,
+          answer,
+          "judge",
+          new Date().toISOString(),
+          run.id,
+        );
+      });
+      if (
+        action !== "wait" &&
+        currentProject.bypass &&
+        currentProject.status === "running"
+      )
+        await this.resolve(
+          gate.id,
+          answer,
+          action === "retry",
+          "judge",
+          run.id,
+        );
+      this.changed(
+        "judge-answered",
+        {
+          gateId: gate.id,
+          action,
+          applied: this.store.get(gate.id).status === "resolved",
+        },
+        project.id,
+      );
+    } catch (error) {
+      const current = this.store.get(gate.id);
+      if (current.status === "open")
+        this.store.patch(gate.id, {
+          judgeStatus: "failed",
+          judgeError: error instanceof Error ? error.message : String(error),
+        });
+      this.changed("judge-failed", { gateId: gate.id }, project.id);
+    }
+  }
+  dispatch(
+    key: string,
+    project: RecordData,
+    work: () => Promise<void>,
+    taskId?: string,
+  ) {
+    this.busy.add(key);
+    Promise.resolve()
+      .then(work)
+      .catch((error) => {
+        if (
+          this.store.get(project.id).status === "running" &&
+          !this.store
+            .all("gate", project.id)
+            .some((gate) => gate.status === "open" && gate.taskId === taskId)
+        )
+          this.gate(
+            project.id,
+            "Work needs attention",
+            error instanceof Error ? error.message : String(error),
+            "runtime",
+            taskId,
+          );
+      })
+      .finally(() => {
+        this.busy.delete(key);
+        this.emit("change");
+      });
   }
   tick() {
     const limit = this.settings().concurrency;
     for (const project of this.store.all("project")) {
-      if (
-        this.busy.size >= limit ||
-        this.busy.has(project.id) ||
-        project.status !== "running"
-      )
-        continue;
+      if (project.status !== "running") continue;
       const gates = this.store
         .all("gate", project.id)
-        .filter((g) => g.status === "open");
-      if (gates.some((g) => !g.taskId)) continue;
+        .filter((gate) => gate.status === "open");
+      const judgeKey = "judge:" + project.id;
+      if (
+        project.bypass &&
+        this.busy.size < limit &&
+        !this.busy.has(judgeKey)
+      ) {
+        const candidate = gates.find(
+          (gate) =>
+            gate.type !== "pr" &&
+            !["answered", "failed", "running"].includes(gate.judgeStatus),
+        );
+        if (candidate)
+          this.dispatch(
+            judgeKey,
+            project,
+            () => this.judge(project, candidate),
+            candidate.taskId,
+          );
+      }
+      if (
+        this.busy.size >= limit ||
+        gates.some(
+          (gate) =>
+            (gate.scope ?? (gate.taskId ? "task" : "project")) === "project",
+        )
+      )
+        continue;
+      const planKey = "plan:" + project.id;
+      if (!project.planned) {
+        if (
+          !gates.length &&
+          !this.busy.has(planKey) &&
+          !this.store
+            .all("run", project.id)
+            .some((run) => run.status === "running" && run.role !== "judge")
+        )
+          this.dispatch(planKey, project, () => this.plan(project));
+        continue;
+      }
       const tasks = this.store.all("task", project.id);
-      for (const task of tasks.filter((task) => task.status === "ready")) {
-        const cancelled = task.dependencies
-          .map((id: string) => this.store.get(id))
-          .find((parent: RecordData) => parent.status === "cancelled");
-        if (cancelled)
+      for (const task of tasks) {
+        if (this.busy.size >= limit) break;
+        const key = "task:" + task.id;
+        if (
+          task.status !== "ready" ||
+          this.busy.has(key) ||
+          gates.some((gate) => gate.taskId === task.id)
+        )
+          continue;
+        const parents = task.dependencies.map((id: string) =>
+          this.store.get(id),
+        );
+        const cancelled = parents.find(
+          (parent: RecordData) => parent.status === "cancelled",
+        );
+        if (cancelled) {
           this.gate(
             project.id,
             "A prerequisite was skipped",
@@ -742,51 +980,26 @@ export class Engine extends EventEmitter {
             "dependency",
             task.id,
           );
-      }
-      const ready = tasks.find(
-        (task) =>
-          task.status === "ready" &&
-          this.store.get(task.id).status === "ready" &&
-          !gates.some((g) => g.taskId === task.id) &&
-          task.dependencies.every(
-            (id: string) => this.store.get(id).status === "completed",
-          ),
-      );
-      if (project.planned && !ready) {
-        if (
-          tasks.length &&
-          tasks.every((task) =>
-            ["completed", "cancelled"].includes(task.status),
-          )
-        ) {
-          this.store.patch(project.id, { planned: false });
-          this.changed("cycle-completed", {}, project.id);
+          continue;
         }
-        continue;
+        if (
+          parents.every((parent: RecordData) => parent.status === "completed")
+        )
+          this.dispatch(
+            key,
+            project,
+            () => this.implement(project, task),
+            task.id,
+          );
       }
-      this.busy.add(project.id);
-      (project.planned ? this.implement(project, ready!) : this.plan(project))
-        .catch((error) => {
-          if (
-            this.store.get(project.id).status === "running" &&
-            !this.store
-              .all("gate", project.id)
-              .some(
-                (gate) => gate.status === "open" && gate.taskId === ready?.id,
-              )
-          )
-            this.gate(
-              project.id,
-              "Work needs attention",
-              error instanceof Error ? error.message : String(error),
-              "runtime",
-              ready?.id,
-            );
-        })
-        .finally(() => {
-          this.busy.delete(project.id);
-          this.emit("change");
-        });
+      if (
+        tasks.length &&
+        !gates.length &&
+        tasks.every((task) => ["completed", "cancelled"].includes(task.status))
+      ) {
+        this.store.patch(project.id, { planned: false });
+        this.changed("cycle-completed", {}, project.id);
+      }
     }
   }
 }

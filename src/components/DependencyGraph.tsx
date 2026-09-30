@@ -62,7 +62,7 @@ export default function DependencyGraph({
               refY="3.5"
               orient="auto"
             >
-              <path d="M0 0 L7 3.5 L0 7" fill="#9aa9a3" />
+              <path d="M0 0 L7 3.5 L0 7" fill="var(--lr-rule-strong)" />
             </marker>
           </defs>
           {tasks.flatMap((task) =>
@@ -77,7 +77,7 @@ export default function DependencyGraph({
                   key={id + task.id}
                   d={`M ${x} ${y} C ${x + 24} ${y}, ${to.x - 24} ${to.y + 38}, ${to.x} ${to.y + 38}`}
                   fill="none"
-                  stroke="#9aa9a3"
+                  stroke="var(--lr-rule-strong)"
                   strokeWidth="1.3"
                   markerEnd="url(#dependency-arrow)"
                 />
@@ -104,7 +104,7 @@ export default function DependencyGraph({
                       : "pending"
                 }
                 size={18}
-                color="#167a72"
+                color="var(--lr-signal)"
                 label=""
               />
               <span>
