@@ -1,9 +1,11 @@
-# Looproom working instructions
+# Looproom contributor instructions
 
-Read `outputs/looproom-wiki/index.md`, then relevant linked pages before work. Maintain the LLM wiki using `outputs/looproom-wiki/SCHEMA.md`: source snapshots are immutable, pages cite evidence, and meaningful changes append to the log.
+Read README.md and docs/workflows/looproom-v1.md before work. In the original design workspace, also read the maintained `../looproom-wiki/index.md` and its relevant linked pages. That wiki uses immutable raw sources, evidence-linked synthesis and a chronological log; do not edit old snapshots.
 
-The user requested GPT-6.1 Sol with High reasoning for orchestration and GPT-6 Sol with Medium reasoning for implementation/subagents. The product's canonical default profiles are in `outputs/looproom-wiki/config/model-profiles.json`. When the user authorizes delegated work, use `gpt-6-sol` and `medium` for children. Do not silently substitute models. The active chat model is controlled by the host, not this file.
+Default profiles live in config/model-profiles.json: GPT-6.1 Sol / High orchestration; GPT-6 Sol / Medium workers. Do not silently substitute models. The host controls the active development chat model. Delegate only when the user or applicable instructions authorizes it; authorized children use gpt-6-sol / medium.
 
-Use the original resource inventory in the wiki. The user has finished mockup exploration; next UI work belongs in the actual application. Preserve Looproom branding and the simple, goal-first onboarding requirement. Product implementation runs in Git worktrees. Every product PR merge needs human approval for the revision being merged.
+Product development runs in Git worktrees. Every product PR merge requires human approval for the exact revision. Keep credentials and external mutations in the coordinator broker; no broad sandbox fallback. Preserve the Looproom brand and simple goal-first flow. Use actual supplied UI components with their retained license notices.
 
-Document work as proposed, researched, implemented, or verified accurately. Current assets and HTML previews are mockups; no application runtime has been implemented yet.
+Document work as proposed, researched, implemented or verified accurately. This is a working local v0; authenticated model execution, real GitHub round-trips and measured self-improvement remain unverified or planned as described in README.md. Do not replace those gaps with fake data or motion.
+
+Run meaningful tests for persistence, scheduling, execution boundaries and merge authority when changing them. Keep node_modules, dist, runtime data and account credentials out of commits.

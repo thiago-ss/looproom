@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "status": "implemented-defaults; live account entitlement unverified",
+  "transport": "codex-app-server",
+  "funding": "chatgpt-plan-oauth",
+  "profiles": {
+    "orchestrator": {
+      "model": "gpt-6.1-sol",
+      "reasoningEffort": "high"
+    },
+    "subagent": {
+      "model": "gpt-6-sol",
+      "reasoningEffort": "medium"
+    }
+  },
+  "roles": {
+    "orchestrator": "orchestrator",
+    "implementation": "subagent",
+    "research": "subagent",
+    "review": "subagent",
+    "experiment": "subagent"
+  },
+  "fallback": "human-gate",
+  "persistRequestedAndEffectiveProfilePerRun": true
+}

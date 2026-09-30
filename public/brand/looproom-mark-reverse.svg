@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Looproom reverse mark</title>
+  <path d="M27 86C16 78 12 63 17 48C23 29 37 18 54 19C70 20 80 31 86 49" fill="none" stroke="#F3F5F2" stroke-width="16" stroke-linecap="round"/>
+  <path d="M82 25C99 23 112 37 111 55C110 74 98 87 81 88" fill="none" stroke="#78BEB2" stroke-width="16" stroke-linecap="round"/>
+  <path d="M70 62H58C41 62 27 74 27 91C27 107 41 116 57 113C74 110 84 98 84 82" fill="none" stroke="#78BEB2" stroke-width="16" stroke-linecap="round"/>
+  <rect x="79" y="59" width="14" height="14" rx="2" fill="#F07859"/>
+</svg>
