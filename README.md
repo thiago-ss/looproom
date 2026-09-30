@@ -2,7 +2,7 @@
 
 A local macOS workspace for continuous, goal-directed agent work. Give a project an outcome; the coordinator plans, assigns isolated worktrees, verifies changes and brings consequential decisions back to you.
 
-**Working v0.** Real local UI, SQLite state and Codex transport are implemented. Native ChatGPT inference and the GitHub PR/merge flow still need an authenticated end-to-end run. The autoresearch evaluator and Jev integration remain planned; this release does not claim measured self-improvement.
+**Working v0.** Real local UI, SQLite state and Codex transport are implemented. Authenticated GPT-6.1 Sol / High planning and GPT-6 Sol / Medium implementation turns have completed. The native independent-review and GitHub PR/merge flow still need an end-to-end run. The autoresearch evaluator and Jev integration remain planned; this release does not claim measured self-improvement.
 
 ## Run
 
@@ -40,7 +40,7 @@ Configuration environment variables:
 4. Add check commands you authorize inside the task worktree. Start the loop for a read-only plan.
 5. Review consequential gates in **Review**. A successful implementation gets checks, an independent review, and a PR. Approve & merge rereads GitHub and submits the displayed head SHA atomically. A changed revision, conflict or pending/failed check blocks merge.
 
-Publishing requires a GitHub `origin` remote, an existing base branch on that remote, and your `gh auth login`. Dependency installation requiring network or other unavailable access becomes a human gate. Package installation has no automatic broad-access fallback.
+Publishing requires a GitHub `origin` remote, an existing base branch on that remote, and your `gh auth login`. For npm projects, identical lockfiles let the broker copy the existing local node_modules into a fresh task worktree without network or lifecycle scripts. Different locks or missing dependencies requiring installation become a human gate. Package installation has no automatic broad-access fallback.
 
 ## Screens
 
@@ -72,7 +72,7 @@ Tests cover persistence, scoped search, transaction rollback, crash recovery, wo
 
 ## Remaining work
 
-Authenticated inference and PR round-trip; parallel task workers inside a project; contradiction review and versioned memory synthesis; protected experiment harness and evaluator promotion; Jev comparison against FTS5; accessibility and performance benchmarks with representative projects; signed macOS distribution. Runtime threads are recorded for audit; retries currently use a fresh thread with preserved worktree and project memory.
+Native independent review and PR round-trip; parallel task workers inside a project; contradiction review and versioned memory synthesis; protected experiment harness and evaluator promotion; Jev comparison against FTS5; accessibility and performance benchmarks with representative projects; signed macOS distribution. Runtime threads are recorded for audit; retries currently use a fresh thread with preserved worktree and project memory.
 
 ## License
 

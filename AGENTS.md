@@ -1,6 +1,6 @@
 # Looproom contributor instructions
 
-Read README.md and docs/workflows/looproom-v1.md before work. In the original design workspace, also read the maintained `../looproom-wiki/index.md` and its relevant linked pages. That wiki uses immutable raw sources, evidence-linked synthesis and a chronological log; do not edit old snapshots.
+Read README.md and docs/workflows/looproom-v1.md before work. The development coordinator maintains the original design workspace’s `../looproom-wiki/index.md` and linked pages. Restricted runtime workers use the contracts shipped within this repository plus project memory supplied by the coordinator; historical sibling docs are outside their workspace. That wiki uses immutable raw sources, evidence-linked synthesis and a chronological log; do not edit old snapshots.
 
 Default profiles live in config/model-profiles.json: GPT-6.1 Sol / High orchestration; GPT-6 Sol / Medium workers. Do not silently substitute models. The host controls the active development chat model. Delegate only when the user or applicable instructions authorizes it; authorized children use gpt-6-sol / medium.
 

@@ -36,7 +36,9 @@ export async function inspectRepo(input: string) {
   );
   const dirty = !!(await git(root, ["status", "--porcelain"]));
   const github =
-    remote.match(/(?:github\.com[:/])([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? "";
+    remote.match(
+      /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+\/[\w.-]+?)(?:\.git)?$/,
+    )?.[1] ?? "";
   return {
     path: root,
     branch: branch || "detached HEAD",
@@ -127,10 +129,10 @@ export async function sandboxCheck(
   await mkdir(codexHome, { recursive: true, mode: 0o700 });
   const config = await permissionConfig(cwd, true);
   const env = {
-    PATH: process.env.PATH,
     HOME: process.env.HOME,
     CODEX_HOME: codexHome,
     TMPDIR: process.env.TMPDIR,
+    ...config.shell_environment_policy.set,
   };
   return new Promise<{ command: string; code: number; output: string }>(
     (resolve, reject) => {

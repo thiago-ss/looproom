@@ -140,7 +140,7 @@ app.get("/api/state", (_req, res) =>
     gates: store.all("gate"),
     agents: store.all("agent"),
     messages: store.all("message"),
-    runs: store.all("run"),
+    runs: store.all("run").map(({ output, ...run }) => run),
     memory: store.all("memory"),
     events: store.events(),
     settings: store.get("settings"),

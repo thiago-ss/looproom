@@ -4,6 +4,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
+import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import {
   inspectRepo,
@@ -324,7 +325,7 @@ export class Engine extends EventEmitter {
     const plan = await this.run(
       project,
       "orchestrator",
-      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. Dependencies are zero-based task indices. The first result is research/planning only. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
+      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. Dependencies are zero-based task indices. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
       Plan,
     );
     validateDependencies(plan.tasks);
@@ -383,6 +384,12 @@ export class Engine extends EventEmitter {
         branch: tree.branch,
       });
     }
+    if (await prepareDependencies(project.path, task.worktree))
+      this.changed(
+        "dependencies-prepared",
+        { taskId: task.id, method: "matching-lockfile-local-copy" },
+        project.id,
+      );
     this.store.patch(task.id, { status: "running", attempt: task.attempt + 1 });
     const context = this.store
       .all("message", project.id)

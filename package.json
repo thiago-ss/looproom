@@ -9,9 +9,9 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "tsc --noEmit && vite build",
-    "start": "tsx server/index.ts",
+    "start": "node --import tsx server/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test server/*.test.ts"
+    "test": "node --import tsx --test server/*.test.ts"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.2.0",
