@@ -1,5 +1,16 @@
 import { useState } from "react";
 import { Shdr11 } from "./ui/shdr-11";
+import { Shdr13 } from "./ui/shdr-13";
+import { Shdr12 } from "./ui/shdr-12";
+import { Shdr16 } from "./ui/shdr-16";
+import { Shdr23 } from "./ui/shdr-23";
+const identities = {
+  orchestrator: Shdr11,
+  implementation: Shdr12,
+  review: Shdr23,
+  research: Shdr16,
+  judge: Shdr13,
+};
 export default function AgentOrb({
   active,
   size = 54,
@@ -10,20 +21,22 @@ export default function AgentOrb({
   identity?: string;
 }) {
   const [unavailable, setUnavailable] = useState(false);
-  const shape =
-    { orchestrator: 0.9, implementation: 0.78, review: 1.03, research: 0.85 }[
-      identity
-    ] ?? 0.9;
+  const Shader = identities[identity as keyof typeof identities] ?? Shdr11;
   return (
-    <span className="agent-orb" aria-hidden="true">
+    <span
+      className={`agent-orb orb-${identity}`}
+      aria-hidden="true"
+      data-orb={identity}
+    >
       {unavailable ? (
-        <img src="/brand/looproom-mark.svg" width={size} height={size} alt="" />
+        <span className="orb-fallback" style={{ width: size, height: size }}>
+          {identity.slice(0, 1).toUpperCase()}
+        </span>
       ) : (
-        <Shdr11
+        <Shader
           size={size}
           state={active ? "thinking" : "idle"}
           maxDpr={1.5}
-          params={{ chromaSpread: 0.04, glow: 0.6, radius: shape }}
           onUnavailable={() => setUnavailable(true)}
         />
       )}

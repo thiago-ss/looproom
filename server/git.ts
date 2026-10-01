@@ -36,7 +36,9 @@ export async function inspectRepo(input: string) {
   );
   const dirty = !!(await git(root, ["status", "--porcelain"]));
   const github =
-    remote.match(/(?:github\.com[:/])([^/]+\/[^/]+?)(?:\.git)?$/)?.[1] ?? "";
+    remote.match(
+      /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([\w.-]+\/[\w.-]+?)(?:\.git)?$/,
+    )?.[1] ?? "";
   return {
     path: root,
     branch: branch || "detached HEAD",
@@ -122,17 +124,18 @@ export async function sandboxCheck(
   cwd: string,
   command: string,
   codexHome: string,
+  signal?: AbortSignal,
 ) {
   const { permissionConfig, configArgs } = await import("./permissions.ts");
   await mkdir(codexHome, { recursive: true, mode: 0o700 });
   const config = await permissionConfig(cwd, true);
   const env = {
-    PATH: process.env.PATH,
     HOME: process.env.HOME,
     CODEX_HOME: codexHome,
     TMPDIR: process.env.TMPDIR,
     // Node otherwise probes a system OpenSSL config outside the worker profile.
     OPENSSL_CONF: "/dev/null",
+    ...config.shell_environment_policy.set,
   };
   return new Promise<{ command: string; code: number; output: string }>(
     (resolve, reject) => {
@@ -151,21 +154,37 @@ export async function sandboxCheck(
           "-c",
           command,
         ],
-        { cwd, env, stdio: ["ignore", "pipe", "pipe"] },
+        { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
       );
       let output = "";
-      const timer = setTimeout(() => child.kill("SIGTERM"), 180_000);
+      let hard: ReturnType<typeof setTimeout> | undefined;
+      const kill = (kind: NodeJS.Signals) => {
+        if (child.pid) try { process.kill(-child.pid, kind); } catch {}
+      };
+      const stop = () => {
+        kill("SIGTERM");
+        hard ??= setTimeout(() => kill("SIGKILL"), 1000);
+      };
+      const timer = setTimeout(stop, 180_000);
+      signal?.addEventListener("abort", stop, { once: true });
+      if (signal?.aborted) stop();
+      const cleanup = () => {
+        clearTimeout(timer);
+        clearTimeout(hard);
+        signal?.removeEventListener("abort", stop);
+        kill("SIGKILL");
+      };
       const read = (chunk: Buffer) => {
         output = (output + chunk.toString()).slice(-100_000);
       };
       child.stdout.on("data", read);
       child.stderr.on("data", read);
       child.on("error", (error) => {
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
+        cleanup();
         resolve({ command, code: code ?? 1, output });
       });
     },

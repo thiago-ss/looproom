@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { once } from "node:events";
 import { mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { sandboxCheck, exec } from "./git.ts";
+import { sandboxCheck, exec, git } from "./git.ts";
 import { testFixture } from "./test-fixtures.ts";
 import { npmReadPath, permissionConfig } from "./permissions.ts";
 
@@ -22,6 +22,7 @@ test(
     const dir = await testFixture("looproom-native-"),
       work = join(dir, "work");
     await mkdir(work);
+    await git(work, ["init", "-b", "main"]);
     await writeFile(join(dir, "outside"), "preserve");
     await writeFile(join(work, ".env.production"), "fixture-secret");
     let requests = 0;
@@ -41,7 +42,7 @@ test(
       const result = await sandboxCheck(
         "codex",
         work,
-        `print inside > inside.txt; print overwrite > ../outside; /bin/cat ../outside; /bin/cat .env.production; /usr/bin/curl --max-time 2 -s -o /dev/null http://127.0.0.1:${port}/; print network-exit:$?`,
+        `git rev-parse --is-inside-work-tree; node --version; npm --version; print tamper > .git/config; print inside > inside.txt; print overwrite > ../outside; /bin/cat ../outside; /bin/cat .env.production; /usr/bin/curl --max-time 2 -s -o /dev/null http://127.0.0.1:${port}/; print network-exit:$?`,
         join(dir, "codex"),
       );
       assert.equal(
@@ -49,6 +50,16 @@ test(
         "inside\n",
       );
       assert.equal(await readFile(join(dir, "outside"), "utf8"), "preserve");
+      assert.match(result.output, /true/);
+      assert.match(result.output, /v\d+\.\d+\.\d+/);
+      assert.doesNotMatch(
+        result.output,
+        /Cannot find module|OpenSSL configuration error|developer tools/,
+      );
+      assert.doesNotMatch(
+        await readFile(join(work, ".git/config"), "utf8"),
+        /tamper/,
+      );
       assert.match(result.output, /Operation not permitted/i);
       assert.doesNotMatch(result.output, /preserve/);
       assert.doesNotMatch(result.output, /fixture-secret/);

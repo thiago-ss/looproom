@@ -1,7 +1,15 @@
+import JudgePending from "./components/JudgePending";
+import { Badge } from "./components/ui/badge";
+import {
+  escalationMode,
+  needsHumanReview,
+  type EscalationMode,
+} from "./lib/autonomy";
 import {
   lazy,
   Suspense,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
@@ -13,6 +21,7 @@ import {
   Check,
   ChevronRight,
   CircleHelp,
+  CornerDownRight,
   ExternalLink,
   FolderGit2,
   GitBranch,
@@ -30,22 +39,43 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "./components/ui/button";
+import { Select } from "./components/ui/select";
+import { Checkbox } from "./components/ui/checkbox";
+import { Accordion } from "./components/arc/accordion/accordion";
+import FolderPicker from "./components/FolderPicker";
+
+import {
+  NotificationCenter,
+  NotificationSettings,
+  useEscalations,
+} from "./components/Notifications";
+import { ToastStack } from "./components/arc/toast-stack/toast-stack";
+import { NumberField } from "./components/arc/number-field/number-field";
+import { ScrollArea } from "./components/arc/scroll-area/scroll-area";
+import { Alert } from "./components/arc/alert/alert";
+import { EmptyState } from "./components/arc/empty-state/empty-state";
+import { ActionButton } from "./components/arc/action-button/action-button";
+import { Skeleton } from "./components/ui/skeleton";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "./components/ui/dialog";
+import { Dialog, DialogContent } from "./components/ui/dialog";
 import { DotmSquare3 } from "./components/ui/dotm-square-3";
 import Stepper, { Step } from "./components/ui/Stepper";
 import StatusMark from "./components/ui/StatusMark";
-import DependencyGraph from "./components/DependencyGraph";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
+import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from "./components/ui/popover";
+import ConversationMessages from "./components/ConversationMessages";
+import { Switch } from "./components/ui/switch";
+const Work = lazy(() => import("./components/Work"));
+import { frontierState, frontierLabel, waitingOnBlocker } from "./lib/work";
 import { api, type Data } from "./lib/api";
 
+const Memory = lazy(() => import("./components/Memory"));
+const Room = lazy(() => import("./components/AgentRoom"));
 const AgentOrb = lazy(() => import("./components/AgentOrb"));
 type View = "goal" | "work" | "room" | "review" | "memory" | "settings";
 const NAV = [
@@ -58,7 +88,7 @@ const NAV = [
 function Pending({ label }: { label: string }) {
   return (
     <span className="pending" role="status">
-      <DotmSquare3 size={18} dotSize={3} color="#167a72" />
+      <DotmSquare3 size={18} dotSize={3} color="var(--lr-signal)" />
       <span>{label}</span>
     </span>
   );
@@ -105,11 +135,12 @@ function Empty({
   children?: React.ReactNode;
 }) {
   return (
-    <div className="empty">
-      <h2>{title}</h2>
-      <p>{text}</p>
-      {children}
-    </div>
+    <EmptyState
+      className="empty"
+      title={title}
+      description={text}
+      action={children}
+    />
   );
 }
 const statusText = (status: string) =>
@@ -148,6 +179,11 @@ export default function App() {
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [inspect, setInspect] = useState<any>(null);
+  const taskOpener = useRef<HTMLElement | null>(null);
+  function inspectTask(task: any) {
+    taskOpener.current = document.activeElement as HTMLElement;
+    setInspect(task);
+  }
   const refreshRef = useRef<() => Promise<void>>(async () => {});
   refreshRef.current = async () => {
     try {
@@ -189,7 +225,7 @@ export default function App() {
       setSelectedId(project.id);
     }
   }, [project?.id]);
-  async function act(fn: () => Promise<any>) {
+  async function act(fn: () => Promise<any>, rethrow = false) {
     setError("");
     setBusy(true);
     try {
@@ -197,35 +233,50 @@ export default function App() {
       await refreshRef.current();
     } catch (error) {
       setError((error as Error).message);
+      if (rethrow) throw error;
     } finally {
       setBusy(false);
     }
   }
+  useEscalations(data?.gates, data?.projects, (projectId: string) => {
+    setSelectedId(projectId);
+    setView("review");
+  });
   if (!data)
     return (
       <main className="boot">
-        <img src="/brand/looproom-mark.svg" alt="Looproom" />
+        <img src="/brand/looproom-mark.svg?v=3" alt="Looproom" />
         <Pending label="Opening your workspace" />
         {connectionError ? (
-          <div role="alert">
-            <p>{connectionError}</p>
+          <Alert tone="danger" title={connectionError}>
             <p>Start the local coordinator with npm run dev.</p>
             <Button onClick={() => refreshRef.current()}>Retry</Button>
-          </div>
+          </Alert>
         ) : null}
       </main>
     );
   const tasks = data.tasks.filter((task) => task.projectId === project?.id),
     gates = data.gates.filter(
-      (gate) => gate.projectId === project?.id && gate.status === "open",
+      (gate) =>
+        gate.projectId === project?.id && needsHumanReview(gate, project ?? {}),
     );
   const runs = data.runs.filter((run) => run.projectId === project?.id),
     messages = data.messages.filter(
       (message) => message.projectId === project?.id,
     );
   const active = runs.filter((run) => run.status === "running");
+  const waiting = project && waitingOnBlocker(
+    project,
+    tasks,
+    data.gates.filter(gate => gate.projectId === project.id),
+    runs,
+  );
   return (
-    <div className="app">
+    <div
+      className={"app" + (!onboarding && view === "goal" ? " goal-view" : "")}
+      data-view={view}
+    >
+      <ToastStack position="bottom-right" />
       {onboarding ? (
         <Onboarding
           data={data}
@@ -249,30 +300,24 @@ export default function App() {
                 setView("goal");
               }}
             >
-              <img src="/brand/looproom-mark-reverse.svg" alt="" />
+              <img src="/brand/looproom-mark-reverse.svg?v=3" alt="" />
               looproom
             </a>
-            <label className="sr-only" htmlFor="project-picker">
-              Project
-            </label>
-            <select
+            <Select
+              label="Project"
               id="project-picker"
-              value={project?.id ?? ""}
-              onChange={(event) => {
-                setSelectedId(event.target.value);
-                setView("goal");
-              }}
               className="project-picker"
-            >
-              {data.projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
+              value={project?.id ?? ""}
+              onValueChange={setSelectedId}
+              options={data.projects.map((project) => ({
+                value: project.id,
+                label: project.name,
+              }))}
+            />
             <nav aria-label="Workspace">
               {NAV.map((item) => (
-                <button
+                <Button
+                  variant="ghost"
                   key={item.id}
                   className={view === item.id ? "selected" : ""}
                   onClick={() => setView(item.id)}
@@ -283,13 +328,17 @@ export default function App() {
                   {item.id === "review" && gates.length ? (
                     <span className="nav-count">{gates.length}</span>
                   ) : null}
-                </button>
+                </Button>
               ))}
             </nav>
-            <button className="new-project" onClick={() => setOnboarding(true)}>
+            <Button
+              variant="ghost"
+              className="new-project"
+              onClick={() => setOnboarding(true)}
+            >
               <Plus size={16} />
               New project
-            </button>
+            </Button>
             <div className="sidebar-bottom">
               <p>
                 <span
@@ -304,19 +353,22 @@ export default function App() {
                   ? "ChatGPT connected"
                   : "Account needed"}
               </p>
-              <button
+              <Button
+                variant="ghost"
                 onClick={() => setView("settings")}
                 className={view === "settings" ? "selected" : ""}
               >
                 <Settings2 size={17} />
                 Settings
-              </button>
+              </Button>
               <div className="local-label">
                 Local on this Mac <ShieldCheck size={13} />
               </div>
             </div>
           </aside>
-          <main className="workspace">
+          <main
+            className={"workspace" + (view === "goal" ? " goal-workspace" : "")}
+          >
             <header className="topbar">
               <div className="breadcrumb">
                 <FolderGit2 size={16} />
@@ -326,11 +378,22 @@ export default function App() {
                   {NAV.find((item) => item.id === view)?.label ?? "Settings"}
                 </span>
               </div>
+              <NotificationCenter
+                gates={data.gates}
+                projects={data.projects}
+                onOpen={(id: string) => {
+                  setSelectedId(id);
+                  setView("review");
+                }}
+              />
               {project ? (
                 <div className="project-controls">
-                  <span className={"status " + project.status}>
+                  {escalationMode(project) === "yolo" ? (
+                    <Badge variant="secondary">YOLO</Badge>
+                  ) : null}
+                  <span className={"status " + (waiting ? "blocked" : project.status)}>
                     <span />
-                    {statusText(project.status)}
+                    {waiting ? (active.some(run => run.role === "judge") ? "Checking blocker" : "Waiting on a blocker") : statusText(project.status)}
                   </span>
                   <Button
                     variant="ghost"
@@ -356,18 +419,15 @@ export default function App() {
               ) : null}
             </header>
             {error || connectionError ? (
-              <div className="error-banner" role="alert">
-                <span>{error || connectionError}</span>
-                <button
-                  aria-label="Dismiss error"
-                  onClick={() => {
-                    setError("");
-                    setConnectionError("");
-                  }}
-                >
-                  <X size={16} />
-                </button>
-              </div>
+              <Alert
+                className="error-banner"
+                tone="danger"
+                title={error || connectionError}
+                onDismiss={() => {
+                  setError("");
+                  setConnectionError("");
+                }}
+              />
             ) : null}
             {!project ? (
               <Empty
@@ -382,29 +442,50 @@ export default function App() {
               <>
                 {view === "goal" ? (
                   <Goal
+                    key={project.id}
                     project={project}
                     messages={messages}
                     active={active}
                     tasks={tasks}
                     gates={gates}
+                    historyGates={data.gates.filter(
+                      (gate) => gate.projectId === project.id,
+                    )}
                     act={act}
                     busy={busy}
                     openReview={() => setView("review")}
-                    openTask={setInspect}
+                    openTask={inspectTask}
                   />
                 ) : null}
                 {view === "work" ? (
-                  <Work tasks={tasks} onSelect={setInspect} />
+                  <Suspense fallback={<Pending label="Opening Work" />}>
+                    <Work
+                      key={project.id}
+                      tasks={tasks}
+                      runs={runs}
+                      messages={messages}
+                      gates={data.gates.filter(
+                        (gate) => gate.projectId === project.id,
+                      )}
+                      project={project}
+                      onSelect={inspectTask}
+                      onReview={() => setView("review")}
+                      onGoal={() => setView("goal")}
+                    />
+                  </Suspense>
                 ) : null}
                 {view === "room" ? (
-                  <Room
-                    runs={runs}
-                    tasks={tasks}
-                    settings={data.settings}
-                    events={data.events.filter(
-                      (event) => event.project_id === project.id,
-                    )}
-                  />
+                  <Suspense fallback={<Pending label="Opening agent room" />}>
+                    <Room
+                      runs={runs}
+                      tasks={tasks}
+                      settings={data.settings}
+                      onSelectTask={inspectTask}
+                      events={data.events.filter(
+                        (event) => event.project_id === project.id,
+                      )}
+                    />
+                  </Suspense>
                 ) : null}
                 {view === "review" ? (
                   <ReviewInbox
@@ -415,12 +496,17 @@ export default function App() {
                   />
                 ) : null}
                 {view === "memory" ? (
-                  <Memory
-                    project={project}
-                    pages={data.memory.filter(
-                      (page) => page.projectId === project.id,
-                    )}
-                  />
+                  <Suspense
+                    fallback={<Skeleton label="Opening memory" lines={4} />}
+                  >
+                    <Memory
+                      key={project.id}
+                      project={project}
+                      pages={data.memory.filter(
+                        (page) => page.projectId === project.id,
+                      )}
+                    />
+                  </Suspense>
                 ) : null}
                 {view === "settings" ? (
                   <Settings
@@ -442,7 +528,9 @@ export default function App() {
             ? (data.tasks.find((task) => task.id === inspect.id) ?? inspect)
             : null
         }
+        tasks={data.tasks}
         onClose={() => setInspect(null)}
+        restoreFocus={() => taskOpener.current?.focus()}
       />
     </div>
   );
@@ -557,7 +645,7 @@ function Onboarding({
     <main className="onboarding">
       <header>
         <a className="wordmark light" href="#">
-          <img src="/brand/looproom-mark.svg" alt="" />
+          <img src="/brand/looproom-mark.svg?v=3" alt="" />
           looproom
         </a>
         {onBack ? (
@@ -586,7 +674,7 @@ function Onboarding({
           <img
             className="brand-sculpture"
             src="/brand/brand-sculpture.png"
-            alt="Two continuous graphite and teal loops meeting at a vermilion gate"
+            alt="Two continuous loops meeting at a human gate"
           />
           <div className="onboarding-promise">
             <ShieldCheck size={18} />
@@ -616,21 +704,6 @@ function Onboarding({
               ...(draft.step === 4 ? { onClick: create } : {}),
             }}
             backButtonProps={{ disabled: pending, className: "setup-back" }}
-            renderStepIndicator={({ step, currentStep }) => (
-              <span
-                className={
-                  "step-number " +
-                  (step === currentStep
-                    ? "active"
-                    : step < currentStep
-                      ? "complete"
-                      : "")
-                }
-                aria-current={step === currentStep ? "step" : undefined}
-              >
-                {step < currentStep ? <Check size={13} /> : step}
-              </span>
-            )}
           >
             <Step>
               <div className="step-heading">
@@ -639,33 +712,26 @@ function Onboarding({
                 <p>Open a repository or start a new project.</p>
               </div>
               <div className="mode-picker">
-                <button
+                <Button
+                  variant="ghost"
                   className={draft.mode === "existing" ? "active" : ""}
                   onClick={() => update("mode", "existing")}
                 >
                   Existing repository
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="ghost"
                   className={draft.mode === "new" ? "active" : ""}
                   onClick={() => update("mode", "new")}
                 >
                   New project
-                </button>
+                </Button>
               </div>
-              <label htmlFor="repo-path">
-                {draft.mode === "new"
-                  ? "New project folder"
-                  : "Repository folder"}
-              </label>
-              <Input
-                id="repo-path"
-                autoFocus
-                placeholder="/Users/you/Projects/my-app"
+
+              <FolderPicker
                 value={draft.path}
-                onChange={(event) => update("path", event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") void inspect();
-                }}
+                onChange={(path) => update("path", path)}
+                mode={draft.mode}
               />
               <Button
                 variant="outline"
@@ -735,7 +801,9 @@ function Onboarding({
                   <a href={authUrl} target="_blank" rel="noreferrer">
                     Open sign-in again
                   </a>
-                  <button onClick={refresh}>I’ve signed in · Refresh</button>
+                  <Button variant="ghost" onClick={refresh}>
+                    I’ve signed in · Refresh
+                  </Button>
                 </p>
               ) : null}
               <div className="model-summary">
@@ -755,15 +823,14 @@ function Onboarding({
                 defaults later in Settings.
               </p>
               {data.runtime.error ? (
-                <p className="field-error">{data.runtime.error}</p>
+                <Alert tone="danger" title={data.runtime.error} />
               ) : null}
               {account?.type !== "chatgpt" ? (
                 <label className="connect-later">
-                  <input
-                    type="checkbox"
+                  <Checkbox
                     checked={draft.connectLater}
-                    onChange={(event) =>
-                      update("connectLater", event.target.checked)
+                    onCheckedChange={(checked) =>
+                      update("connectLater", checked === true)
                     }
                   />
                   Set up my account later
@@ -776,23 +843,23 @@ function Onboarding({
                 <h2>What should get better?</h2>
                 <p>Describe the outcome. Agents will research the path.</p>
               </div>
-              <label htmlFor="project-name">Project name</label>
               <Input
                 id="project-name"
+                label="Project name"
                 value={draft.name}
                 onChange={(event) => update("name", event.target.value)}
               />
-              <label htmlFor="project-goal">Your goal</label>
               <Textarea
                 id="project-goal"
+                label="Your goal"
                 rows={5}
                 value={draft.goal}
                 onChange={(event) => update("goal", event.target.value)}
                 placeholder="Build a workshop booking app that feels clear, fast, and welcoming. Organizers should manage sessions; visitors should reserve a place."
               />
-              <label htmlFor="project-constraints">Boundaries</label>
               <Textarea
                 id="project-constraints"
+                label="Boundaries"
                 rows={2}
                 value={draft.constraints}
                 onChange={(event) => update("constraints", event.target.value)}
@@ -812,11 +879,9 @@ function Onboarding({
                 <dt>Goal</dt>
                 <dd>{draft.goal}</dd>
               </dl>
-              <label htmlFor="setup-checks">
-                Acceptance checks · one command per line
-              </label>
               <Textarea
                 id="setup-checks"
+                label="Acceptance checks · one command per line"
                 rows={2}
                 value={draft.checks}
                 onChange={(event) => update("checks", event.target.value)}
@@ -832,9 +897,13 @@ function Onboarding({
             </Step>
           </Stepper>
           {error ? (
-            <p className="setup-error" role="alert">
+            <Alert
+              tone="danger"
+              title="Could not continue"
+              className="setup-error"
+            >
               {error}
-            </p>
+            </Alert>
           ) : null}
           {pending ? (
             <div className="setup-loading">
@@ -858,123 +927,190 @@ function Goal({
   active,
   tasks,
   gates,
+  historyGates,
   act,
   busy,
   openReview,
   openTask,
 }: any) {
   const [text, setText] = useState("");
-  const end = useRef<HTMLDivElement>(null);
+  const [replyId, setReplyId] = useState<string | null>(null);
+  const input = useRef<HTMLTextAreaElement>(null);
+  const replyGate = historyGates.find((gate: any) => gate.id === replyId);
+  function reply(gate: any) {
+    setReplyId(gate.id);
+    input.current?.focus();
+  }
+  const chat = useRef<HTMLDivElement>(null);
+  const flow = useRef<HTMLDivElement>(null);
+  const follow = useRef(true);
+  const [showLatest, setShowLatest] = useState(false);
+  function latest() {
+    if (chat.current) chat.current.scrollTop = chat.current.scrollHeight;
+    follow.current = true;
+    setShowLatest(false);
+  }
+  useLayoutEffect(latest, []);
+  useLayoutEffect(() => {
+    if (follow.current) latest();
+  }, [messages.length, gates.length, active.length]);
   useEffect(() => {
-    end.current?.scrollIntoView({ behavior: "instant", block: "end" });
-  }, [messages.length]);
+    const observer = new ResizeObserver(() => {
+      if (follow.current) latest();
+    });
+    if (flow.current) observer.observe(flow.current);
+    return () => observer.disconnect();
+  }, []);
   function send(event: FormEvent) {
     event.preventDefault();
     if (!text.trim()) return;
     const value = text;
     void act(async () => {
-      await api("/projects/" + project.id + "/messages", { text: value });
+      if (replyId)
+        await api("/gates/" + replyId + "/resolve", {
+          answer: value,
+          retry: true,
+        });
+      else await api("/projects/" + project.id + "/messages", { text: value });
       setText("");
+      setReplyId(null);
+      latest();
     });
   }
+  const context = (
+    <GoalContext
+      project={project}
+      tasks={tasks}
+      gates={gates}
+      active={active}
+      openTask={openTask}
+    />
+  );
   return (
     <div className="goal-layout">
       <section className="conversation">
-        <div className="page-intro">
+        <h1 className="sr-only">Goal</h1>
+        <div className="page-intro goal-toolbar">
           <div className="repo-line">
             <GitBranch size={13} />
             {project.branch}
             <span>·</span>
-            <span>Goal conversation</span>
+            <span>Conversation</span>
           </div>
-          <h1>{project.name}</h1>
-          <p>Move the goal forward. Keep the evidence close.</p>
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className="context-toggle">
+                <Layers3 size={14} />
+                Context
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent align="end" className="goal-context-popover">
+              {context}
+            </PopoverContent>
+          </Popover>
         </div>
-        <div className="messages">
-          {messages.map((message: any) => (
-            <article key={message.id} className={"message " + message.role}>
-              <div className="message-byline">
-                {message.role === "human" ? (
-                  <span className="human-avatar">You</span>
-                ) : (
-                  <img src="/brand/looproom-mark.svg" alt="" />
-                )}
-                <strong>
-                  {message.role === "human" ? "You" : "Orchestrator"}
-                </strong>
-                <DateLabel date={message.createdAt} />
-              </div>
-              <div className="message-body">{message.text}</div>
-            </article>
-          ))}
-          {active.map((run: any) => (
-            <article key={run.id} className="message live">
-              <div className="message-byline">
-                <Orb active size={34} identity={run.role} />
-                <strong>{run.role}</strong>
-                <span className="live-label">Thinking</span>
-              </div>
-              <div className="message-body">
-                <Pending
-                  label={
-                    run.activity === "fileChange"
-                      ? "Updating the assigned worktree"
-                      : run.activity === "commandExecution"
-                        ? "Running a command in the project"
-                        : run.activity === "webSearch"
-                          ? "Checking source evidence"
-                          : run.role === "orchestrator"
-                            ? "Reading the project and finding the first useful step"
-                            : "Working on the assigned task"
+        <ScrollArea
+          className="conversation-scroll"
+          viewportClassName="messages"
+          viewportRef={chat}
+          label="Goal conversation"
+          fade={0}
+          onScroll={() => {
+            const element = chat.current!;
+            follow.current =
+              element.scrollHeight - element.scrollTop - element.clientHeight <
+              64;
+            setShowLatest(!follow.current);
+          }}
+        >
+          <div className="conversation-flow" ref={flow}>
+            <ConversationMessages
+              mode={escalationMode(project)}
+              messages={messages}
+              gates={historyGates}
+              onReply={reply}
+              onReview={openReview}
+            />
+            {active.map((run: any) => (
+              <article key={run.id} className="message live">
+                <div className="message-byline">
+                  <Orb active size={34} identity={run.role} />
+                  <strong>{run.role}</strong>
+                  <span className="live-label">Thinking</span>
+                </div>
+                <div className="message-body">
+                  <Pending
+                    label={
+                      run.activity === "fileChange"
+                        ? "Updating the assigned worktree"
+                        : run.activity === "commandExecution"
+                          ? "Running a command in the project"
+                          : run.activity === "webSearch"
+                            ? "Checking source evidence"
+                            : run.role === "orchestrator"
+                              ? "Reading the project and finding the first useful step"
+                              : "Working on the assigned task"
+                    }
+                  />
+                </div>
+              </article>
+            ))}
+            {!active.length && !tasks.length ? (
+              <div className="first-step">
+                <h2>Your goal is ready.</h2>
+                <p>Turn your goal into a plan.</p>
+                <Button
+                  disabled={busy}
+                  onClick={() =>
+                    act(() =>
+                      api("/projects/" + project.id + "/control", {
+                        action: "start",
+                      }),
+                    )
                   }
-                />
+                >
+                  <Play size={14} />
+                  Start planning
+                </Button>
               </div>
-            </article>
-          ))}
-          {!active.length && !tasks.length ? (
-            <div className="first-step">
-              <h2>Your goal is ready.</h2>
-              <p>
-                Start the loop to get a sourced plan. Agents will implement in
-                worktrees and bring PRs back here for review.
-              </p>
+            ) : null}
+          </div>
+        </ScrollArea>
+        {showLatest ? (
+          <Button
+            className="latest-message"
+            variant="secondary"
+            size="sm"
+            onClick={latest}
+          >
+            <ArrowDown size={14} />
+            Latest messages
+          </Button>
+        ) : null}
+        <form className="composer" onSubmit={send}>
+          {replyGate ? (
+            <div className="composer-reply">
+              <CornerDownRight size={14} />
+              <span>
+                {replyGate.status === "open" ? "Reply to" : "Already answered"}{" "}
+                · {replyGate.title}
+              </span>
               <Button
-                disabled={busy}
-                onClick={() =>
-                  act(() =>
-                    api("/projects/" + project.id + "/control", {
-                      action: "start",
-                    }),
-                  )
-                }
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                aria-label="Cancel escalation reply"
+                onClick={() => setReplyId(null)}
               >
-                <Play size={14} />
-                Start planning
+                <X size={14} />
               </Button>
             </div>
           ) : null}
-          {gates.length ? (
-            <button className="inline-gate" onClick={openReview}>
-              <span className="gate-square" />
-              <div>
-                <strong>
-                  {gates.length === 1
-                    ? gates[0].title
-                    : gates.length + " decisions need you"}
-                </strong>
-                <p>{gates[0].detail?.slice(0, 160)}</p>
-              </div>
-              <ArrowRight size={17} />
-            </button>
-          ) : null}
-          <div ref={end} />
-        </div>
-        <form className="composer" onSubmit={send}>
-          <label className="sr-only" htmlFor="message">
-            Message your agents
-          </label>
+
           <Textarea
             id="message"
+            label="Message your agents"
+            ref={input}
             value={text}
             onChange={(event) => setText(event.target.value)}
             placeholder="Add context, clarify the goal, or leave a direction…"
@@ -985,260 +1121,89 @@ function Goal({
             }}
           />
           <div>
-            <span>⌘ Enter to send · Context stays with this project</span>
-            <Button type="submit" disabled={busy || !text.trim()} size="sm">
-              Send
+            <span aria-label="Command Enter to send">⌘ ↵</span>
+            <Button
+              type="submit"
+              disabled={
+                busy ||
+                !text.trim() ||
+                (!!replyGate && replyGate.status !== "open")
+              }
+              size="sm"
+            >
+              {replyGate ? "Reply & retry" : "Send"}
               <ArrowRight size={14} />
             </Button>
           </div>
         </form>
       </section>
-      <aside className="goal-context">
-        <h2>In motion</h2>
-        {active.length ? (
-          active.map((run: any) => (
-            <div className="context-agent" key={run.id}>
-              <Orb active />
-              <div>
-                <strong>{run.role}</strong>
-                <span>{run.model}</span>
-                <small>{run.effort} reasoning</small>
-              </div>
-            </div>
-          ))
-        ) : (
-          <p className="muted">
-            Agents are{" "}
-            {project.status === "paused"
-              ? "paused"
-              : gates.length
-                ? "waiting at a gate"
-                : "idle"}
-            .
-          </p>
-        )}
-        <div className="context-heading">
-          <h2>Work frontier</h2>
-          <span>
-            {tasks.filter((task: any) => task.status === "completed").length} /{" "}
-            {tasks.length}
-          </span>
-        </div>
-        {tasks.length ? (
-          tasks.slice(-6).map((task: any) => (
-            <button
-              className="context-task"
-              onClick={() => openTask(task)}
-              key={task.id}
-            >
-              <StatusMark
-                status={glyph(task.status)}
-                size={17}
-                label=""
-                color="#167a72"
-                doneColor="#25724b"
-              />
-              <div>
-                <strong>{task.title}</strong>
-                <span>{statusText(task.status)}</span>
-              </div>
-            </button>
-          ))
-        ) : (
-          <p className="muted">
-            The first plan will create a small set of useful tasks.
-          </p>
-        )}
-        <div className="context-authority">
-          <Square size={13} />
-          <p>
-            Human approval
-            <br />
-            <strong>Required for every merge</strong>
-          </p>
-        </div>
-      </aside>
+      <div className="goal-context-rail">{context}</div>
     </div>
   );
 }
 
-function Work({
-  tasks,
-  onSelect,
-}: {
-  tasks: any[];
-  onSelect: (task: any) => void;
-}) {
-  const [view, setView] = useState("list");
+function GoalContext({ project, tasks, gates, active, openTask }: any) {
   return (
-    <section className="page">
-      <div className="page-heading">
-        <div>
-          <h1>Work</h1>
-          <p>Useful steps, explicit dependencies.</p>
-        </div>
-        <div className="mode-picker compact">
-          <button
-            className={view === "list" ? "active" : ""}
-            onClick={() => setView("list")}
-          >
-            List
-          </button>
-          <button
-            className={view === "graph" ? "active" : ""}
-            onClick={() => setView("graph")}
-          >
-            Dependencies
-          </button>
-        </div>
-      </div>
-      {!tasks.length ? (
-        <Empty
-          title="A plan comes first"
-          text="Start the goal loop. The orchestrator will turn the outcome into bounded, verifiable tasks."
-        />
-      ) : view === "graph" ? (
-        <DependencyGraph tasks={tasks} onSelect={onSelect} />
-      ) : (
-        <div className={"work-list " + view}>
-          <div className="work-header">
-            <span>Task</span>
-            <span>State</span>
-            <span>Dependencies</span>
-            <span>Evidence</span>
+    <aside className="goal-context">
+      <h2>In motion</h2>
+      {active.length ? (
+        active.map((run: any) => (
+          <div className="context-agent" key={run.id}>
+            <Orb active identity={run.role} />
+            <div>
+              <strong>{run.role}</strong>
+              <span>{run.model}</span>
+              <small>{run.effort} reasoning</small>
+            </div>
           </div>
-          {tasks.map((task) => (
-            <button
-              className="work-row"
-              key={task.id}
-              onClick={() => onSelect(task)}
-            >
-              <div className="work-title">
-                <StatusMark
-                  status={glyph(task.status)}
-                  label=""
-                  size={20}
-                  color="#167a72"
-                  doneColor="#25724b"
-                />
-                <div>
-                  <strong>{task.title}</strong>
-                  <small>
-                    {task.kind} · {task.id.slice(0, 8)}
-                  </small>
-                </div>
-              </div>
-              <span className={"status " + task.status}>
-                {statusText(task.status)}
-              </span>
-              <span className="dependencies">
-                {task.dependencies.length
-                  ? task.dependencies
-                      .map(
-                        (id: string) =>
-                          tasks.find((t) => t.id === id)?.title ?? id,
-                      )
-                      .join(" → ")
-                  : "Ready frontier"}
-              </span>
-              <span>
-                {task.pr ? (
-                  <>
-                    <GitPullRequest size={14} />
-                    PR ready
-                  </>
-                ) : task.checks?.length ? (
-                  task.checks.filter((c: any) => c.code === 0).length +
-                  " checks passed"
-                ) : (
-                  "—"
-                )}
-              </span>
-            </button>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function Room({ runs, tasks, settings, events }: any) {
-  const roles = ["orchestrator", "implementation", "review", "research"];
-  return (
-    <section className="page">
-      <div className="page-heading">
-        <div>
-          <h1>Agent room</h1>
-          <p>One shared goal. Clear ownership and handoffs.</p>
-        </div>
-        <span className="mono">Local runtime</span>
-      </div>
-      <div className="agent-room">
-        {roles.map((role) => {
-          const active = runs.find(
-            (r: any) => r.role === role && r.status === "running",
-          );
-          const latest = runs.filter((r: any) => r.role === role).at(-1);
-          const profile =
-            role === "orchestrator" ? settings.orchestrator : settings.subagent;
-          const task = tasks.find((t: any) => t.id === active?.taskId);
-          return (
-            <article className="agent-row" key={role}>
-              <Orb active={!!active} size={76} identity={role} />
-              <div className="agent-info">
-                <h2>{role[0].toUpperCase() + role.slice(1)}</h2>
-                <p>
-                  {task?.title ??
-                    (active
-                      ? "Researching the next useful step"
-                      : latest?.error
-                        ? "Last run needs attention"
-                        : "Waiting for assigned work")}
-                </p>
-                <span className="mono">
-                  {profile.model} · {profile.effort}
-                </span>
-              </div>
-              <span className={"status " + (active ? "running" : "idle")}>
-                <span />
-                {active ? "Thinking" : "Idle"}
-              </span>
-            </article>
-          );
-        })}
-      </div>
-      <div className="section-heading">
-        <h2>Handoffs and events</h2>
-        <span>Recorded by the coordinator</span>
-      </div>
-      {events.length ? (
-        <ol className="event-list">
-          {events.slice(0, 25).map((event: any) => (
-            <li key={event.seq}>
-              <span
-                className={
-                  event.type.includes("gate") ? "gate-square" : "event-dot"
-                }
-              />
-              <div>
-                <strong>{event.type.replaceAll("-", " ")}</strong>
-                <p>
-                  {event.data.title ??
-                    event.data.command ??
-                    event.data.summary ??
-                    event.data.role ??
-                    event.data.pr ??
-                    "Project state recorded"}
-                </p>
-              </div>
-              <DateLabel date={event.created_at} />
-            </li>
-          ))}
-        </ol>
+        ))
       ) : (
-        <p className="muted">Real handoffs will appear after the first run.</p>
+        <p className="muted">
+          Agents are{" "}
+          {project.status === "paused"
+            ? "paused"
+            : gates.length
+              ? "waiting at a gate"
+              : "idle"}
+          .
+        </p>
       )}
-    </section>
+      <div className="context-heading">
+        <h2>Work frontier</h2>
+        <span>
+          {tasks.filter((task: any) => task.status === "completed").length} /{" "}
+          {tasks.length}
+        </span>
+      </div>
+      {tasks.length ? (
+        tasks.slice(-6).map((task: any) => (
+          <Button
+            variant="ghost"
+            className="context-task"
+            onClick={() => openTask(task)}
+            key={task.id}
+          >
+            <StatusMark
+              status={glyph(task.status)}
+              size={17}
+              label=""
+              color="var(--lr-signal)"
+              doneColor="var(--lr-verified)"
+            />
+            <div>
+              <strong>{task.title}</strong>
+              <span>{frontierLabel(frontierState(task, tasks))}</span>
+            </div>
+          </Button>
+        ))
+      ) : (
+        <p className="muted">No tasks yet.</p>
+      )}
+      <div className="context-authority">
+        <Square size={13} />
+        <p>Approval before every merge</p>
+      </div>
+    </aside>
   );
 }
 
@@ -1248,15 +1213,20 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
     [pr, setPr] = useState<any>(null),
     [diff, setDiff] = useState(""),
     [loadError, setLoadError] = useState(""),
-    [confirm, setConfirm] = useState(false),
+    [confirm, setConfirm] = useState<{ gateId: string; sha: string } | null>(
+      null,
+    ),
     [loading, setLoading] = useState(false);
   const gate = gates.find((gate: any) => gate.id === selected) ?? gates[0];
   const task = tasks.find((task: any) => task.id === gate?.taskId);
+  const mergeOpener = useRef<HTMLElement | null>(null);
   useEffect(() => {
     setPr(null);
     setDiff("");
     setAnswer("");
     setLoadError("");
+    setLoading(false);
+    setConfirm(null);
     if (!gate || gate.type !== "pr") return;
     let alive = true;
     setLoading(true);
@@ -1283,45 +1253,103 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
   if (!gates.length)
     return (
       <section className="page">
-        <h1>Review</h1>
-        <Empty
-          title="Nothing needs your judgment."
-          text="Agents will bring a decision here when they need your authority, access, or a PR merge."
+        <h1 className="sr-only">Review</h1>
+        <EmptyState
+          className="review-clear"
+          title="No decisions waiting"
+          description="Approval before every merge"
+          icon={<ShieldCheck size={40} />}
         />
       </section>
     );
+  const response = (
+    <div className="decision-response">
+      <Textarea
+        id="gate-answer"
+        label={gate.type === "pr" ? "Request changes" : "Your decision"}
+        rows={3}
+        value={answer}
+        onChange={(event) => setAnswer(event.target.value)}
+        placeholder={
+          gate.type === "pr"
+            ? "Describe what should change before merging…"
+            : "How should the agents proceed?"
+        }
+      />
+      <div className="response-actions">
+        <Button
+          variant="outline"
+          disabled={busy || !answer.trim()}
+          onClick={() =>
+            act(() =>
+              api("/gates/" + gate.id + "/resolve", {
+                answer,
+                retry: true,
+              }),
+            )
+          }
+        >
+          {gate.type === "pr" ? "Request changes" : "Resolve & retry"}
+          <ArrowRight size={14} />
+        </Button>
+        {gate.taskId && gate.type !== "pr" ? (
+          <Button
+            variant="ghost"
+            disabled={busy || !answer.trim()}
+            onClick={() =>
+              act(() =>
+                api("/gates/" + gate.id + "/resolve", {
+                  answer,
+                  retry: false,
+                }),
+              )
+            }
+          >
+            Skip this task
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
   return (
     <section className="page review-page">
-      <div className="page-heading">
-        <div>
-          <h1>Review</h1>
-          <p>
-            {gates.length} {gates.length === 1 ? "decision" : "decisions"}{" "}
-            waiting for you.
-          </p>
-        </div>
+      <h1 className="sr-only">Review</h1>
+      <div className="workspace-caption">
+        <span className="mono">
+          {gates.length} {gates.length === 1 ? "decision" : "decisions"} waiting
+        </span>
         <span className="approval-note">
           <Square size={12} />
-          Human gate
+          Human approval required
         </span>
       </div>
       <div className="review-layout">
         <div className="review-queue">
+          <div className="review-queue-label">
+            Decision inbox <span>{gates.length}</span>
+          </div>
           {gates.map((item: any) => (
-            <button
+            <Button
+              variant="ghost"
               key={item.id}
               className={item.id === gate.id ? "active" : ""}
+              aria-pressed={item.id === gate.id}
               onClick={() => setSelected(item.id)}
             >
               <span className="gate-square" />
               <div>
+                <small className="gate-kind">
+                  {item.type === "pr"
+                    ? "Pull request"
+                    : item.type.replaceAll("_", " ")}
+                </small>
                 <strong>{item.title}</strong>
                 <span>
                   {tasks.find((task: any) => task.id === item.taskId)?.title ??
                     "Project direction"}
                 </span>
               </div>
-            </button>
+            </Button>
           ))}
         </div>
         <article className="review-document">
@@ -1330,8 +1358,111 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
             <span>·</span>
             <DateLabel date={gate.createdAt} />
           </div>
-          <h2>{task?.title ?? gate.title}</h2>
-          <p className="review-summary">{gate.detail}</p>
+
+          <h2>{gate.title}</h2>
+          {task ? (
+            <p className="dossier-task">
+              <Layers3 size={14} />
+              {task.title}
+            </p>
+          ) : null}
+          <div
+            className="decision-brief"
+            tabIndex={0}
+            aria-label="Decision context"
+          >
+            <p className="review-summary">{gate.detail}</p>
+          </div>
+          {gate.judgeStatus ? (
+            <div className="judge-assessment">
+              <strong>
+                {gate.judgeSubmittedAt ? "Judge reply" : "Judge draft"}
+              </strong>
+              {["pending", "running"].includes(gate.judgeStatus) ? (
+                <p role="status" aria-live="polite">
+                  <JudgePending
+                    text={
+                      gate.judgeRecoveryStatus === "verifying"
+                        ? "Running isolated checks…"
+                        : gate.judgeRecoveryStatus === "running"
+                        ? "Resolving this escalation…"
+                        : "Reviewing this escalation…"
+                    }
+                  />
+                </p>
+              ) : (
+                <p>{gate.judgeAnswer ?? gate.judgeError}</p>
+              )}
+              {gate.judgeAnswer &&
+              !gate.judgeSubmittedAt &&
+              gate.type !== "pr" ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setAnswer(gate.judgeAnswer)}
+                >
+                  Use judge draft
+                </Button>
+              ) : null}
+              {gate.judgeSources?.length ? (
+                <p className="muted">{gate.judgeSources.join(" · ")}</p>
+              ) : null}
+              {gate.judgeStatus !== "running" ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={busy}
+                  onClick={() =>
+                    act(() => api("/gates/" + gate.id + "/judge", {}))
+                  }
+                >
+                  Ask judge again
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+          {gate.type !== "pr" ? response : null}
+          {gate.type !== "pr" && task ? (
+            <Tabs
+              key={gate.id}
+              defaultValue="contract"
+              className="decision-evidence"
+            >
+              <TabsList variant="line">
+                <TabsTrigger value="contract">Task contract</TabsTrigger>
+                <TabsTrigger value="checks">Recorded checks</TabsTrigger>
+              </TabsList>
+              <TabsContent value="contract">
+                <p>{task.description}</p>
+                {task.acceptance?.length ? (
+                  <ul>
+                    {task.acceptance.map((criterion: string, index: number) => (
+                      <li key={index}>{criterion}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </TabsContent>
+              <TabsContent value="checks">
+                {task.checks?.length ? (
+                  <ul className="check-list">
+                    {task.checks.map((check: any, index: number) => (
+                      <li key={index}>
+                        <StatusMark
+                          status={check.code === 0 ? "done" : "failed"}
+                          label=""
+                          size={16}
+                        />
+                        <span className="mono">{check.command}</span>
+                        <span>Exit {check.code}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No recorded checks.</p>
+                )}
+              </TabsContent>
+            </Tabs>
+          ) : null}
           {gate.type === "pr" ? (
             <>
               <a
@@ -1346,11 +1477,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
               {loading ? (
                 <Pending label="Fetching the current PR revision and diff" />
               ) : null}
-              {loadError ? (
-                <p className="field-error" role="alert">
-                  {loadError}
-                </p>
-              ) : null}
+              {loadError ? <Alert tone="danger" title={loadError} /> : null}
               {pr ? (
                 <>
                   <dl className="revision">
@@ -1362,16 +1489,20 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                     </dd>
                   </dl>
                   {pr.headRefOid !== gate.sha ? (
-                    <p className="field-error">
-                      Revision changed. Request changes so agents can verify and
-                      publish the new commit.
-                    </p>
+                    <Alert tone="warning" title="Revision changed">
+                      Request changes so agents can verify and publish the new
+                      commit.
+                    </Alert>
                   ) : null}
                   <h3>Verification</h3>
                   <ul className="check-list">
                     {task?.checks?.map((check: any, i: number) => (
                       <li key={i}>
-                        <Check size={15} />
+                        <StatusMark
+                          status={check.code === 0 ? "done" : "failed"}
+                          size={15}
+                          label=""
+                        />
                         <span className="mono">{check.command}</span>
                         <span>Exit {check.code}</span>
                       </li>
@@ -1394,10 +1525,29 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                       </li>
                     ))}
                   </ul>
-                  <details>
-                    <summary>Read the full diff</summary>
-                    <pre className="diff">{diff || "No diff returned."}</pre>
-                  </details>
+                  <Tabs defaultValue="files" className="review-diff-tabs">
+                    <TabsList>
+                      <TabsTrigger value="files">Change summary</TabsTrigger>
+                      <TabsTrigger value="diff">Full diff</TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="files">
+                      <p className="muted">
+                        {pr.files?.length ?? 0} files · +
+                        {pr.files?.reduce(
+                          (sum: number, file: any) => sum + file.additions,
+                          0,
+                        ) ?? 0}{" "}
+                        / −
+                        {pr.files?.reduce(
+                          (sum: number, file: any) => sum + file.deletions,
+                          0,
+                        ) ?? 0}
+                      </p>
+                    </TabsContent>
+                    <TabsContent value="diff">
+                      <pre className="diff">{diff || "No diff returned."}</pre>
+                    </TabsContent>
+                  </Tabs>
                   <Button
                     className="merge-button"
                     disabled={
@@ -1406,7 +1556,11 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                       pr.state !== "OPEN" ||
                       pr.mergeable !== "MERGEABLE"
                     }
-                    onClick={() => setConfirm(true)}
+                    onClick={() => {
+                      mergeOpener.current =
+                        document.activeElement as HTMLElement;
+                      setConfirm({ gateId: gate.id, sha: pr.headRefOid });
+                    }}
                   >
                     <GitPullRequest size={15} />
                     Approve & merge
@@ -1415,186 +1569,62 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
               ) : null}
             </>
           ) : null}
-          <div className="decision-response">
-            <label htmlFor="gate-answer">
-              {gate.type === "pr"
-                ? "Request changes"
-                : "Your decision or resolution"}
-            </label>
-            <Textarea
-              id="gate-answer"
-              rows={3}
-              value={answer}
-              onChange={(event) => setAnswer(event.target.value)}
-              placeholder={
-                gate.type === "pr"
-                  ? "Describe what should change before merging…"
-                  : "Answer the question, or describe what you fixed…"
-              }
-            />
-            <div className="response-actions">
-              <Button
-                variant="outline"
-                disabled={busy || !answer.trim()}
-                onClick={() =>
-                  act(() =>
-                    api("/gates/" + gate.id + "/resolve", {
-                      answer,
-                      retry: true,
-                    }),
-                  )
-                }
-              >
-                {gate.type === "pr" ? "Request changes" : "Resolve & retry"}
-                <ArrowRight size={14} />
-              </Button>
-              {gate.taskId && gate.type !== "pr" ? (
-                <Button
-                  variant="ghost"
-                  disabled={busy || !answer.trim()}
-                  onClick={() =>
-                    act(() =>
-                      api("/gates/" + gate.id + "/resolve", {
-                        answer,
-                        retry: false,
-                      }),
-                    )
-                  }
-                >
-                  Skip this task
-                </Button>
-              ) : null}
-            </div>
-          </div>
+          {gate.type === "pr" ? response : null}
         </article>
       </div>
-      <Dialog open={confirm} onOpenChange={setConfirm}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Merge this revision?</DialogTitle>
-            <DialogDescription>
-              This merges the reviewed pull request on GitHub. Looproom will
-              check the commit again before submitting the merge.
-            </DialogDescription>
-          </DialogHeader>
-          <p className="mono confirm-sha">{pr?.headRefOid}</p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setConfirm(false)}>
+      <Dialog
+        open={!!confirm}
+        onOpenChange={(open) => {
+          if (!open) setConfirm(null);
+        }}
+      >
+        <DialogContent
+          title="Merge this revision?"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            mergeOpener.current?.focus();
+          }}
+          description="This merges the reviewed pull request on GitHub. Looproom will check the commit again before submitting the merge."
+        >
+          <p className="mono confirm-sha">{confirm?.sha}</p>
+          <div className="dialog-actions">
+            <Button variant="outline" onClick={() => setConfirm(null)}>
               Keep reviewing
             </Button>
             <Button
               disabled={busy}
               onClick={() =>
                 act(async () => {
-                  await api("/gates/" + gate.id + "/approve", {
-                    sha: pr.headRefOid,
+                  if (!confirm) return;
+                  await api("/gates/" + confirm.gateId + "/approve", {
+                    sha: confirm.sha,
                   });
-                  setConfirm(false);
+                  setConfirm(null);
                 })
               }
             >
               Approve & merge
             </Button>
-          </DialogFooter>
+          </div>
         </DialogContent>
       </Dialog>
     </section>
   );
 }
 
-function Memory({ project, pages }: any) {
-  const [query, setQuery] = useState(""),
-    [results, setResults] = useState<any[] | null>(null),
-    [error, setError] = useState("");
-  async function search(event: FormEvent) {
-    event.preventDefault();
-    try {
-      setResults(
-        await api(
-          "/projects/" + project.id + "/memory?q=" + encodeURIComponent(query),
-        ),
-      );
-      setError("");
-    } catch (error) {
-      setError((error as Error).message);
-    }
-  }
-  return (
-    <section className="page reading-page">
-      <div className="page-heading">
-        <div>
-          <h1>Project memory</h1>
-          <p>Outcomes, sources, and a history that survives restarts.</p>
-        </div>
-        <span className="mono">SQLite FTS5 + LLM wiki</span>
-      </div>
-      <form onSubmit={search} className="memory-search">
-        <label className="sr-only" htmlFor="memory-query">
-          Search project memory
-        </label>
-        <Input
-          id="memory-query"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search decisions, findings, and outcomes"
-        />
-        <Button variant="outline" type="submit">
-          <Search size={15} />
-          Search
-        </Button>
-      </form>
-      {error ? <p role="alert">{error}</p> : null}
-      {(results ?? pages).length ? (
-        (results ?? pages).map((page: any) => (
-          <article className="memory-document" key={page.id}>
-            <h2>{page.title}</h2>
-            <p>{page.content}</p>
-            <div className="evidence">
-              <strong>Agent-reported outcome</strong>
-              <span>Verification lives with the task and PR.</span>
-            </div>
-            {page.sources?.length ? (
-              <ul>
-                {page.sources.map((source: string, i: number) => (
-                  <li key={i}>
-                    <span className="source-marker">[{i + 1}]</span>
-                    {/^https:\/\//.test(source) ? (
-                      <a href={source} target="_blank" rel="noreferrer">
-                        {source}
-                      </a>
-                    ) : (
-                      <span className="mono">{source}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="muted">No external sources cited.</p>
-            )}
-          </article>
-        ))
-      ) : (
-        <Empty
-          title={
-            query
-              ? "No matching memory yet."
-              : "Knowledge starts with evidence."
-          }
-          text="Completed agent runs will create Markdown pages, source records, an index, and an append-only log."
-        />
-      )}
-    </section>
-  );
-}
-
 function Settings({ data, project, act, busy, refresh }: any) {
-  const [settings, setSettings] = useState(data.settings),
+  const [settings, setSettings] = useState({
+      ...data.settings,
+      judge: data.settings.judge ?? data.settings.subagent,
+    }),
+    [mode, setMode] = useState<EscalationMode>(escalationMode(project)),
     [checks, setChecks] = useState(project.checks.join("\n")),
     [constraints, setConstraints] = useState(project.constraints),
     [authUrl, setAuthUrl] = useState("");
   useEffect(() => {
     setChecks(project.checks.join("\n"));
     setConstraints(project.constraints);
+    setMode(escalationMode(project));
   }, [project.id]);
   async function login() {
     const result = await api("/runtime/login", {});
@@ -1617,23 +1647,28 @@ function Settings({ data, project, act, busy, refresh }: any) {
         })),
         {
           model: settings.orchestrator.model,
-          displayName: settings.orchestrator.model,
+          displayName: settings.orchestrator.model
+            .replace(/^gpt-/, "GPT-")
+            .replace(/-sol$/, " Sol"),
         },
         {
           model: settings.subagent.model,
-          displayName: settings.subagent.model,
+          displayName: settings.subagent.model
+            .replace(/^gpt-/, "GPT-")
+            .replace(/-sol$/, " Sol"),
+        },
+        {
+          model: settings.judge.model,
+          displayName: settings.judge.model
+            .replace(/^gpt-/, "GPT-")
+            .replace(/-sol$/, " Sol"),
         },
       ].map((model: any) => [model.model, model]),
     ).values(),
   ] as any[];
   return (
     <section className="page settings-page">
-      <div className="page-heading">
-        <div>
-          <h1>Settings</h1>
-          <p>Choose how the room works.</p>
-        </div>
-      </div>
+      <h1 className="sr-only">Settings</h1>
       <section className="setting-section">
         <h2>ChatGPT connection</h2>
         <div className="account-row">
@@ -1688,95 +1723,157 @@ function Settings({ data, project, act, busy, refresh }: any) {
       </section>
       <section className="setting-section">
         <h2>Models</h2>
-        <p>Defaults apply to future runs. Unavailable models create a gate.</p>
-        {(["orchestrator", "subagent"] as const).map((role) => (
-          <div className="model-setting" key={role}>
-            <label htmlFor={role + "-model"}>
-              {role === "orchestrator"
-                ? "Orchestrator"
-                : "Implementation & subagents"}
-            </label>
-            <select
-              id={role + "-model"}
-              value={settings[role].model}
-              onChange={(event) =>
-                setSettings({
-                  ...settings,
-                  [role]: { ...settings[role], model: event.target.value },
-                })
-              }
-            >
-              {models.map((model) => (
-                <option key={model.model} value={model.model}>
-                  {model.displayName}
-                </option>
-              ))}
-            </select>
-            <label className="sr-only" htmlFor={role + "-effort"}>
-              {role} reasoning effort
-            </label>
-            <select
-              id={role + "-effort"}
-              value={settings[role].effort}
-              onChange={(event) =>
-                setSettings({
-                  ...settings,
-                  [role]: { ...settings[role], effort: event.target.value },
-                })
-              }
-            >
-              {["low", "medium", "high", "xhigh", "max"].map((effort) => (
-                <option key={effort} value={effort}>
-                  {effort} reasoning
-                </option>
-              ))}
-            </select>
+        <div className="model-roster">
+          {(
+            [
+              {
+                role: "orchestrator",
+                title: "Orchestrator",
+                detail: "Plans the next move",
+                Icon: GitBranch,
+              },
+              {
+                role: "subagent",
+                title: "Builders & researchers",
+                detail: "Turns the plan into working code",
+                Icon: Layers3,
+              },
+              {
+                role: "judge",
+                title: "Escalation judge",
+                detail: "Finds a way forward",
+                Icon: ShieldCheck,
+              },
+            ] as const
+          ).map(({ role, title, detail, Icon }) => (
+            <div className={"model-role model-role-" + role} key={role}>
+              <div className="model-role-label">
+                <span className="model-role-icon">
+                  <Icon size={19} aria-hidden="true" />
+                </span>
+                <div>
+                  <strong>{title}</strong>
+                  <span>{detail}</span>
+                </div>
+              </div>
+              <div className="model-setting">
+                <Select
+                  value={settings[role].model}
+                  onValueChange={(model) =>
+                    setSettings({
+                      ...settings,
+                      [role]: { ...settings[role], model },
+                    })
+                  }
+                  label={title + " model"}
+                  id={role + "-model"}
+                  options={models.map((model) => ({
+                    value: model.model,
+                    label: model.displayName,
+                  }))}
+                />
+                <Select
+                  value={settings[role].effort}
+                  onValueChange={(effort) =>
+                    setSettings({
+                      ...settings,
+                      [role]: { ...settings[role], effort },
+                    })
+                  }
+                  label={title + " reasoning"}
+                  id={role + "-effort"}
+                  options={["low", "medium", "high", "xhigh", "max"].map(
+                    (effort) => ({
+                      value: effort,
+                      label: effort[0].toUpperCase() + effort.slice(1),
+                    }),
+                  )}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="workflow-setting">
+          <div className="workflow-label">
+            <Layers3 size={19} aria-hidden="true" />
+            <div>
+              <strong>Concurrent workflows</strong>
+              <span>Active at once, across your agents</span>
+            </div>
           </div>
-        ))}
-        <label htmlFor="concurrency">Concurrent project runs</label>
-        <Input
-          id="concurrency"
-          type="number"
-          min={1}
-          max={4}
-          value={settings.concurrency}
-          onChange={(event) =>
-            setSettings({
-              ...settings,
-              concurrency: Number(event.target.value),
-            })
-          }
-          className="short-input"
-        />
-        <Button
+          <div className="workflow-counter">
+            <NumberField
+              id="concurrency"
+              label="Concurrent workflows"
+              min={1}
+              max={4}
+              step={1}
+              largeStep={1}
+              scrub={false}
+              value={settings.concurrency}
+              onValueChange={(concurrency) =>
+                setSettings({ ...settings, concurrency })
+              }
+            />
+          </div>
+        </div>
+        <ActionButton
           disabled={busy}
-          onClick={() =>
-            act(() =>
-              api("/settings", {
-                orchestrator: settings.orchestrator,
-                subagent: settings.subagent,
-                concurrency: settings.concurrency,
-              }),
+          onAction={() =>
+            act(
+              () =>
+                api("/settings", {
+                  orchestrator: settings.orchestrator,
+                  subagent: settings.subagent,
+                  judge: settings.judge,
+                  concurrency: settings.concurrency,
+                }),
+              true,
             )
           }
-        >
-          Save model settings
-        </Button>
+          label="Save model settings"
+          pendingLabel="Saving…"
+          successLabel="Saved"
+        />
       </section>
+      <NotificationSettings />
       <section className="setting-section">
         <h2>Project boundaries</h2>
-        <label htmlFor="settings-constraints">Scope and exclusions</label>
+        <div className="bypass-setting">
+          <div>
+            <strong>Escalations</strong>
+            <p>
+              {mode === "yolo"
+                ? "Judge handles replies and recovery. You approve PR merges."
+                : mode === "bypass"
+                  ? "Judge sends routine decisions. Blockers wait for you."
+                  : "Judge prepares a draft. You choose the response."}
+            </p>
+          </div>
+          <Select
+            id="escalation-mode"
+            label="Escalation mode"
+            value={mode}
+            onValueChange={(value) => setMode(value as EscalationMode)}
+            options={[
+              { value: "human", label: "Human review" },
+              { value: "bypass", label: "Judge bypass" },
+              { value: "yolo", label: "YOLO" },
+            ]}
+          />
+        </div>
+
         <Textarea
           id="settings-constraints"
+          label="Scope and exclusions"
           rows={3}
           value={constraints}
           onChange={(event) => setConstraints(event.target.value)}
         />
-        <label htmlFor="settings-checks">
-          Authorized checks · one command per line
-        </label>
+
         <Textarea
           id="settings-checks"
+          label="Authorized checks · one command per line"
           rows={3}
           value={checks}
           onChange={(event) => setChecks(event.target.value)}
@@ -1785,22 +1882,26 @@ function Settings({ data, project, act, busy, refresh }: any) {
           Commands run through the Codex workspace sandbox with direct network
           disabled. Package installation may need a human step.
         </p>
-        <Button
+        <ActionButton
           disabled={busy}
-          onClick={() =>
-            act(() =>
-              api("/projects/" + project.id + "/settings", {
-                checks: checks
-                  .split("\n")
-                  .map((line: string) => line.trim())
-                  .filter(Boolean),
-                constraints,
-              }),
+          onAction={() =>
+            act(
+              () =>
+                api("/projects/" + project.id + "/settings", {
+                  checks: checks
+                    .split("\n")
+                    .map((line: string) => line.trim())
+                    .filter(Boolean),
+                  constraints,
+                  escalationMode: mode,
+                }),
+              true,
             )
           }
-        >
-          Save project settings
-        </Button>
+          label="Save project settings"
+          pendingLabel="Saving…"
+          successLabel="Saved"
+        />
       </section>
       <section className="setting-section">
         <h2>Control</h2>
@@ -1825,7 +1926,17 @@ function Settings({ data, project, act, busy, refresh }: any) {
   );
 }
 
-function TaskDetail({ task, onClose }: { task: any; onClose: () => void }) {
+function TaskDetail({
+  task,
+  tasks,
+  onClose,
+  restoreFocus,
+}: {
+  task: any;
+  tasks: any[];
+  onClose: () => void;
+  restoreFocus: () => void;
+}) {
   return (
     <Dialog
       open={!!task}
@@ -1833,13 +1944,19 @@ function TaskDetail({ task, onClose }: { task: any; onClose: () => void }) {
         if (!open) onClose();
       }}
     >
-      <DialogContent className="task-dialog">
-        <DialogHeader>
-          <DialogTitle>{task?.title}</DialogTitle>
-          <DialogDescription>
-            {task ? statusText(task.status) + " · " + task.kind : ""}
-          </DialogDescription>
-        </DialogHeader>
+      <DialogContent
+        className="task-dialog"
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          restoreFocus();
+        }}
+        title={task?.title ?? "Task"}
+        description={
+          task
+            ? frontierLabel(frontierState(task, tasks)) + " · " + task.kind
+            : undefined
+        }
+      >
         {task ? (
           <div className="task-document">
             <p>{task.description}</p>
@@ -1861,14 +1978,19 @@ function TaskDetail({ task, onClose }: { task: any; onClose: () => void }) {
                 <p>{task.summary}</p>
               </>
             ) : null}
-            {task.checks?.map((check: any, i: number) => (
-              <details key={i}>
-                <summary className="mono">
-                  {check.command} · exit {check.code}
-                </summary>
-                <pre>{check.output}</pre>
-              </details>
-            ))}
+            {task.checks?.length ? (
+              <Accordion
+                defaultOpen={-1}
+                items={task.checks.map((check: any) => ({
+                  title:
+                    (check.code === 0 ? "Passed: " : "Failed: ") +
+                    check.command +
+                    " · exit " +
+                    check.code,
+                  content: <pre>{check.output}</pre>,
+                }))}
+              />
+            ) : null}
             {task.pr ? (
               <a
                 className="source-link"

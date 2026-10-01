@@ -17,4 +17,12 @@ Karpathy autoresearch informs fixed acceptance criteria and bounded candidates. 
 
 ## Scope of v0
 
-One active task per project; up to four concurrent projects. Role identities and handoffs are durable; a role runs in a fresh Codex thread with project memory/context. Native hidden child agents are disabled so every dispatched worker uses the explicitly selected profile. Parallel workers within one project, contradiction review, native macOS packaging and measured engine experiments remain next slices.
+A configurable shared capacity of one to four concurrent workflows includes planning, task pipelines and judges. Independent ready tasks within a project may run concurrently; each has a separate worktree. Role identities and handoffs are durable; a role runs in a fresh Codex thread with project memory/context. Native hidden child agents are disabled so every dispatched worker uses the explicitly selected profile. Simultaneous native worker/PR lifecycle verification, contradiction review, native macOS packaging and measured engine experiments remain next slices.
+
+## Scoped gates and optional judge
+
+A task gate blocks its task and true dependents; planning gates can leave already-scoped independent work runnable; a project gate stops ordinary project work. Dependencies represent required artifacts, not an arbitrary preferred sequence. Dispatch reserves capacity before starting asynchronous work and will not launch a duplicate task. Shared runtime wiki updates are serialized per project.
+
+Every gate writes an attributed escalation message into the Goal conversation. Replies retain the gate/task link and identify the human or judge. The composer can reply directly to a non-PR gate. Restart backfills older history idempotently, using actual run evidence for attribution.
+
+Project boundaries offers Judge bypass, initially off. A separately configurable judge defaults to GPT-6 Sol / Medium and runs read-only against repository/task evidence. It returns retry, skip or wait with a sourced answer. Answers and runtime identifiers are durable. A wait answer or failed judge stays on the original gate; explicit retry is available. Three judge retries on the same task require waiting for human intervention. Switching bypass off or pausing prevents an in-flight answer from automatically resolving a gate. The judge cannot install tools, widen access, fabricate verification or approve a PR. PR merge approval remains human and exact-revision-bound.

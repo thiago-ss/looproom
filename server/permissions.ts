@@ -19,6 +19,7 @@ export async function permissionConfig(cwd: string, write: boolean) {
   const filesystem: Record<string, any> = {
     ":root": "deny",
     ":minimal": "read",
+    "/System/Library/OpenSSL": "read",
     ":tmpdir": "deny",
     ":slash_tmp": "deny",
     [cwd]: {
@@ -37,6 +38,11 @@ export async function permissionConfig(cwd: string, write: boolean) {
     "--git-common-dir",
   ]).catch(() => "");
   if (common) filesystem[common] = "read";
+  const { exec } = await import("./git.ts");
+  const developerDir = await exec("/usr/bin/xcode-select", ["-p"])
+    .then((result) => result.stdout.trim())
+    .catch(() => "");
+  if (developerDir) filesystem[await realpath(developerDir)] = "read";
   // Toolchains installed outside the platform minimum are readable, never writable.
   for (const command of ["node", "npm"]) {
     const { exec } = await import("./git.ts");
@@ -53,6 +59,16 @@ export async function permissionConfig(cwd: string, write: boolean) {
     permissions: { looproom: { filesystem, network: { enabled: false } } },
     features: { multi_agent: false },
     web_search: "cached",
+    shell_environment_policy: {
+      set: {
+        PATH:
+          (developerDir ? developerDir + "/usr/bin:" : "") + process.env.PATH,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_OPTIONAL_LOCKS: "0",
+        TSX_DISABLE_CACHE: "1",
+      },
+    },
   };
 }
 

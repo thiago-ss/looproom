@@ -1,3 +1,4 @@
+import { escalationMode } from "../src/lib/autonomy.ts";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -111,20 +112,143 @@ export class Store {
       .all(terms, projectId) as { id: string }[];
     return rows.map((row) => this.get(row.id));
   }
+  recordEscalation(gate: RecordData) {
+    return this.put(
+      "message",
+      {
+        projectId: gate.projectId,
+        taskId: gate.taskId,
+        gateId: gate.id,
+        kind: "escalation",
+        role: gate.authorRole ?? "coordinator",
+        title: gate.title,
+        text: gate.detail,
+        createdAt: gate.createdAt,
+      },
+      "escalation:" + gate.id,
+    );
+  }
+  recordGateResponse(
+    gate: RecordData,
+    answer: string,
+    actor: string,
+    createdAt: string,
+    runId?: string,
+    kind = "escalation_response",
+  ) {
+    return this.put(
+      "message",
+      {
+        projectId: gate.projectId,
+        taskId: gate.taskId,
+        gateId: gate.id,
+        kind,
+        role: actor,
+        text: answer,
+        runId,
+        createdAt,
+      },
+      "response:" +
+        gate.id +
+        ":" +
+        actor +
+        (actor === "judge" && runId ? ":" + runId : ""),
+    );
+  }
+  syncConversation() {
+    this.transaction(() => {
+      for (const gate of this.all("gate")) {
+        if (!gate.authorRole) {
+          const origin = this.all("run", gate.projectId).findLast((run) => {
+            if (run.taskId !== gate.taskId || !run.output) return false;
+            try {
+              const output = JSON.parse(run.output);
+              return (
+                output.humanQuestion === gate.detail ||
+                output.gate === gate.detail ||
+                (run.role === "review" && output.summary === gate.detail)
+              );
+            } catch {
+              return false;
+            }
+          });
+          if (origin)
+            Object.assign(
+              gate,
+              this.patch(gate.id, {
+                authorRole: origin.role,
+                originRunId: origin.id,
+              }),
+            );
+        }
+        this.recordEscalation(gate);
+        if (!gate.answer || !gate.resolvedAt) continue;
+        const actor = gate.resolvedBy ?? "human";
+        const legacy = this.all("message", gate.projectId).find(
+          (message) =>
+            !message.gateId &&
+            message.role === actor &&
+            message.text === gate.answer &&
+            Math.abs(
+              Date.parse(message.createdAt) - Date.parse(gate.resolvedAt),
+            ) < 3000,
+        );
+        if (legacy)
+          this.patch(legacy.id, {
+            gateId: gate.id,
+            taskId: gate.taskId,
+            kind: "escalation_response",
+          });
+        else if (
+          !this.all("message", gate.projectId).some(
+            (message) =>
+              message.gateId === gate.id &&
+              message.kind === "escalation_response" &&
+              message.role === actor,
+          )
+        )
+          this.recordGateResponse(gate, gate.answer, actor, gate.resolvedAt);
+      }
+    });
+  }
+  conversation(projectId?: string) {
+    return this.all("message", projectId).sort(
+      (a, b) =>
+        Date.parse(a.createdAt) - Date.parse(b.createdAt) ||
+        Number(b.kind === "escalation") - Number(a.kind === "escalation"),
+    );
+  }
   recover() {
     this.transaction(() => {
       const interrupted = this.all("run").filter(
         (run) => run.status === "running",
       );
-      const recovery = interrupted.map((run) => ({
-        projectId: run.projectId,
-        taskId: run.taskId,
-      }));
+      const recovery = interrupted
+        .filter((run) => run.role !== "judge")
+        .map((run) => ({
+          projectId: run.projectId,
+          taskId: run.taskId,
+        }));
       for (const run of interrupted)
         this.patch(run.id, {
           status: "interrupted",
           error: "Coordinator restarted before completion.",
           finishedAt: new Date().toISOString(),
+        });
+      for (const gate of this.all("gate").filter(
+        (gate) => gate.status === "open" && gate.judgeStatus === "running",
+      ))
+        this.patch(gate.id, {
+          judgeStatus:
+            escalationMode(this.get(gate.projectId)) === "yolo" &&
+            (gate.judgeFailures ?? 0) < 3
+              ? "pending"
+              : "failed",
+          judgeError: "Coordinator restarted during judgment.",
+          judgeRecoveryStatus:
+            ["running", "verifying"].includes(gate.judgeRecoveryStatus)
+              ? "interrupted"
+              : gate.judgeRecoveryStatus,
         });
       for (const task of this.all("task").filter((task) =>
         ["running", "verifying"].includes(task.status),

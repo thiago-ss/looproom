@@ -1,3 +1,4 @@
+import { escalationMode } from "../src/lib/autonomy.ts";
 import express from "express";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -5,6 +6,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { access, mkdir, realpath, stat, readFile } from "node:fs/promises";
 import { z } from "zod";
+import { chooseFolder, droppedFolder } from "./folders.ts";
 import { Store } from "./store.ts";
 import { Runtime } from "./runtime.ts";
 import { Engine } from "./engine.ts";
@@ -36,7 +38,10 @@ try {
     "settings",
   );
 }
+if (!store.get("settings").judge)
+  store.patch("settings", { judge: { ...store.get("settings").subagent } });
 store.recover();
+store.syncConversation();
 const runtime = new Runtime(
   process.env.CODEX_BINARY ?? "codex",
   join(dataDir, "codex"),
@@ -139,8 +144,8 @@ app.get("/api/state", (_req, res) =>
     tasks: store.all("task"),
     gates: store.all("gate"),
     agents: store.all("agent"),
-    messages: store.all("message"),
-    runs: store.all("run"),
+    messages: store.conversation(),
+    runs: store.all("run").map(({ output, ...run }) => run),
     memory: store.all("memory"),
     events: store.events(),
     settings: store.get("settings"),
@@ -309,12 +314,36 @@ const profile = z.object({
   effort: z.enum(["low", "medium", "high", "xhigh", "max"]),
 });
 app.post(
+  "/api/folders/choose",
+  route(async (req, res) => {
+    const body = z
+      .object({ initial: z.string().max(4096).optional() })
+      .parse(req.body);
+    res.json({ path: await chooseFolder(appRoot, dataDir, body.initial) });
+  }),
+);
+app.post(
+  "/api/folders/drop",
+  route(async (req, res) => {
+    const body = z
+      .object({
+        names: z.array(z.string().max(255)).min(1).max(1),
+        uri: z.string().max(4096).optional(),
+      })
+      .parse(req.body);
+    res.json({
+      path: await droppedFolder(appRoot, dataDir, body.names, body.uri),
+    });
+  }),
+);
+app.post(
   "/api/settings",
   route((req, res) => {
     const settings = z
       .object({
         orchestrator: profile,
         subagent: profile,
+        judge: profile.optional(),
         concurrency: z.number().int().min(1).max(4),
       })
       .parse(req.body);
@@ -329,9 +358,34 @@ app.post(
       .object({
         checks: z.array(z.string().trim().min(1).max(500)).max(8),
         constraints: z.string().max(6000),
+        bypass: z.boolean().optional(),
+        escalationMode: z.enum(["human", "bypass", "yolo"]).optional(),
       })
       .parse(req.body);
-    res.json(store.patch(String(req.params.id), settings));
+    const projectId = String(req.params.id),
+      previous = store.get(projectId);
+    const updated = store.transaction(() => {
+      const record = store.patch(projectId, settings);
+      if (escalationMode(previous) !== escalationMode(record)) {
+        for (const gate of store.all("gate", projectId)) {
+          if (
+            gate.status === "open" &&
+            gate.type !== "pr" &&
+            gate.judgeStatus !== "running" &&
+            !gate.judgeSubmittedAt
+          )
+            store.patch(gate.id, {
+              judgeStatus: "pending",
+              judgeError: null,
+              judgeAttempts: 0,
+              judgeFailures: 0,
+              judgeNextAttemptAt: null,
+            });
+        }
+      }
+      return record;
+    });
+    res.json(updated);
     engine.changed("project-settings-updated", {}, String(req.params.id));
   }),
 );
@@ -370,6 +424,26 @@ app.post(
       })
       .parse(req.body);
     await engine.resolve(String(req.params.id), body.answer, body.retry);
+    res.json({ ok: true });
+  }),
+);
+app.post(
+  "/api/gates/:id/judge",
+  route((req, res) => {
+    const gate = store.get(String(req.params.id)),
+      project = store.get(gate.projectId);
+    if (gate.status !== "open")
+      throw new Error("Judge drafting is unavailable for this gate.");
+    if (gate.judgeStatus === "running")
+      throw new Error("The judge is already working.");
+    store.patch(gate.id, {
+      judgeStatus: "pending",
+      judgeError: null,
+      judgeAttempts: 0,
+      judgeFailures: 0,
+      judgeNextAttemptAt: null,
+    });
+    engine.changed("judge-requested", { gateId: gate.id }, project.id);
     res.json({ ok: true });
   }),
 );

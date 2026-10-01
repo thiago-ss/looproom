@@ -1,0 +1,382 @@
+/* Arc primitives inherit Looproom's established identity. Registry sources stay intact. */
+:root[data-theme="dark"] {
+  --background: var(--lr-canvas);
+  --surface: var(--lr-sheet);
+  --surface-raised: var(--lr-wash);
+  --surface-muted: var(--lr-signal-wash);
+  --foreground: var(--lr-ink);
+  --text-secondary: var(--lr-ink-soft);
+  --text-muted: var(--lr-muted);
+  --border: var(--lr-rule);
+  --border-subtle: transparent;
+  --border-strong: var(--lr-rule-strong);
+  --accent: var(--lr-signal);
+  --accent-strong: var(--lr-ink);
+  --accent-subtle: var(--lr-signal-wash);
+  --accent-foreground: var(--lr-on-accent);
+  --control-on: var(--lr-citron);
+  --control-glyph: var(--lr-on-accent);
+  --control-track: var(--lr-rule-strong);
+  --control-track-hover: var(--lr-muted);
+  --control-thumb: var(--lr-ink);
+  --control-thumb-on: var(--lr-on-accent);
+  --success: var(--lr-verified);
+  --warning: var(--lr-gate);
+  --danger: var(--lr-gate);
+  --shadow-resting: none;
+  --shadow-raised: none;
+  --shadow-floating: none;
+  --control-thumb-shadow: none;
+  --font-geist: "IBM Plex Sans";
+  --font-inter: "IBM Plex Sans";
+  --font-display: "IBM Plex Sans", sans-serif;
+  --font-body: "IBM Plex Sans", sans-serif;
+  --radius-control: 10px;
+  --radius-panel: 10px;
+  --radius-surface: 10px;
+  --radius-pill: 10px;
+  --tracking-display: 0;
+  --tracking-body: 0;
+}
+:root *:focus-visible {
+  outline: 2px solid var(--lr-signal) !important;
+  outline-offset: 3px;
+}
+label[for="project-picker"] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+/* Domain cards and navigation keep their own layout around Arc's animated label. */
+:is(
+    .sidebar nav button,
+    .new-project,
+    .agent-station,
+    .room-center,
+    .memory-card,
+    .frontier-task,
+    .frontier-stage,
+    .context-task,
+    .review-queue button,
+    .assignment-link,
+    .notification-item,
+    .notification-trigger,
+    .review-target,
+    .memory-type,
+    .memory-source-link
+  )[data-slot="button"]
+  > span,
+:is(
+    .sidebar nav button,
+    .new-project,
+    .agent-station,
+    .room-center,
+    .memory-card,
+    .frontier-task,
+    .frontier-stage,
+    .context-task,
+    .review-queue button,
+    .assignment-link,
+    .notification-item,
+    .notification-trigger,
+    .review-target,
+    .memory-type,
+    .memory-source-link
+  )[data-slot="button"]
+  > span
+  > span,
+:is(
+    .sidebar nav button,
+    .new-project,
+    .agent-station,
+    .room-center,
+    .memory-card,
+    .frontier-task,
+    .frontier-stage,
+    .context-task,
+    .review-queue button,
+    .assignment-link,
+    .notification-item,
+    .notification-trigger,
+    .review-target,
+    .memory-type,
+    .memory-source-link
+  )[data-slot="button"]
+  > span
+  > span
+  > span {
+  display: contents;
+}
+.conversation-scroll {
+  flex: 1;
+  min-height: 0;
+}
+.conversation-scroll > .messages {
+  height: 100%;
+}
+.frontier-search,
+.memory-search {
+  display: block;
+  padding: 0;
+}
+.frontier-search label,
+.memory-search label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+:is(
+  .agent-station,
+  .room-center,
+  .memory-card,
+  .frontier-task,
+  .frontier-stage,
+  .context-task,
+  .review-queue button,
+  .assignment-link,
+  .notification-item,
+  .review-target
+)[data-slot="button"] {
+  white-space: normal;
+  text-align: left;
+}
+.composer > div:has(> textarea) {
+  display: grid;
+  width: 100%;
+}
+.composer label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.memory-search-field {
+  padding: 0;
+}
+.memory-search-field > div {
+  flex: 1;
+  min-width: 0;
+}
+.memory-search-field label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.model-setting {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.6fr);
+  align-items: end;
+}
+.setting-section > div:has(> div > [role="spinbutton"]) {
+  max-width: 300px;
+  margin-bottom: 20px;
+}
+.setup-progress > div {
+  height: auto !important;
+  margin: 0 !important;
+  width: 100%;
+}
+.setup-progress > div > div {
+  background: transparent !important;
+}
+.dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: end;
+  margin-top: 20px;
+}
+@media (max-width: 600px) {
+  .model-setting {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+[data-slot="tabs-trigger"] > span:last-child {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.frontier-tools {
+  align-items: center;
+}
+.frontier-tools label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.task-dialog {
+  width: min(calc(100vw - 32px), 750px) !important;
+}
+[data-slot="tabs-trigger"] {
+  border-radius: var(--lr-radius);
+}
+/* Tooltip triggers keep transform neutral; use independent translation for the center station. */
+.agent-station.station-judge {
+  position: absolute;
+  translate: -50% -50%;
+}
+.dependency-map .dependency-node {
+  position: absolute;
+  white-space: normal;
+}
+.dependency-node[data-slot="button"] > span,
+.dependency-node[data-slot="button"] > span > span,
+.dependency-node[data-slot="button"] > span > span > span {
+  display: contents;
+}
+[data-slot="button"] > span:has(> span > span) {
+  white-space: inherit;
+}
+[data-slot="button"] > span > span > span {
+  white-space: inherit;
+}
+.memory-card[data-slot="button"] {
+  display: block;
+  padding: 20px 12px;
+}
+.latest-message[data-slot="button"] {
+  position: absolute;
+  translate: -50% 0;
+  transform: none;
+}
+
+.setup-wizard {
+  width: 100%;
+}
+.folder-path-row {
+  align-items: end;
+}
+.folder-path-row > div {
+  flex: 1;
+  min-width: 0;
+}
+.reader-source > .mono {
+  white-space: nowrap;
+  min-width: 2ch;
+}
+
+/* Single-column fields stretch rather than shrink to the placeholder's intrinsic width. */
+.composer > div:has(> textarea) {
+  grid-template-columns: minmax(0, 1fr);
+  justify-content: stretch;
+  align-items: stretch;
+  min-width: 0;
+}
+.composer textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.model-roster {
+  display: grid;
+  gap: 10px;
+  margin: 22px 0;
+}
+.model-role {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+  gap: 24px;
+  padding: 18px;
+  border-radius: 10px;
+  background: var(--lr-sheet);
+}
+.model-role-label,
+.workflow-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.model-role-label > div,
+.workflow-label > div {
+  display: grid;
+  gap: 4px;
+}
+.model-role-label strong,
+.workflow-label strong {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--lr-ink);
+}
+.model-role-label > div > span,
+.workflow-label > div > span {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--lr-muted);
+}
+.model-role-icon {
+  display: grid;
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--lr-signal) 12%, var(--lr-sheet));
+  color: var(--lr-signal);
+}
+.model-role-subagent .model-role-icon {
+  background: color-mix(in srgb, var(--lr-verified) 12%, var(--lr-sheet));
+  color: var(--lr-verified);
+}
+.model-role-judge .model-role-icon {
+  background: color-mix(in srgb, var(--lr-gate) 12%, var(--lr-sheet));
+  color: var(--lr-gate);
+}
+.model-role .model-setting {
+  margin: 0;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 0.45fr);
+}
+.model-role .model-setting label,
+.workflow-counter label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.workflow-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px;
+  padding: 20px 18px;
+  margin: 0 0 24px;
+  border-radius: 10px;
+  background: var(--lr-sheet);
+}
+.workflow-label > svg {
+  flex: none;
+  color: var(--lr-muted);
+  margin-inline: 10px;
+}
+.workflow-counter {
+  --number-field-width: 160px;
+  flex: 0 0 160px;
+}
+.workflow-counter > div > div:first-child {
+  height: 0;
+  margin: 0;
+}
+.workflow-counter input[role="spinbutton"] {
+  color: transparent;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+@media (max-width: 780px) {
+  .model-role {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+}

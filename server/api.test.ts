@@ -98,12 +98,40 @@ test("local API requires a session, rejects foreign origins and keeps projects a
       body: JSON.stringify(body),
     });
     assert.equal(response.status, 200);
-    assert.equal((await response.json()).status, "paused");
+    const created = await response.json();
+    assert.equal(created.status, "paused");
+    const settingHeaders = {
+      "content-type": "application/json",
+      "x-looproom-client": "ui",
+      cookie,
+    };
+    response = await fetch(url + "/api/projects/" + created.id + "/settings", {
+      method: "POST",
+      headers: settingHeaders,
+      body: JSON.stringify({
+        checks: body.checks,
+        constraints: body.constraints,
+        escalationMode: "yolo",
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).escalationMode, "yolo");
+    response = await fetch(url + "/api/projects/" + created.id + "/settings", {
+      method: "POST",
+      headers: settingHeaders,
+      body: JSON.stringify({
+        checks: body.checks,
+        constraints: body.constraints,
+        escalationMode: "invented",
+      }),
+    });
+    assert.equal(response.status, 400);
     await stop();
     url = await start();
     response = await fetch(url + "/api/state");
     const state = await response.json();
     assert.equal(state.projects[0].name, "API project");
+    assert.equal(state.projects[0].escalationMode, "yolo");
     assert.equal(state.messages[0].text, body.goal);
     assert.equal(state.settings.orchestrator.model, "gpt-6.1-sol");
     assert.equal(state.settings.subagent.effort, "medium");
