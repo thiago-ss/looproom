@@ -26,7 +26,7 @@ For a change: search the intent, inspect the chosen component, get its install c
 | SearchField | Work filtering and Memory search; clear retains field focus |
 | NumberField | Bounded workflow concurrency, 1–4 |
 | Select | Project, work stage, role model and reasoning effort |
-| Checkbox / Switch | Setup choices, notifications and judge bypass |
+| Checkbox / Switch | Setup choices and notification preferences |
 | Tabs | Work views, Memory views, review evidence and room feed |
 | Dialog | Task contract and explicit approval of an exact PR revision |
 | Popover | Notification inbox and compact Goal context |

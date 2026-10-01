@@ -1,3 +1,4 @@
+import { escalationMode } from "../src/lib/autonomy.ts";
 import express from "express";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -358,9 +359,32 @@ app.post(
         checks: z.array(z.string().trim().min(1).max(500)).max(8),
         constraints: z.string().max(6000),
         bypass: z.boolean().optional(),
+        escalationMode: z.enum(["human", "bypass", "yolo"]).optional(),
       })
       .parse(req.body);
-    res.json(store.patch(String(req.params.id), settings));
+    const projectId = String(req.params.id),
+      previous = store.get(projectId);
+    const updated = store.transaction(() => {
+      const record = store.patch(projectId, settings);
+      if (escalationMode(previous) !== escalationMode(record)) {
+        for (const gate of store.all("gate", projectId)) {
+          if (
+            gate.status === "open" &&
+            gate.type !== "pr" &&
+            gate.judgeStatus !== "running" &&
+            !gate.judgeSubmittedAt
+          )
+            store.patch(gate.id, {
+              judgeStatus: "pending",
+              judgeError: null,
+              judgeAttempts: 0,
+              judgeNextAttemptAt: null,
+            });
+        }
+      }
+      return record;
+    });
+    res.json(updated);
     engine.changed("project-settings-updated", {}, String(req.params.id));
   }),
 );
@@ -407,11 +431,16 @@ app.post(
   route((req, res) => {
     const gate = store.get(String(req.params.id)),
       project = store.get(gate.projectId);
-    if (!project.bypass || gate.status !== "open" || gate.type === "pr")
-      throw new Error("Judge bypass is unavailable for this gate.");
+    if (gate.status !== "open")
+      throw new Error("Judge drafting is unavailable for this gate.");
     if (gate.judgeStatus === "running")
       throw new Error("The judge is already working.");
-    store.patch(gate.id, { judgeStatus: "pending", judgeError: null });
+    store.patch(gate.id, {
+      judgeStatus: "pending",
+      judgeError: null,
+      judgeAttempts: 0,
+      judgeNextAttemptAt: null,
+    });
     engine.changed("judge-requested", { gateId: gate.id }, project.id);
     res.json({ ok: true });
   }),

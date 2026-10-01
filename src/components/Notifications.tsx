@@ -1,3 +1,4 @@
+import { needsHumanReview } from "../lib/autonomy";
 import { useEffect, useState } from "react";
 import {
   Bell,
@@ -88,7 +89,12 @@ export function useEscalations(
     async function deliver() {
       const ids = seen();
       const previousSize = ids.size;
-      const fresh = recordGateSnapshot(gates!, ids);
+      const fresh = recordGateSnapshot(gates!, ids).filter((gate) =>
+        needsHumanReview(
+          gate,
+          projects?.find((p) => p.id === gate.projectId) ?? {},
+        ),
+      );
       if (ids.size !== previousSize) writeSeen(ids);
       if (!fresh.length) return;
       const prefs = preferences();
@@ -132,7 +138,12 @@ export function useEscalations(
   }, [gates, projects, ready, open, toast]);
 }
 export function NotificationCenter({ gates, projects, onOpen }: any) {
-  const open = gates.filter((gate: any) => gate.status === "open");
+  const open = gates.filter((gate: any) =>
+    needsHumanReview(
+      gate,
+      projects?.find((p: any) => p.id === gate.projectId) ?? {},
+    ),
+  );
   return (
     <Popover>
       <PopoverTrigger asChild>

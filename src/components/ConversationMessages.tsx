@@ -17,7 +17,9 @@ export default function ConversationMessages({
   gates,
   onReply,
   onReview,
+  mode,
 }: {
+  mode?: string;
   messages: any[];
   gates: any[];
   onReply: (gate: any) => void;
@@ -51,7 +53,10 @@ export default function ConversationMessages({
       {entries.map((message) => {
         const gate = gateById.get(message.gateId),
           escalation = message.kind === "escalation",
-          response = message.kind === "escalation_response",
+          response = ["escalation_response", "escalation_draft"].includes(
+            message.kind,
+          ),
+          draft = message.kind === "escalation_draft",
           open = gate?.status === "open";
         return (
           <article
@@ -81,7 +86,10 @@ export default function ConversationMessages({
               {response ? (
                 <div className="reply-context">
                   <CornerDownRight size={14} />
-                  <span>Escalation reply · {gate?.title ?? "Decision"}</span>
+                  <span>
+                    {draft ? "Draft for escalation" : "Escalation reply"} ·{" "}
+                    {gate?.title ?? "Decision"}
+                  </span>
                 </div>
               ) : null}
               {escalation ? (
@@ -92,6 +100,9 @@ export default function ConversationMessages({
                   </div>
                   <p>{message.text}</p>
                   <div className="escalation-actions">
+                    {gate?.awaitingCapability ? (
+                      <Badge variant="secondary">Judge replied · blocked</Badge>
+                    ) : null}
                     {open ? (
                       <>
                         {gate.type !== "pr" ? (
@@ -100,12 +111,17 @@ export default function ConversationMessages({
                             variant="secondary"
                             onClick={() => onReply(gate)}
                           >
-                            Reply
+                            {mode === "yolo" ? "Add context" : "Reply"}
                           </Button>
                         ) : null}
-                        <Button size="sm" variant="ghost" onClick={onReview}>
-                          Review <ArrowRight size={14} />
-                        </Button>
+                        {mode !== "yolo" || gate.type === "pr" ? (
+                          <Button size="sm" variant="ghost" onClick={onReview}>
+                            Review <ArrowRight size={14} />
+                          </Button>
+                        ) : null}
+                        {gate.judgeStatus === "failed" ? (
+                          <Badge variant="secondary">Judge unavailable</Badge>
+                        ) : null}
                         {gate.judgeStatus === "running" ? (
                           <Badge variant="secondary">Judge thinking</Badge>
                         ) : null}

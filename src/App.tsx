@@ -1,3 +1,9 @@
+import { Badge } from "./components/ui/badge";
+import {
+  escalationMode,
+  needsHumanReview,
+  type EscalationMode,
+} from "./lib/autonomy";
 import {
   lazy,
   Suspense,
@@ -250,7 +256,8 @@ export default function App() {
     );
   const tasks = data.tasks.filter((task) => task.projectId === project?.id),
     gates = data.gates.filter(
-      (gate) => gate.projectId === project?.id && gate.status === "open",
+      (gate) =>
+        gate.projectId === project?.id && needsHumanReview(gate, project ?? {}),
     );
   const runs = data.runs.filter((run) => run.projectId === project?.id),
     messages = data.messages.filter(
@@ -374,6 +381,9 @@ export default function App() {
               />
               {project ? (
                 <div className="project-controls">
+                  {escalationMode(project) === "yolo" ? (
+                    <Badge variant="secondary">YOLO</Badge>
+                  ) : null}
                   <span className={"status " + project.status}>
                     <span />
                     {statusText(project.status)}
@@ -458,7 +468,6 @@ export default function App() {
                 ) : null}
                 {view === "review" ? (
                   <ReviewInbox
-                    bypass={Boolean(project.bypass)}
                     gates={gates}
                     tasks={tasks}
                     act={act}
@@ -995,6 +1004,7 @@ function Goal({
         >
           <div className="conversation-flow" ref={flow}>
             <ConversationMessages
+              mode={escalationMode(project)}
               messages={messages}
               gates={historyGates}
               onReply={reply}
@@ -1176,7 +1186,7 @@ function GoalContext({ project, tasks, gates, active, openTask }: any) {
   );
 }
 
-function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
+function ReviewInbox({ gates, tasks, act, busy }: any) {
   const [selected, setSelected] = useState<string>(""),
     [answer, setAnswer] = useState(""),
     [pr, setPr] = useState<any>(null),
@@ -1342,15 +1352,31 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
           >
             <p className="review-summary">{gate.detail}</p>
           </div>
-          {gate.type !== "pr" && gate.judgeStatus ? (
+          {gate.judgeStatus ? (
             <div className="judge-assessment">
-              <strong>Judge</strong>
+              <strong>
+                {gate.judgeSubmittedAt ? "Judge reply" : "Judge draft"}
+              </strong>
               <p>
                 {gate.judgeAnswer ??
                   gate.judgeError ??
                   "Reviewing this escalation…"}
               </p>
-              {bypass && gate.judgeStatus !== "running" ? (
+              {gate.judgeAnswer &&
+              !gate.judgeSubmittedAt &&
+              gate.type !== "pr" ? (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setAnswer(gate.judgeAnswer)}
+                >
+                  Use judge draft
+                </Button>
+              ) : null}
+              {gate.judgeSources?.length ? (
+                <p className="muted">{gate.judgeSources.join(" · ")}</p>
+              ) : null}
+              {gate.judgeStatus !== "running" ? (
                 <Button
                   variant="secondary"
                   size="sm"
@@ -1560,14 +1586,14 @@ function Settings({ data, project, act, busy, refresh }: any) {
       ...data.settings,
       judge: data.settings.judge ?? data.settings.subagent,
     }),
-    [bypass, setBypass] = useState(!!project.bypass),
+    [mode, setMode] = useState<EscalationMode>(escalationMode(project)),
     [checks, setChecks] = useState(project.checks.join("\n")),
     [constraints, setConstraints] = useState(project.constraints),
     [authUrl, setAuthUrl] = useState("");
   useEffect(() => {
     setChecks(project.checks.join("\n"));
     setConstraints(project.constraints);
-    setBypass(!!project.bypass);
+    setMode(escalationMode(project));
   }, [project.id]);
   async function login() {
     const result = await api("/runtime/login", {});
@@ -1735,13 +1761,25 @@ function Settings({ data, project, act, busy, refresh }: any) {
         <h2>Project boundaries</h2>
         <div className="bypass-setting">
           <div>
-            <label htmlFor="bypass-mode">Judge bypass</label>
-            <p>Judge answers escalations. You approve every PR merge.</p>
+            <strong>Escalations</strong>
+            <p>
+              {mode === "yolo"
+                ? "Judge drafts and sends every reply. You approve PR merges."
+                : mode === "bypass"
+                  ? "Judge sends routine decisions. Blockers wait for you."
+                  : "Judge prepares a draft. You choose the response."}
+            </p>
           </div>
-          <Switch
-            id="bypass-mode"
-            checked={bypass}
-            onCheckedChange={setBypass}
+          <Select
+            id="escalation-mode"
+            label="Escalation mode"
+            value={mode}
+            onValueChange={(value) => setMode(value as EscalationMode)}
+            options={[
+              { value: "human", label: "Human review" },
+              { value: "bypass", label: "Judge bypass" },
+              { value: "yolo", label: "YOLO" },
+            ]}
           />
         </div>
 
@@ -1775,7 +1813,7 @@ function Settings({ data, project, act, busy, refresh }: any) {
                     .map((line: string) => line.trim())
                     .filter(Boolean),
                   constraints,
-                  bypass,
+                  escalationMode: mode,
                 }),
               true,
             )

@@ -1,3 +1,4 @@
+import { escalationMode } from "../src/lib/autonomy.ts";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
@@ -133,6 +134,7 @@ export class Store {
     actor: string,
     createdAt: string,
     runId?: string,
+    kind = "escalation_response",
   ) {
     return this.put(
       "message",
@@ -140,13 +142,17 @@ export class Store {
         projectId: gate.projectId,
         taskId: gate.taskId,
         gateId: gate.id,
-        kind: "escalation_response",
+        kind,
         role: actor,
         text: answer,
         runId,
         createdAt,
       },
-      "response:" + gate.id + ":" + actor,
+      "response:" +
+        gate.id +
+        ":" +
+        actor +
+        (actor === "judge" && runId ? ":" + runId : ""),
     );
   }
   syncConversation() {
@@ -233,9 +239,12 @@ export class Store {
         (gate) => gate.status === "open" && gate.judgeStatus === "running",
       ))
         this.patch(gate.id, {
-          judgeStatus: "failed",
-          judgeError:
-            "Coordinator restarted during judgment. Ask the judge to retry.",
+          judgeStatus:
+            escalationMode(this.get(gate.projectId)) === "yolo" &&
+            (gate.judgeAttempts ?? 0) < 3
+              ? "pending"
+              : "failed",
+          judgeError: "Coordinator restarted during judgment.",
         });
       for (const task of this.all("task").filter((task) =>
         ["running", "verifying"].includes(task.status),

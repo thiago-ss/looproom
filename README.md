@@ -91,8 +91,10 @@ Goal fills the viewport and scrolls within the conversation. Work offers a group
 
 The current interface uses continuous plum surfaces, soft citron actions and readable supporting text. Selected items use tonal fills; keyboard focus retains a visible outline. See [identity rules and verification](docs/identity-v2.md).
 
-Goal preserves linked escalation requests and replies, including migrated history. Human messages use a single byline; the composer can answer a selected non-PR gate directly. Judge bypass is opt-in under Project boundaries. Its read-only model is configured separately in Settings; genuine capability blockers remain open, and every PR merge needs human approval. Native GPT-6 Sol / Medium judge inference was verified on an isolated routine-choice gate; no PR or live gate was approved by that test.
+Goal preserves linked escalation requests and replies, including migrated history. Human messages use a single byline; the composer can answer a selected non-PR gate directly. Settings → Project boundaries offers Human review (judge draft), Judge bypass (routine automatic decisions), and YOLO (judge drafts and sends every non-PR reply). Its read-only model is configured separately in Settings. Submitted capability blockers remain blocked while independent work continues; every PR merge needs human approval. Native GPT-6 Sol / Medium judge inference was verified on an isolated routine-choice gate; no PR or live gate was approved by that test.
 
 ## Component development
 
 Use Arc for shared interactive controls and feedback. [MCP setup, component coverage and identity rules](docs/arc-ui.md). `npm run check:ui` rejects native controls outside the Arc sources.
+
+YOLO keeps PRs in your review inbox, while other escalations are handled by the judge. The response includes task-specific evidence and actionable next steps. Three task retries and three judge transport attempts bound failures. Drafts are never worker instructions; submitted replies are recorded in SQLite and the goal chat. No mode grants unavailable capabilities or guarantees perfect judgments.

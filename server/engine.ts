@@ -6,6 +6,7 @@ import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
 import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
+import { escalationMode } from "../src/lib/autonomy.ts";
 import {
   inspectRepo,
   checkApproval,
@@ -66,7 +67,7 @@ export function validateDependencies(tasks: { dependencies: number[] }[]) {
   }
   tasks.forEach((_, i) => visit(i));
 }
-const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: shadcn foundation, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
+const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
 
 export class Engine extends EventEmitter {
   busy = new Set<string>();
@@ -102,6 +103,10 @@ export class Engine extends EventEmitter {
     taskId?: string,
     extra: any = {},
   ) {
+    if (escalationMode(this.store.get(projectId)) === "yolo" && type !== "pr")
+      title = title
+        .replace("your input", "a decision")
+        .replace("your decision", "a decision");
     const existing = this.store
       .all("gate", projectId)
       .find(
@@ -361,6 +366,7 @@ export class Engine extends EventEmitter {
       .join("\n");
     const replies = this.store
       .conversation(project.id)
+      .filter((message) => message.kind !== "escalation_draft")
       .slice(-12)
       .map((message) => message.role + ": " + message.text)
       .join("\n");
@@ -442,11 +448,15 @@ export class Engine extends EventEmitter {
     this.store.patch(task.id, { status: "running", attempt: task.attempt + 1 });
     const context = this.store
       .conversation(project.id)
-      .filter((message) => !message.taskId || message.taskId === task.id)
+      .filter(
+        (message) =>
+          message.kind !== "escalation_draft" &&
+          (!message.taskId || message.taskId === task.id),
+      )
       .slice(-6)
-      .map((m) => m.text)
+      .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nHuman context: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     const result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
@@ -768,15 +778,17 @@ export class Engine extends EventEmitter {
         throw new Error("Gate is already resolved.");
       if (
         actor === "judge" &&
-        (!project.bypass || project.status !== "running")
+        (escalationMode(project) === "human" || project.status !== "running")
       )
-        throw new Error("Judge bypass is no longer active.");
+        throw new Error("Automatic judge submission is no longer active.");
       const resolvedAt = new Date().toISOString();
       this.store.patch(gateId, {
         status: "resolved",
         answer,
         resolvedBy: actor,
         resolvedAt,
+        awaitingCapability: false,
+        ...(actor === "judge" ? { judgeSubmittedAt: resolvedAt } : {}),
       });
       this.store.recordGateResponse(gate, answer, actor, resolvedAt, runId);
       if (gate.taskId) {
@@ -799,19 +811,52 @@ export class Engine extends EventEmitter {
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
   async judge(project: RecordData, gate: RecordData) {
-    if (gate.type === "pr") return;
+    if (gate.status !== "open") return;
     const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
-    this.store.patch(gate.id, { judgeStatus: "running", judgeError: null });
+    this.store.patch(gate.id, {
+      judgeStatus: "running",
+      judgeError: null,
+      judgeAttempts: (gate.judgeAttempts ?? 0) + 1,
+    });
     this.changed("judge-started", { gateId: gate.id }, project.id);
     try {
       const context = this.store
         .conversation(project.id)
         .filter((message) => !message.taskId || message.taskId === gate.taskId)
         .slice(-10);
+      const relatedTasks = this.store.all("task", project.id).map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: t.status,
+        dependencies: t.dependencies,
+        ...(t.id === task?.id
+          ? {
+              description: t.description,
+              acceptance: t.acceptance,
+              feedback: t.feedback,
+              checks: t.checks,
+              judgeRetries: t.judgeRetries,
+            }
+          : {}),
+      }));
+      const origin =
+        (gate.originRunId ?? gate.runId)
+          ? this.store.get(gate.originRunId ?? gate.runId)
+          : undefined;
       const result = await this.run(
         project,
         "judge",
-        `You are the independent escalation judge. Bypass mode delegates routine decisions to you; you are an agent, never a human approver. Read actual repository evidence before answering. Goal: ${project.goal}\nScope: ${project.constraints}\nEscalation: ${gate.title}\n${gate.detail}\nTask: ${task ? JSON.stringify({ title: task.title, description: task.description, acceptance: task.acceptance, feedback: task.feedback, checks: task.checks }) : "Project planning"}\nConversation: ${JSON.stringify(context)}\nReturn a clear answer, rationale summary and evidence sources. Action retry means your answer is sufficient to continue within existing authority. Action skip means the task is unnecessary and should be cancelled, with an explicit reason. Action wait means actual access, credentials, external setup, missing facts or permission changes are required; explain the concrete blocker. Do not claim to have fixed files, executed checks, installed software or granted permissions. You cannot approve or merge any PR, change scope, weaken the sandbox or change acceptance checks. Never retry a factual environment denial just by recommending a command. A read-only answer cannot grant spawn, network or filesystem access.`,
+        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. Never impersonate a human.
+Goal: ${project.goal}
+Scope/exclusions: ${project.constraints}
+Repository: ${project.path}
+Authorized checks: ${JSON.stringify(project.checks ?? [])}
+Escalation: ${JSON.stringify({ id: gate.id, title: gate.title, detail: gate.detail, type: gate.type, scope: gate.scope, authorRole: gate.authorRole })}
+Task and dependency frontier: ${JSON.stringify(relatedTasks)}
+Originating run: ${JSON.stringify(origin ? { role: origin.role, output: String(origin.output ?? "").slice(-16000), error: origin.error } : null)}
+Relevant conversation, including earlier responses: ${JSON.stringify(context)}
+Read actual repository evidence; check referenced files and failures rather than treating previous agent claims as facts. Answer the exact question first, choose a concrete course of action, then give implementable next steps and the checks that establish success. Cite relevant paths/sources and state any assumption or unresolved fact. Prefer existing components and the smallest useful change. Avoid generic reassurance, repeated escalation text, vague instructions to investigate, invented preferences or commands already known to fail. Before returning, check that your response directly answers the question, respects scope and acceptance, distinguishes observed from proposed work, and gives the recipient enough information to act.
+Action retry: your specific decision permits continuing within existing capabilities. If an attempt failed, identify a different evidence-supported approach; never repeat an unchanged environment denial. Action skip: task is demonstrably unnecessary, with an explicit reason; inability alone is not a reason to abandon required work. Action wait: no valid route exists because a concrete capability or fact is missing; give the exact missing condition, evidence and what would allow resumption. In YOLO this is a submitted machine blocker, not a request for human approval; other independent work continues. Never claim to have fixed files, run checks, installed packages, granted permissions or changed credentials. A read-only reply cannot grant spawn, network or filesystem access. Do not change scope, acceptance checks or sandbox permissions. For a PR escalation, produce a sourced review note only (action wait); every merge requires the human's approval of that exact revision. Never authorize or merge a PR`,
         Judgment,
         task,
         false,
@@ -823,7 +868,7 @@ export class Engine extends EventEmitter {
       const current = this.store.get(gate.id),
         currentProject = this.store.get(project.id);
       if (current.status !== "open") return;
-      let action = result.action,
+      let action = gate.type === "pr" ? "wait" : result.action,
         answer = result.answer;
       if (
         action === "retry" &&
@@ -831,8 +876,9 @@ export class Engine extends EventEmitter {
         (this.store.get(task.id).judgeRetries ?? 0) >= 3
       ) {
         action = "wait";
-        answer +=
-          "\nThree judge retries did not clear this task. Human intervention is required before another retry.";
+        answer =
+          answer.slice(0, 5600) +
+          "\nThree judge retries did not clear this task. This task remains blocked until its failed prerequisite or unavailable capability changes; independent tasks may continue. Do not repeat the same attempt.";
       }
       this.store.transaction(() => {
         this.store.patch(gate.id, {
@@ -840,6 +886,8 @@ export class Engine extends EventEmitter {
           judgeAnswer: answer,
           judgeAction: action,
           judgeRunId: run.id,
+          judgeSummary: result.summary,
+          judgeSources: result.sources,
         });
         this.store.recordGateResponse(
           gate,
@@ -847,11 +895,13 @@ export class Engine extends EventEmitter {
           "judge",
           new Date().toISOString(),
           run.id,
+          "escalation_draft",
         );
       });
       if (
+        gate.type !== "pr" &&
         action !== "wait" &&
-        currentProject.bypass &&
+        escalationMode(currentProject) !== "human" &&
         currentProject.status === "running"
       )
         await this.resolve(
@@ -861,12 +911,48 @@ export class Engine extends EventEmitter {
           "judge",
           run.id,
         );
+      if (
+        gate.type !== "pr" &&
+        action === "wait" &&
+        escalationMode(currentProject) === "yolo" &&
+        currentProject.status === "running"
+      ) {
+        this.store.transaction(() => {
+          const latestProject = this.store.get(project.id),
+            latestGate = this.store.get(gate.id);
+          if (
+            latestGate.status !== "open" ||
+            escalationMode(latestProject) !== "yolo" ||
+            latestProject.status !== "running"
+          )
+            return;
+          const submittedAt = new Date().toISOString();
+          this.store.patch(gate.id, {
+            judgeSubmittedAt: submittedAt,
+            awaitingCapability: true,
+            answer,
+            resolvedBy: "judge",
+          });
+          this.store.recordGateResponse(
+            gate,
+            answer,
+            "judge",
+            submittedAt,
+            run.id,
+          );
+          if (task)
+            this.store.patch(task.id, {
+              status: "blocked",
+              feedback: `Judge answered escalation: ${gate.detail}\n${answer}`,
+            });
+        });
+      }
       this.changed(
         "judge-answered",
         {
           gateId: gate.id,
           action,
-          applied: this.store.get(gate.id).status === "resolved",
+          applied: Boolean(this.store.get(gate.id).judgeSubmittedAt),
         },
         project.id,
       );
@@ -874,7 +960,14 @@ export class Engine extends EventEmitter {
       const current = this.store.get(gate.id);
       if (current.status === "open")
         this.store.patch(gate.id, {
-          judgeStatus: "failed",
+          judgeStatus:
+            escalationMode(this.store.get(project.id)) === "yolo" &&
+            (current.judgeAttempts ?? 0) < 3
+              ? "pending"
+              : "failed",
+          judgeNextAttemptAt:
+            Date.now() +
+            15_000 * 2 ** Math.max(0, (current.judgeAttempts ?? 1) - 1),
           judgeError: error instanceof Error ? error.message : String(error),
         });
       this.changed("judge-failed", { gateId: gate.id }, project.id);
@@ -917,15 +1010,17 @@ export class Engine extends EventEmitter {
         .all("gate", project.id)
         .filter((gate) => gate.status === "open");
       const judgeKey = "judge:" + project.id;
-      if (
-        project.bypass &&
-        this.busy.size < limit &&
-        !this.busy.has(judgeKey)
-      ) {
+      if (this.busy.size < limit && !this.busy.has(judgeKey)) {
         const candidate = gates.find(
           (gate) =>
-            gate.type !== "pr" &&
-            !["answered", "failed", "running"].includes(gate.judgeStatus),
+            (!["answered", "failed", "running"].includes(gate.judgeStatus) ||
+              (gate.judgeStatus === "answered" &&
+                !gate.judgeSubmittedAt &&
+                gate.type !== "pr" &&
+                (escalationMode(project) === "yolo" ||
+                  (escalationMode(project) === "bypass" &&
+                    gate.judgeAction !== "wait")))) &&
+            (!gate.judgeNextAttemptAt || gate.judgeNextAttemptAt <= Date.now()),
         );
         if (candidate)
           this.dispatch(
