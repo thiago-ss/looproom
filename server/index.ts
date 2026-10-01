@@ -415,6 +415,13 @@ app.post(
   }),
 );
 app.post(
+  "/api/gates/:id/reconcile-merge",
+  route(async (req, res) => {
+    await engine.reconcileMerge(String(req.params.id), true);
+    res.json({ ok: true });
+  }),
+);
+app.post(
   "/api/gates/:id/resolve",
   route(async (req, res) => {
     const body = z

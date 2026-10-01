@@ -1249,7 +1249,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
     return () => {
       alive = false;
     };
-  }, [gate?.id, gate?.sha]);
+  }, [gate?.id, gate?.sha, gate?.mergeAttempt?.requestedAt]);
   if (!gates.length)
     return (
       <section className="page">
@@ -1279,7 +1279,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
       <div className="response-actions">
         <Button
           variant="outline"
-          disabled={busy || !answer.trim()}
+          disabled={busy || !answer.trim() || (gate.type === "pr" && !!gate.mergeAttempt)}
           onClick={() =>
             act(() =>
               api("/gates/" + gate.id + "/resolve", {
@@ -1478,6 +1478,33 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                 <Pending label="Fetching the current PR revision and diff" />
               ) : null}
               {loadError ? <Alert tone="danger" title={loadError} /> : null}
+              {gate.mergeRecovery ? (
+                <Alert
+                  tone="warning"
+                  title={gate.mergeAttempt ? "Merge attempt needs reconciliation" : "Merge attempt reconciled"}
+                >
+                  {gate.mergeRecovery}
+                </Alert>
+              ) : null}
+              {gate.mergeAttempt ? (
+                <>
+                  <p className="muted">
+                    Reconcile rereads this PR without retrying the merge. If it
+                    merged at the reviewed commit, the task completes without a
+                    recorded approval. If it is still open at that commit, you
+                    can review it for a fresh approval. If its head changed or
+                    it closed unmerged, the attempt is preserved in history and
+                    the task waits for you to Request changes.
+                  </p>
+                  <Button
+                    variant="secondary"
+                    disabled={busy || loading}
+                    onClick={() => act(() => api("/gates/" + gate.id + "/reconcile-merge", {}))}
+                  >
+                    Reconcile merge attempt
+                  </Button>
+                </>
+              ) : null}
               {pr ? (
                 <>
                   <dl className="revision">
@@ -1490,8 +1517,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                   </dl>
                   {pr.headRefOid !== gate.sha ? (
                     <Alert tone="warning" title="Revision changed">
-                      Request changes so agents can verify and publish the new
-                      commit.
+                      {gate.mergeAttempt ? "Reconcile the interrupted merge attempt, then Request changes so agents can verify and publish the new commit." : "Request changes so agents can verify and publish the new commit."}
                     </Alert>
                   ) : null}
                   <h3>Verification</h3>
@@ -1552,6 +1578,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                     className="merge-button"
                     disabled={
                       busy ||
+                      !!gate.mergeAttempt ||
                       pr.headRefOid !== gate.sha ||
                       pr.state !== "OPEN" ||
                       pr.mergeable !== "MERGEABLE"
