@@ -39,8 +39,8 @@ const Judgment = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   verificationRequests: z
-    .array(z.enum(["configured-checks", "refresh-baseline"]))
-    .max(2)
+    .array(z.enum(["configured-checks", "refresh-baseline", "cleanup-test-fixtures"]))
+    .max(3)
     .default([]),
 });
 export function validateDependencies(tasks: { dependencies: number[] }[]) {
@@ -533,7 +533,7 @@ export class Engine extends EventEmitter {
     const review = await this.run(
       project,
       "review",
-      `Independently inspect git diff in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
+      `Independently inspect git diff in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
       Review,
       task,
     );
@@ -815,13 +815,14 @@ export class Engine extends EventEmitter {
     });
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
-  async verify(project: RecordData, task: RecordData, commands: string[]) {
+  async verify(project: RecordData, task: RecordData, commands: string[], cleanupFixtures = false) {
     const report = await this.verificationRunner({
       cwd: task.worktree,
       commands,
       dataDir: this.dataDir,
       codexBinary: this.runtime.binary,
       protectedPorts: [4319, 5173, Number(process.env.PORT ?? 4319)],
+      cleanupFixtures,
     });
     this.store.patch(task.id, {
       checks: report.results,
@@ -862,7 +863,7 @@ export class Engine extends EventEmitter {
     task: RecordData,
     requests: string[],
   ) {
-    const commands = requests.includes("configured-checks")
+    const commands = requests.includes("configured-checks") || requests.includes("cleanup-test-fixtures")
       ? [...(project.checks ?? [])]
       : [];
     if (requests.includes("refresh-baseline")) {
@@ -990,7 +991,7 @@ export class Engine extends EventEmitter {
       let result = await this.run(
         project,
         "judge",
-        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request coordinator verification using verificationRequests: ["configured-checks"] and/or ["refresh-baseline"]. These are predefined recipes, never arbitrary shell commands. The coordinator runs a disposable isolated snapshot with child execution, fixture cleanup and test loopback; the worker permissions stay unchanged. If recorded evidence is missing for the available verification runner, request the appropriate recipe instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
+        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request coordinator verification using verificationRequests: ["configured-checks"] and/or ["refresh-baseline"]. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs a disposable isolated snapshot with child execution, fixture cleanup and test loopback; the worker permissions stay unchanged. If recorded evidence is missing for the available verification runner, request the appropriate recipe instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
 Goal: ${project.goal}
 Scope/exclusions: ${project.constraints}
 Repository: ${project.path}
@@ -1025,7 +1026,7 @@ Action retry: your specific decision permits continuing within existing capabili
             { gateId: gate.id, taskId: task.id },
             project.id,
           );
-          const report = await this.verify(project, task, commands);
+          const report = await this.verify(project, task, commands, result.verificationRequests.includes("cleanup-test-fixtures"));
           if (this.store.get(gate.id).status !== "open") return;
           if (this.store.get(project.id).status !== "running" ||
               escalationMode(this.store.get(project.id)) !== "yolo") {

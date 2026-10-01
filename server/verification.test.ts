@@ -11,8 +11,12 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runVerification, sourceFingerprint } from "./verification.ts";
-const shell = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
+import { runVerification, sourceFingerprint, cleanupTestFixtures, npmReadRoot } from "./verification.ts";
+test("unrecognized npm layouts cannot grant read access to a broad parent", () => {
+  assert.equal(npmReadRoot("/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"), "/opt/homebrew/lib/node_modules/npm");
+  for (const path of ["/usr/local/bin/npm", "/custom/tool/bin/npm-cli.js", "/npm-cli.js"])
+    assert.equal(npmReadRoot(path), path);
+});
 
 test(
   "native verifier isolates source, secrets, Internet and coordinator while allowing children and local fixtures",
@@ -26,6 +30,8 @@ test(
     await mkdir(cwd);
     const outside = join(dir, "outside.txt");
     await writeFile(outside, "preserve");
+    await mkdir(join(cwd, ".looproom-test-fixtures"));
+    await symlink(outside, join(cwd, ".looproom-test-fixtures/old-outside-link"));
     await writeFile(join(cwd, ".env.production"), "fixture-secret");
     await symlink(outside, join(cwd, "outside-link"));
     await writeFile(
@@ -60,11 +66,14 @@ console.log('All native boundaries passed');
         dataDir: dir,
         codexBinary: "codex",
         timeoutMs: 10_000,
+        cleanupFixtures: true,
       });
       assert.equal(r.results[0].code, 0, r.results[0].output);
       assert.match(r.results[0].output, /All native boundaries passed/);
       assert.equal(r.results[1].code, 7);
       assert.equal(r.sourceUnchanged, true);
+      assert.equal(r.fixtureCleanup?.removed, true);
+      assert.equal((await readdir(cwd)).includes(".looproom-test-fixtures"), false);
       assert.equal(r.sourceHash, hash);
       assert.equal(await readFile(outside, "utf8"), "preserve");
       assert.equal(await sourceFingerprint(cwd), hash);
@@ -98,3 +107,15 @@ console.log('All native boundaries passed');
     }
   },
 );
+
+test("coordinator fixture cleanup rejects a symlinked scratch root", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "looproom-cleanup-"));
+  try {
+    const cwd = join(dir, "source"), outside = join(dir, "outside");
+    await mkdir(cwd); await mkdir(outside);
+    await writeFile(join(outside, "preserve"), "preserve");
+    await symlink(outside, join(cwd, ".looproom-test-fixtures"));
+    await assert.rejects(cleanupTestFixtures(cwd), /real reserved scratch directory/);
+    assert.equal(await readFile(join(outside, "preserve"), "utf8"), "preserve");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

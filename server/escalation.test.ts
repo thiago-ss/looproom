@@ -809,7 +809,7 @@ test("YOLO requests coordinator checks, reassesses actual evidence, and resumes 
           : "Actual configured checks passed; finish the task using the evidence.",
       summary: "Gate-specific verification",
       sources: [],
-      verificationRequests: turns === 1 ? ["configured-checks"] : [],
+      verificationRequests: turns === 1 ? ["configured-checks", "cleanup-test-fixtures"] : [],
     });
   });
   try {
@@ -835,6 +835,7 @@ test("YOLO requests coordinator checks, reassesses actual evidence, and resumes 
     f.engine.verificationRunner = async (options) => {
       verified++;
       assert.deepEqual(options.commands, ["node --version"]);
+      assert.equal(options.cleanupFixtures, true);
       return {
         id: "fixture-report",
         sourceHash: "fixture-hash",

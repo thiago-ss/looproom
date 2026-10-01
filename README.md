@@ -75,7 +75,7 @@ npm run check:ui
 npm run build
 ```
 
-Thirty-five tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
+Thirty-seven tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
 
 ## Remaining work
 
@@ -106,3 +106,5 @@ Configured checks run in disposable copies of task worktrees through a separate 
 Reports record actual commands, exit codes, timeout status, durations and the original source fingerprint in `verification/<id>.json` under the data directory. Workers can read `.looproom-verification/latest.json` and immutable `<report-id>.json` history; this runtime evidence is excluded from publication. YOLO judges can request configured checks or the pinned refresh baseline, then reassess the real results. Worker permissions and human approval of PR merges remain unchanged.
 
 The v0 runner uses macOS `sandbox-exec`, which is deprecated. Native sandbox denial tests use a private socket to request the existing worker policy in a sibling sandbox, because macOS rejects nested policy application. Caller-supplied permission profiles are ignored. Normal timeouts terminate process groups and cancel native test children. A signed sandboxed runner and crash-proof process supervision remain packaging work.
+
+YOLO may explicitly request `cleanup-test-fixtures` to remove only the reserved `.looproom-test-fixtures` scratch directory in the assigned worktree, then run configured checks. The coordinator rejects a symlinked root and does not follow nested links. This recorded housekeeping action is separate from test process permissions. Earlier reports remain readable by ID when later checks run.

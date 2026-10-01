@@ -87,6 +87,7 @@ export async function nativeTestBroker(job: string, binary: string) {
     });
     connection.on("error", () => {});
   });
+  try {
   await new Promise<void>((ok, no) => {
     server.once("error", no);
     server.listen(socket, () => {
@@ -107,6 +108,12 @@ connection.on('error',error=>{console.error(error.message);process.exitCode=1;})
 `,
     { mode: 0o755 },
   );
+  } catch (error) {
+    for (const connection of connections) connection.destroy();
+    server.close();
+    await rm(socketRoot, { recursive: true, force: true });
+    throw error;
+  }
   return {
     socket,
     bin,

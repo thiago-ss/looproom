@@ -13,7 +13,7 @@ import {
   writeFile,
   symlink,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { exec } from "./git.ts";
 
 const omitted = (name: string) =>
@@ -60,6 +60,11 @@ export async function sourceFingerprint(root: string): Promise<string> {
   return hash.digest("hex");
 }
 const quote = (value: string) => JSON.stringify(value);
+export function npmReadRoot(executable: string) {
+  const root = dirname(dirname(executable));
+  return basename(executable) === "npm-cli.js" && basename(dirname(executable)) === "bin" && basename(root) === "npm"
+    ? root : executable;
+}
 export function verificationPolicy(
   job: string,
   readRoots: string[],
@@ -110,7 +115,22 @@ export type VerificationReport = {
   results: VerificationResult[];
   reportPath: string;
   createdAt: string;
+  fixtureCleanup?: { path: string; removed: boolean };
 };
+// Coordinator housekeeping for the reserved, ignored test scratch directory.
+// Never follow its root or nested symlinks into project/source directories.
+export async function cleanupTestFixtures(cwd: string) {
+  const root = await realpath(cwd), path = join(root, ".looproom-test-fixtures");
+  const meta = await lstat(path).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!meta) return { path, removed: false };
+  if (!meta.isDirectory() || meta.isSymbolicLink() || await realpath(path) !== path)
+    throw new Error("Test fixture cleanup requires a real reserved scratch directory.");
+  await rm(path, { recursive: true });
+  return { path, removed: true };
+}
 export async function runVerification(options: {
   cwd: string;
   commands: string[];
@@ -118,6 +138,7 @@ export async function runVerification(options: {
   codexBinary: string;
   protectedPorts?: number[];
   timeoutMs?: number;
+  cleanupFixtures?: boolean;
 }): Promise<VerificationReport> {
   if (process.platform !== "darwin")
     throw new Error("Isolated verification currently requires macOS.");
@@ -129,16 +150,17 @@ export async function runVerification(options: {
     throw new Error("Choose 1–8 configured verification commands.");
   const cwd = await realpath(options.cwd),
     id = randomUUID();
+  const sourceHash = await sourceFingerprint(cwd);
   const base = resolve(options.dataDir, "verification"),
     job = join(base, id),
     workspace = join(job, "workspace");
   await mkdir(base, { recursive: true, mode: 0o700 });
   await mkdir(job, { mode: 0o700 });
-  const canonicalJob = await realpath(job),
-    sourceHash = await sourceFingerprint(cwd);
+  const canonicalJob = await realpath(job);
   const reportPath = join(base, id + ".json");
   let broker: Awaited<ReturnType<typeof nativeTestBroker>> | undefined;
   try {
+    const fixtureCleanup = options.cleanupFixtures ? await cleanupTestFixtures(cwd) : undefined;
     await cp(cwd, workspace, {
       recursive: true,
       dereference: false,
@@ -228,7 +250,7 @@ export async function runVerification(options: {
     await mkdir(tmp);
     const node = await realpath(process.execPath);
     const npm = (await exec("/usr/bin/which", ["npm"])).stdout.trim();
-    const npmRoot = dirname(dirname(await realpath(npm)));
+    const npmRoot = npmReadRoot(await realpath(npm));
     const binary = await realpath(
       options.codexBinary.includes("/")
         ? options.codexBinary
@@ -343,6 +365,7 @@ export async function runVerification(options: {
       results,
       reportPath,
       createdAt: new Date().toISOString(),
+      ...(fixtureCleanup ? { fixtureCleanup } : {}),
     };
     await writeFile(reportPath, JSON.stringify(report, null, 2), {
       mode: 0o600,
