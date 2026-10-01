@@ -71,7 +71,7 @@ import {
 import ConversationMessages from "./components/ConversationMessages";
 import { Switch } from "./components/ui/switch";
 const Work = lazy(() => import("./components/Work"));
-import { frontierState, frontierLabel } from "./lib/work";
+import { frontierState, frontierLabel, waitingOnBlocker } from "./lib/work";
 import { api, type Data } from "./lib/api";
 
 const Memory = lazy(() => import("./components/Memory"));
@@ -265,6 +265,12 @@ export default function App() {
       (message) => message.projectId === project?.id,
     );
   const active = runs.filter((run) => run.status === "running");
+  const waiting = project && waitingOnBlocker(
+    project,
+    tasks,
+    data.gates.filter(gate => gate.projectId === project.id),
+    runs,
+  );
   return (
     <div
       className={"app" + (!onboarding && view === "goal" ? " goal-view" : "")}
@@ -385,9 +391,9 @@ export default function App() {
                   {escalationMode(project) === "yolo" ? (
                     <Badge variant="secondary">YOLO</Badge>
                   ) : null}
-                  <span className={"status " + project.status}>
+                  <span className={"status " + (waiting ? "blocked" : project.status)}>
                     <span />
-                    {statusText(project.status)}
+                    {waiting ? (active.some(run => run.role === "judge") ? "Checking blocker" : "Waiting on a blocker") : statusText(project.status)}
                   </span>
                   <Button
                     variant="ghost"

@@ -438,7 +438,9 @@ export default function Work({
                           <strong>
                             {gate.type === "pr"
                               ? "Ready for your review"
-                              : "A decision is holding this task"}
+                              : gate.awaitingCapability
+                                ? "Judge replied · still blocked"
+                                : "A decision is holding this task"}
                           </strong>
                         </div>
                         {["pending", "running"].includes(gate.judgeStatus) ? (

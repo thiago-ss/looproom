@@ -2,6 +2,7 @@ import { lazy, Suspense } from "react";
 import { ArrowRight, CornerDownRight, ShieldCheck, Square } from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
+import { submittedWait } from "../lib/work";
 const Orb = lazy(() => import("./AgentOrb"));
 const names: Record<string, string> = {
   human: "You",
@@ -57,7 +58,8 @@ export default function ConversationMessages({
             message.kind,
           ),
           draft = message.kind === "escalation_draft",
-          open = gate?.status === "open";
+          open = gate?.status === "open",
+          waiting = submittedWait(message, gate);
         return (
           <article
             key={message.id}
@@ -72,6 +74,9 @@ export default function ConversationMessages({
                 <img src="/brand/looproom-mark.svg?v=3" alt="" />
               ) : null}
               <strong>{names[message.role] ?? message.role}</strong>
+              {waiting ? (
+                <Badge variant="secondary">Still blocked</Badge>
+              ) : null}
               {escalation ? (
                 <Badge variant="secondary">Escalation</Badge>
               ) : null}
@@ -87,8 +92,12 @@ export default function ConversationMessages({
                 <div className="reply-context">
                   <CornerDownRight size={14} />
                   <span>
-                    {draft ? "Draft for escalation" : "Escalation reply"} ·{" "}
-                    {gate?.title ?? "Decision"}
+                    {draft
+                      ? "Draft for escalation"
+                      : waiting
+                        ? "Judge replied · waiting for access"
+                        : "Escalation reply"}{" "}
+                    · {gate?.title ?? "Decision"}
                   </span>
                 </div>
               ) : null}
@@ -137,7 +146,18 @@ export default function ConversationMessages({
                   </div>
                 </>
               ) : (
-                message.text
+                <>
+                  {message.text}
+                  {waiting && gate.judgeNextAttemptAt ? (
+                    <div className="reply-context">
+                      Next check{" "}
+                      {new Date(gate.judgeNextAttemptAt).toLocaleTimeString(
+                        [],
+                        { hour: "2-digit", minute: "2-digit" },
+                      )}
+                    </div>
+                  ) : null}
+                </>
               )}
             </div>
           </article>
