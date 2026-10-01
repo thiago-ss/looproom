@@ -505,6 +505,7 @@ export default function App() {
                       pages={data.memory.filter(
                         (page) => page.projectId === project.id,
                       )}
+                      tasks={data.tasks.filter((task) => task.projectId === project.id)}
                     />
                   </Suspense>
                 ) : null}

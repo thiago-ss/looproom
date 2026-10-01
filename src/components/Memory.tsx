@@ -36,6 +36,12 @@ function sourceName(source: string) {
     return target.split("/").filter(Boolean).at(-1) ?? target;
   }
 }
+function claimSource(source: string, key: string) {
+  const target = sourceTarget(source);
+  return /^https?:\/\//.test(target)
+    ? <a key={key} href={target} target="_blank" rel="noreferrer">{source}</a>
+    : <span key={key}>{source}</span>;
+}
 function headline(page: any) {
   if (
     !/^(orchestrator|implementation|review|research|judge) outcome$/i.test(
@@ -345,6 +351,31 @@ export default function Memory({ project, pages }: any) {
                     {page.content}
                   </Markdown>
                 </div>
+                {page.claimRevisions?.length ? (
+                  <section className="reader-sources" aria-label="Claim revisions">
+                    <h3>Claim revisions</h3>
+                    {page.claimRevisions.map((claim: any, i: number) => (
+                      <div className="reader-source" key={i}>
+                        <span><strong>{claim.status}{claim.relation === "supersedes" ? "; proposed supersession" : claim.relation === "contradicts" ? "; proposed contradiction" : ""}: {claim.key}</strong><br />{claim.statement}
+                          <small>Sources: {claim.sources.map((source: string, index: number) =>
+                            <span key={index}>{index ? ", " : ""}{claimSource(source, `${i}-${index}`)}</span>)}</small>
+                          {claim.related.map((item: any) => (
+                            <small key={`${item.pageId}:${item.claimIndex}`}>Conflicts with {item.pageId} claim {item.claimIndex + 1}: {item.statement} (sources: {item.sources.map((source: string, index: number) =>
+                              <span key={index}>{index ? ", " : ""}{claimSource(source, `${item.pageId}-${item.claimIndex}-${index}`)}</span>)})</small>
+                          ))}
+                        </span>
+                      </div>
+                    ))}
+                  </section>
+                ) : null}
+                {(page.checkEvidenceHistory?.length || page.checkEvidence || page.prEvidence) ? (
+                    <section className="reader-sources" aria-label="Independent evidence">
+                      <h3>Separate evidence</h3>
+                      {(page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : [])).map((report: any) =>
+                        <p key={report.reportId}>Check report <a href={`/api/verification/${report.reportId}`} target="_blank" rel="noreferrer">{report.reportId}</a>: {report.results?.every((check: any) => check.code === 0) && report.sourceUnchanged ? "passed" : "failed or stale"}. Source hash {report.sourceHash}.</p>)}
+                      {page.prEvidence ? <p>PR outcome: <a href={page.prEvidence.url} target="_blank" rel="noreferrer">{page.prEvidence.url}</a> ({page.prEvidence.status}; head {page.prEvidence.headSha}{page.prEvidence.mergedSha ? `; merged ${page.prEvidence.mergedSha}` : ""})</p> : null}
+                    </section>
+                ) : null}
 
                 <div className="reader-sources">
                   <h3>
