@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { Store } from "./store.ts";
 import { Engine } from "./engine.ts";
 import { Runtime } from "./runtime.ts";
 import { createRepo } from "./git.ts";
+import { testFixture } from "./test-fixtures.ts";
 
 class FixtureRuntime extends EventEmitter {
   binary = "";
@@ -49,7 +49,7 @@ class FixtureRuntime extends EventEmitter {
 }
 
 test("planner → isolated worker → check → reviewer preserves artifacts and gates a missing GitHub remote", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-engine-"));
+  const dir = await testFixture("looproom-engine-");
   const store = new Store(join(dir, "db"));
   const runtime = new FixtureRuntime();
   runtime.home = join(dir, "codex");
@@ -57,6 +57,17 @@ test("planner → isolated worker → check → reviewer preserves artifacts and
   runtime.binary = join(dir, "fixture-check");
   await writeFile(runtime.binary, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   const engine = new Engine(store, runtime as unknown as Runtime, dir);
+  // This fixture tests coordinator handoffs. Native isolation is exercised by
+  // sandbox.test.ts and verification.test.ts, outside this mock runtime.
+  engine.verificationRunner = async ({ cwd, commands }) => {
+    assert.deepEqual(commands, ["test -f result.txt"]);
+    assert.equal(await readFile(join(cwd, "result.txt"), "utf8"), "useful work");
+    return {
+      id: "fixture-check", sourceHash: "fixture-source", sourceUnchanged: true,
+      reportPath: "fixture-check.json", createdAt: new Date().toISOString(),
+      results: [{ command: commands[0], code: 0, output: "Fixture content verified", timedOut: false, durationMs: 1 }],
+    };
+  };
   try {
     store.put(
       "settings",
@@ -113,7 +124,7 @@ test("planner → isolated worker → check → reviewer preserves artifacts and
 });
 
 test("routine verification failures get bounded autonomous repair before human escalation", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-repair-"));
+  const dir = await testFixture("looproom-repair-");
   const store = new Store(join(dir, "db"));
   const engine = new Engine(
     store,

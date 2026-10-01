@@ -1,9 +1,7 @@
-import { lazy, Suspense } from "react";
 import { ArrowRight, CornerDownRight, ShieldCheck, Square } from "lucide-react";
 import { Button } from "./ui/button";
 import { Badge } from "./ui/badge";
 import { submittedWait } from "../lib/work";
-const Orb = lazy(() => import("./AgentOrb"));
 const names: Record<string, string> = {
   human: "You",
   orchestrator: "Orchestrator",
@@ -67,9 +65,17 @@ export default function ConversationMessages({
           >
             <div className="message-byline">
               {message.role === "judge" ? (
-                <Suspense fallback={<ShieldCheck size={20} />}>
-                  <Orb active={false} size={26} identity="judge" />
-                </Suspense>
+                // History can contain hundreds of replies; reserve WebGL for live activity.
+                <img
+                  src="/orbs/judge-idle.png"
+                  className="agent-orb orb-judge"
+                  data-orb="judge"
+                  width={26}
+                  height={26}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                />
               ) : message.role !== "human" ? (
                 <img src="/brand/looproom-mark.svg?v=3" alt="" />
               ) : null}

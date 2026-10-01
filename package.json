@@ -12,6 +12,7 @@
     "start": "node --import tsx server/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test server/*.test.ts",
+    "benchmark:refresh": "node --import tsx scripts/measure-refresh.ts",
     "check:ui": "node scripts/check-ui.mjs"
   },
   "dependencies": {

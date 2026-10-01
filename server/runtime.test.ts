@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { Runtime } from "./runtime.ts";
+import { testFixture } from "./test-fixtures.ts";
 
 const fixture = `#!/usr/bin/env node
 import { createInterface } from 'node:readline';
@@ -29,7 +29,7 @@ createInterface({input:process.stdin}).on('line', line => {
 });`;
 
 test("Codex transport applies the requested profile and isolates final output from commentary", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-runtime-"));
+  const dir = await testFixture("looproom-runtime-");
   const binary = join(dir, "codex.mjs");
   await writeFile(binary, fixture, { mode: 0o755 });
   const runtime = new Runtime(binary, join(dir, "home"));

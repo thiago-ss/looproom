@@ -1,7 +1,7 @@
+import { testFixture } from "./test-fixtures.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  mkdtemp,
   mkdir,
   writeFile,
   readFile,
@@ -9,7 +9,6 @@ import {
   symlink,
   readdir,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runVerification, sourceFingerprint, cleanupTestFixtures, npmReadRoot } from "./verification.ts";
 test("unrecognized npm layouts cannot grant read access to a broad parent", () => {
@@ -25,7 +24,7 @@ test(
       process.platform !== "darwin" || !!process.env.LOOPROOM_VERIFICATION_JOB,
   },
   async () => {
-    const dir = await mkdtemp(join(tmpdir(), "looproom-verifier-")),
+    const dir = await testFixture("looproom-verifier-"),
       cwd = join(dir, "source");
     await mkdir(cwd);
     const outside = join(dir, "outside.txt");
@@ -109,7 +108,7 @@ console.log('All native boundaries passed');
 );
 
 test("coordinator fixture cleanup rejects a symlinked scratch root", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-cleanup-"));
+  const dir = await testFixture("looproom-cleanup-");
   try {
     const cwd = join(dir, "source"), outside = join(dir, "outside");
     await mkdir(cwd); await mkdir(outside);

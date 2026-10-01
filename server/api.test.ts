@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { createRepo } from "./git.ts";
+import { testFixture } from "./test-fixtures.ts";
 
 test("local API requires a session, rejects foreign origins and keeps projects after restart", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-api-"));
+  const dir = await testFixture("looproom-api-");
   const binary = join(dir, "fixture.mjs");
   await writeFile(
     binary,

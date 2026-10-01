@@ -1,14 +1,14 @@
+import { testFixture } from "./test-fixtures.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Store } from "./store.ts";
 import { Engine } from "./engine.ts";
 import type { Runtime } from "./runtime.ts";
 async function fixture(run?: (options: any) => Promise<string>) {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-escalation-"));
+  const dir = await testFixture("looproom-escalation-");
   const store = new Store(join(dir, "db"));
   const runtime = Object.assign(new EventEmitter(), { run, close() {} });
   const engine = new Engine(store, runtime as unknown as Runtime, dir);

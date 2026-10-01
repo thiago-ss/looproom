@@ -488,7 +488,8 @@ app.use(
     });
   },
 );
-const server = app.listen(port, "127.0.0.1", () => {
+const server = app.listen(port, "127.0.0.1");
+server.once("listening", () => {
   console.log(
     `Looproom coordinator: http://127.0.0.1:${(server.address() as any).port}`,
   );

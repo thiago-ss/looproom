@@ -429,6 +429,10 @@ time {
   width: 22px;
   height: 22px;
 }
+.message-byline > img.agent-orb {
+  width: 26px;
+  height: 26px;
+}
 .message-byline time {
   margin-left: auto;
   color: var(--lr-muted);

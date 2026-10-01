@@ -75,7 +75,7 @@ npm run check:ui
 npm run build
 ```
 
-Thirty-seven tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
+Forty-two tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
 
 ## Remaining work
 
@@ -108,3 +108,5 @@ Reports record actual commands, exit codes, timeout status, durations and the or
 The v0 runner uses macOS `sandbox-exec`, which is deprecated. Native sandbox denial tests use a private socket to request the existing worker policy in a sibling sandbox, because macOS rejects nested policy application. Caller-supplied permission profiles are ignored. Normal timeouts terminate process groups and cancel native test children. A signed sandboxed runner and crash-proof process supervision remain packaging work.
 
 YOLO may explicitly request `cleanup-test-fixtures` to remove only the reserved `.looproom-test-fixtures` scratch directory in the assigned worktree, then run configured checks. The coordinator rejects a symlinked root and does not follow nested links. This recorded housekeeping action is separate from test process permissions. Earlier reports remain readable by ID when later checks run.
+
+Baseline setup repairs require independent source comparison and fresh coordinator measurements. Original evaluator bytes and hash revisions are retained; missing or modified snapshots fail closed. Once accepted, the baseline freezes for subsequent candidates. Refused verification recipes enter YOLO recovery with the actual error instead of the model transport cooldown. This does not grant worker capabilities, bypass review, or authorize a PR merge.
