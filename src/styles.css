@@ -2285,6 +2285,23 @@ pre {
   outline: 0;
   box-shadow: none;
 }
+.memory-page > .pending {
+  margin-top: 12px;
+}
+.memory-search-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--lr-radius);
+  background: var(--lr-gate-wash);
+  color: var(--lr-gate);
+  font-size: 13px;
+}
+.memory-search-error p {
+  margin: 0;
+}
 .memory-summary {
   display: flex;
   gap: 22px;
