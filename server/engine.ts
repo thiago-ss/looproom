@@ -810,12 +810,81 @@ export class Engine extends EventEmitter {
     });
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
+  async recoverEscalation(
+    project: RecordData,
+    gate: RecordData,
+    task: RecordData | undefined,
+    assessment: z.infer<typeof Judgment>,
+  ) {
+    const currentProject = this.store.get(project.id);
+    if (
+      !task?.worktree ||
+      this.store.get(gate.id).status !== "open" ||
+      gate.type === "pr" ||
+      escalationMode(currentProject) !== "yolo" ||
+      currentProject.status !== "running"
+    )
+      return assessment;
+    this.store.patch(gate.id, { judgeRecoveryStatus: "running" });
+    this.changed(
+      "judge-recovery-started",
+      { gateId: gate.id, taskId: task.id },
+      project.id,
+    );
+    try {
+      const recovery = await this.run(
+        currentProject,
+        "judge",
+        `YOLO escalation recovery: carry out the recovery in this task's existing worktree, rather than asking a human to perform routine work. Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${JSON.stringify({ title: task.title, description: task.description, acceptance: task.acceptance, checks: task.checks, feedback: task.feedback })}\nEscalation: ${gate.title}\n${gate.detail}\nAssessment: ${assessment.answer}\nAuthorized coordinator checks: ${JSON.stringify(project.checks ?? [])}\nInspect actual sources and capabilities, then implement the smallest valid repair or use an available alternative. You may edit this task's worktree and execute commands under its existing workspace permissions. Keep acceptance checks, scope, credential isolation and sandbox protections intact. Never commit, change Git metadata, publish or merge a PR. Never invent credentials or claim an unavailable capability was granted. If no repair is possible, return wait with the specific observed condition; the coordinator will recheck automatically. If your verified repair lets the worker continue, return retry with what changed, actual evidence and next steps. Skip is only for work demonstrably unnecessary to the goal, never a substitute for completing required work. Distinguish executed results from proposed checks. Return answer, action, summary and evidence sources.`,
+        Judgment,
+        task,
+        true,
+      );
+      this.store.patch(gate.id, { judgeRecoveryStatus: "completed" });
+      this.changed(
+        "judge-recovery-completed",
+        { gateId: gate.id, action: recovery.action },
+        project.id,
+      );
+      return {
+        ...recovery,
+        summary: assessment.summary + "\n" + recovery.summary,
+        sources: [...new Set([...assessment.sources, ...recovery.sources])],
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.store.patch(gate.id, {
+        judgeRecoveryStatus: "failed",
+        judgeRecoveryError: detail,
+      });
+      return {
+        ...assessment,
+        action: "wait" as const,
+        answer: (
+          assessment.answer.slice(0, 4200) +
+          "\nAutomatic recovery could not complete: " +
+          detail.slice(0, 1200) +
+          "\nLooproom will recheck this blocker automatically."
+        ).slice(0, 6000),
+      };
+    }
+  }
   async judge(project: RecordData, gate: RecordData) {
     if (gate.status !== "open") return;
     const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
+    if (
+      escalationMode(project) === "yolo" &&
+      gate.awaitingCapability &&
+      gate.judgeNextAttemptAt &&
+      gate.judgeNextAttemptAt <= Date.now() &&
+      task
+    )
+      this.store.patch(task.id, { judgeRetries: 0 });
     this.store.patch(gate.id, {
       judgeStatus: "running",
       judgeError: null,
+      judgeRecoveryStatus: null,
+      judgeRecoveryError: null,
       judgeAttempts: (gate.judgeAttempts ?? 0) + 1,
     });
     this.changed("judge-started", { gateId: gate.id }, project.id);
@@ -843,7 +912,7 @@ export class Engine extends EventEmitter {
         (gate.originRunId ?? gate.runId)
           ? this.store.get(gate.originRunId ?? gate.runId)
           : undefined;
-      const result = await this.run(
+      let result = await this.run(
         project,
         "judge",
         `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. Never impersonate a human.
@@ -861,6 +930,12 @@ Action retry: your specific decision permits continuing within existing capabili
         task,
         false,
       );
+      if (
+        result.action === "wait" &&
+        gate.type !== "pr" &&
+        escalationMode(this.store.get(project.id)) === "yolo"
+      )
+        result = await this.recoverEscalation(project, gate, task, result);
       const run = this.store
         .all("run", project.id)
         .filter((run) => run.role === "judge")
@@ -888,6 +963,8 @@ Action retry: your specific decision permits continuing within existing capabili
           judgeRunId: run.id,
           judgeSummary: result.summary,
           judgeSources: result.sources,
+          judgeFailures: 0,
+          judgeNextAttemptAt: null,
         });
         this.store.recordGateResponse(
           gate,
@@ -930,6 +1007,13 @@ Action retry: your specific decision permits continuing within existing capabili
           this.store.patch(gate.id, {
             judgeSubmittedAt: submittedAt,
             awaitingCapability: true,
+            judgeRechecks: (latestGate.judgeRechecks ?? 0) + 1,
+            judgeNextAttemptAt:
+              Date.now() +
+              Math.min(
+                30 * 60_000,
+                5 * 60_000 * 2 ** (latestGate.judgeRechecks ?? 0),
+              ),
             answer,
             resolvedBy: "judge",
           });
@@ -962,12 +1046,15 @@ Action retry: your specific decision permits continuing within existing capabili
         this.store.patch(gate.id, {
           judgeStatus:
             escalationMode(this.store.get(project.id)) === "yolo" &&
-            (current.judgeAttempts ?? 0) < 3
+            (current.judgeFailures ?? 0) < 2
               ? "pending"
               : "failed",
+          judgeFailures: (current.judgeFailures ?? 0) + 1,
           judgeNextAttemptAt:
             Date.now() +
-            15_000 * 2 ** Math.max(0, (current.judgeAttempts ?? 1) - 1),
+            ((current.judgeFailures ?? 0) >= 2
+              ? 30 * 60_000
+              : 15_000 * 2 ** (current.judgeFailures ?? 0)),
           judgeError: error instanceof Error ? error.message : String(error),
         });
       this.changed("judge-failed", { gateId: gate.id }, project.id);
@@ -1011,17 +1098,27 @@ Action retry: your specific decision permits continuing within existing capabili
         .filter((gate) => gate.status === "open");
       const judgeKey = "judge:" + project.id;
       if (this.busy.size < limit && !this.busy.has(judgeKey)) {
-        const candidate = gates.find(
-          (gate) =>
-            (!["answered", "failed", "running"].includes(gate.judgeStatus) ||
-              (gate.judgeStatus === "answered" &&
-                !gate.judgeSubmittedAt &&
-                gate.type !== "pr" &&
-                (escalationMode(project) === "yolo" ||
-                  (escalationMode(project) === "bypass" &&
-                    gate.judgeAction !== "wait")))) &&
-            (!gate.judgeNextAttemptAt || gate.judgeNextAttemptAt <= Date.now()),
-        );
+        const candidate = gates.find((gate) => {
+          if (gate.judgeStatus === "running") return false;
+          if (gate.judgeNextAttemptAt && gate.judgeNextAttemptAt > Date.now())
+            return false;
+          if (!["answered", "failed"].includes(gate.judgeStatus)) return true;
+          const mode = escalationMode(project);
+          if (mode === "yolo") {
+            if (gate.judgeStatus === "failed") return true;
+            return (
+              gate.type !== "pr" &&
+              (!gate.judgeSubmittedAt || gate.awaitingCapability)
+            );
+          }
+          return (
+            mode === "bypass" &&
+            gate.type !== "pr" &&
+            gate.judgeStatus === "answered" &&
+            !gate.judgeSubmittedAt &&
+            gate.judgeAction !== "wait"
+          );
+        });
         if (candidate)
           this.dispatch(
             judgeKey,
@@ -1057,6 +1154,14 @@ Action retry: your specific decision permits continuing within existing capabili
         if (
           task.status !== "ready" ||
           this.busy.has(key) ||
+          this.store
+            .all("run", project.id)
+            .some(
+              (run) =>
+                run.taskId === task.id &&
+                run.role === "judge" &&
+                run.status === "running",
+            ) ||
           gates.some((gate) => gate.taskId === task.id)
         )
           continue;

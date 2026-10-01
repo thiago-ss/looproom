@@ -1,3 +1,4 @@
+import JudgePending from "./components/JudgePending";
 import { Badge } from "./components/ui/badge";
 import {
   escalationMode,
@@ -1357,11 +1358,19 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
               <strong>
                 {gate.judgeSubmittedAt ? "Judge reply" : "Judge draft"}
               </strong>
-              <p>
-                {gate.judgeAnswer ??
-                  gate.judgeError ??
-                  "Reviewing this escalation…"}
-              </p>
+              {["pending", "running"].includes(gate.judgeStatus) ? (
+                <p role="status" aria-live="polite">
+                  <JudgePending
+                    text={
+                      gate.judgeRecoveryStatus === "running"
+                        ? "Resolving this escalation…"
+                        : "Reviewing this escalation…"
+                    }
+                  />
+                </p>
+              ) : (
+                <p>{gate.judgeAnswer ?? gate.judgeError}</p>
+              )}
               {gate.judgeAnswer &&
               !gate.judgeSubmittedAt &&
               gate.type !== "pr" ? (
@@ -1616,15 +1625,21 @@ function Settings({ data, project, act, busy, refresh }: any) {
         })),
         {
           model: settings.orchestrator.model,
-          displayName: settings.orchestrator.model,
+          displayName: settings.orchestrator.model
+            .replace(/^gpt-/, "GPT-")
+            .replace(/-sol$/, " Sol"),
         },
         {
           model: settings.subagent.model,
-          displayName: settings.subagent.model,
+          displayName: settings.subagent.model
+            .replace(/^gpt-/, "GPT-")
+            .replace(/-sol$/, " Sol"),
         },
         {
           model: settings.judge.model,
-          displayName: settings.judge.model,
+          displayName: settings.judge.model
+            .replace(/^gpt-/, "GPT-")
+            .replace(/-sol$/, " Sol"),
         },
       ].map((model: any) => [model.model, model]),
     ).values(),
@@ -1686,57 +1701,100 @@ function Settings({ data, project, act, busy, refresh }: any) {
       </section>
       <section className="setting-section">
         <h2>Models</h2>
-        <p>Defaults apply to future runs. Unavailable models create a gate.</p>
-        {(["orchestrator", "subagent", "judge"] as const).map((role) => (
-          <div className="model-setting" key={role}>
-            <Select
-              value={settings[role].model}
-              onValueChange={(model) =>
-                setSettings({
-                  ...settings,
-                  [role]: { ...settings[role], model },
-                })
+        <div className="model-roster">
+          {(
+            [
+              {
+                role: "orchestrator",
+                title: "Orchestrator",
+                detail: "Plans the next move",
+                Icon: GitBranch,
+              },
+              {
+                role: "subagent",
+                title: "Builders & researchers",
+                detail: "Turns the plan into working code",
+                Icon: Layers3,
+              },
+              {
+                role: "judge",
+                title: "Escalation judge",
+                detail: "Finds a way forward",
+                Icon: ShieldCheck,
+              },
+            ] as const
+          ).map(({ role, title, detail, Icon }) => (
+            <div className={"model-role model-role-" + role} key={role}>
+              <div className="model-role-label">
+                <span className="model-role-icon">
+                  <Icon size={19} aria-hidden="true" />
+                </span>
+                <div>
+                  <strong>{title}</strong>
+                  <span>{detail}</span>
+                </div>
+              </div>
+              <div className="model-setting">
+                <Select
+                  value={settings[role].model}
+                  onValueChange={(model) =>
+                    setSettings({
+                      ...settings,
+                      [role]: { ...settings[role], model },
+                    })
+                  }
+                  label={title + " model"}
+                  id={role + "-model"}
+                  options={models.map((model) => ({
+                    value: model.model,
+                    label: model.displayName,
+                  }))}
+                />
+                <Select
+                  value={settings[role].effort}
+                  onValueChange={(effort) =>
+                    setSettings({
+                      ...settings,
+                      [role]: { ...settings[role], effort },
+                    })
+                  }
+                  label={title + " reasoning"}
+                  id={role + "-effort"}
+                  options={["low", "medium", "high", "xhigh", "max"].map(
+                    (effort) => ({
+                      value: effort,
+                      label: effort[0].toUpperCase() + effort.slice(1),
+                    }),
+                  )}
+                />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="workflow-setting">
+          <div className="workflow-label">
+            <Layers3 size={19} aria-hidden="true" />
+            <div>
+              <strong>Concurrent workflows</strong>
+              <span>Active at once, across your agents</span>
+            </div>
+          </div>
+          <div className="workflow-counter">
+            <NumberField
+              id="concurrency"
+              label="Concurrent workflows"
+              min={1}
+              max={4}
+              step={1}
+              largeStep={1}
+              scrub={false}
+              value={settings.concurrency}
+              onValueChange={(concurrency) =>
+                setSettings({ ...settings, concurrency })
               }
-              label={
-                role === "orchestrator"
-                  ? "Orchestrator"
-                  : role === "judge"
-                    ? "Escalation judge"
-                    : "Implementation & subagents"
-              }
-              id={role + "-model"}
-              options={models.map((model) => ({
-                value: model.model,
-                label: model.displayName,
-              }))}
-            />
-            <Select
-              value={settings[role].effort}
-              onValueChange={(effort) =>
-                setSettings({
-                  ...settings,
-                  [role]: { ...settings[role], effort },
-                })
-              }
-              label="Reasoning"
-              id={role + "-effort"}
-              options={["low", "medium", "high", "xhigh", "max"].map(
-                (effort) => ({ value: effort, label: effort + " reasoning" }),
-              )}
             />
           </div>
-        ))}
-
-        <NumberField
-          id="concurrency"
-          label="Concurrent workflows"
-          min={1}
-          max={4}
-          value={settings.concurrency}
-          onValueChange={(concurrency) =>
-            setSettings({ ...settings, concurrency })
-          }
-        />
+        </div>
         <ActionButton
           disabled={busy}
           onAction={() =>
@@ -1764,7 +1822,7 @@ function Settings({ data, project, act, busy, refresh }: any) {
             <strong>Escalations</strong>
             <p>
               {mode === "yolo"
-                ? "Judge drafts and sends every reply. You approve PR merges."
+                ? "Judge handles replies and recovery. You approve PR merges."
                 : mode === "bypass"
                   ? "Judge sends routine decisions. Blockers wait for you."
                   : "Judge prepares a draft. You choose the response."}

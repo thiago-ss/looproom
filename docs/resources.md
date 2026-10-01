@@ -17,3 +17,5 @@
 | Superdesign / imagegen | Looproom brand marks and onboarding sculpture | Existing approved direction incorporated; no new mockups |
 
 For source constraints see [third-party notices](../THIRD_PARTY.md). Research claims remain hypotheses until measured in Looproom.
+
+Pending escalation judgment uses the ReactBits Shiny Text CSS sweep mapped to the Looproom palette, with reduced-motion static text. Source snapshots and verification are in the parent wiki’s follow-through batch; existing MIT + Commons Clause notice applies.

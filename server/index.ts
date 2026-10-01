@@ -378,6 +378,7 @@ app.post(
               judgeStatus: "pending",
               judgeError: null,
               judgeAttempts: 0,
+              judgeFailures: 0,
               judgeNextAttemptAt: null,
             });
         }
@@ -439,6 +440,7 @@ app.post(
       judgeStatus: "pending",
       judgeError: null,
       judgeAttempts: 0,
+      judgeFailures: 0,
       judgeNextAttemptAt: null,
     });
     engine.changed("judge-requested", { gateId: gate.id }, project.id);

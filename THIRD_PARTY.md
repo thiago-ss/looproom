@@ -20,3 +20,5 @@ UI registries were captured on 2026-09-30. Existing source captures and their ha
 The shared shadcn primitive implementations and Sonner were replaced by 22 free [Arc UI](https://uiarc.dev/docs/ai) components installed through the shadcn registry CLI. Incorporated source and CSS modules: `src/components/arc/`; MIT, Copyright (c) 2026 Elia Kuratli, full notice in `src/components/arc/LICENSE`. See [upstream license](https://uiarc.dev/license), [source hashes](docs/arc-sources.json), and [coverage/setup](docs/arc-ui.md). No Arc Pro code is incorporated. The shadcn notice remains for the historical implementation and installation tooling.
 
 ReactBits Stepper now provides retained animated wizard content around Arc's progress indicator and buttons. StatusMark remains incorporated.
+
+ReactBits Shiny Text’s CSS gradient sweep (MIT + Commons Clause) is adapted in `src/components/judge-pending.css`; original TS/CSS are captured in the parent wiki’s `raw/2026-09-30-followthrough/`. Full existing ReactBits license applies. The per-frame JavaScript component is not incorporated.

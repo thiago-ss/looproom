@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "./store.ts";
@@ -527,7 +527,7 @@ test("pausing or switching YOLO to human during judgment prevents automatic subm
   }
 });
 
-test("YOLO judge transport failures retry with backoff and stop after three attempts without opening human gates", async () => {
+test("YOLO judge transport failures retry in bounded bursts with backoff without opening human gates", async () => {
   const f = await fixture(async () => {
     throw new Error("Transport unavailable");
   });
@@ -576,6 +576,220 @@ test("YOLO re-assesses an unsent durable draft after restart and preserves PR dr
     await settle();
     assert.deepEqual(started, [gate.id]);
     assert.equal(f.store.get(pr.id).judgeSubmittedAt, undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+test("YOLO repairs a blocker in the existing worktree and submits the resulting retry", async () => {
+  const calls: any[] = [];
+  const f = await fixture(async (options) => {
+    calls.push(options);
+    options.onThread("fixture");
+    if (options.write)
+      await writeFile(join(options.cwd, "recovery.txt"), "verified repair");
+    return JSON.stringify({
+      action: options.write ? "retry" : "wait",
+      answer: options.write
+        ? "Repaired recovery.txt; continue verification."
+        : "Missing local recovery file.",
+      summary: "Observed local state",
+      sources: ["recovery.txt"],
+    });
+  });
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo" });
+    const task = f.store.put("task", {
+      projectId: f.project.id,
+      title: "Verify",
+      status: "ready",
+      dependencies: [],
+      worktree: f.project.path,
+    });
+    const gate = f.engine.gate(
+      f.project.id,
+      "Missing file",
+      "Restore recovery.txt",
+      "verification",
+      task.id,
+    );
+    await f.engine.judge(f.store.get(f.project.id), gate);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].write, false);
+    assert.equal(calls[1].write, true);
+    assert.equal(calls[1].cwd, task.worktree);
+    assert.equal(
+      await readFile(join(task.worktree, "recovery.txt"), "utf8"),
+      "verified repair",
+    );
+    assert.equal(f.store.get(gate.id).judgeRecoveryStatus, "completed");
+    assert.equal(f.store.get(gate.id).status, "resolved");
+    assert.equal(f.store.get(task.id).status, "ready");
+    assert.equal(
+      f.store.conversation(f.project.id).at(-1)?.kind,
+      "escalation_response",
+    );
+    assert.equal(f.store.all("approval").length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("YOLO cannot start write recovery after a human has already resolved the gate", async () => {
+  let finish!: (value: string) => void;
+  let calls = 0;
+  const f = await fixture(async (options) => {
+    calls++;
+    options.onThread("fixture");
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo" });
+    const task = f.store.put("task", {
+      projectId: f.project.id,
+      title: "Verify",
+      status: "ready",
+      dependencies: [],
+      worktree: f.project.path,
+    });
+    const gate = f.engine.gate(
+      f.project.id,
+      "Missing file",
+      "Restore recovery.txt",
+      "verification",
+      task.id,
+    );
+    const judging = f.engine.judge(f.store.get(f.project.id), gate);
+    await settle();
+    await f.engine.resolve(gate.id, "Handled by human", true);
+    finish(
+      JSON.stringify({
+        action: "wait",
+        answer: "Missing file.",
+        summary: "Observed state",
+        sources: [],
+      }),
+    );
+    await judging;
+    assert.equal(calls, 1);
+    assert.equal(f.store.get(gate.id).status, "resolved");
+    assert.equal(f.store.get(gate.id).judgeRecoveryStatus, null);
+  } finally {
+    await f.close();
+  }
+});
+
+test("YOLO rechecks submitted waits only after cooldown, without duplicates or PR submission", async () => {
+  const f = await fixture();
+  const started: string[] = [];
+  let release!: () => void;
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo" });
+    const wait = f.engine.gate(
+      f.project.id,
+      "Unavailable capability",
+      "Recheck later",
+      "planning",
+    );
+    f.store.patch(wait.id, {
+      judgeStatus: "answered",
+      judgeSubmittedAt: new Date().toISOString(),
+      awaitingCapability: true,
+      judgeNextAttemptAt: Date.now() + 60000,
+    });
+    const pr = f.engine.gate(
+      f.project.id,
+      "Merge",
+      "Needs exact human approval",
+      "pr",
+    );
+    f.store.patch(pr.id, { judgeStatus: "answered", judgeAction: "wait" });
+    f.engine.judge = async (_project, gate) => {
+      started.push(gate.id);
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    };
+    f.engine.tick();
+    await settle();
+    assert.deepEqual(started, []);
+    f.store.patch(wait.id, { judgeNextAttemptAt: Date.now() - 1 });
+    f.engine.tick();
+    f.engine.tick();
+    await settle();
+    assert.deepEqual(started, [wait.id]);
+    assert.equal(f.store.get(pr.id).status, "open");
+    release();
+    await settle();
+  } finally {
+    await f.close();
+  }
+});
+
+test("a human reply cannot dispatch a worker while YOLO recovery still owns its worktree", async () => {
+  let finish!: (value: string) => void;
+  const f = await fixture(async (options) => {
+    options.onThread("fixture");
+    if (!options.write)
+      return JSON.stringify({
+        action: "wait",
+        answer: "Missing file",
+        summary: "Inspect",
+        sources: [],
+      });
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo" });
+    const task = f.store.put("task", {
+      projectId: f.project.id,
+      title: "Verify",
+      status: "ready",
+      dependencies: [],
+      worktree: f.project.path,
+    });
+    const gate = f.engine.gate(
+      f.project.id,
+      "Missing file",
+      "Repair",
+      "verification",
+      task.id,
+    );
+    const recovering = new Promise<void>((resolve) => {
+      f.engine.on("change", () => {
+        if (f.store.get(gate.id).judgeRecoveryStatus === "running") resolve();
+      });
+    });
+    const judging = f.engine.judge(f.store.get(f.project.id), gate);
+    await recovering;
+    await settle();
+    assert.ok(finish);
+    assert.equal(f.store.get(gate.id).judgeRecoveryStatus, "running");
+    await f.engine.resolve(gate.id, "Handled by human", true);
+    const started: string[] = [];
+    f.engine.implement = async (_project, t) => {
+      started.push(t.id);
+      f.store.patch(t.id, { status: "completed" });
+    };
+    f.engine.tick();
+    await settle();
+    assert.deepEqual(started, []);
+    finish(
+      JSON.stringify({
+        action: "retry",
+        answer: "Repaired",
+        summary: "Recovery",
+        sources: [],
+      }),
+    );
+    await judging;
+    f.engine.tick();
+    await settle();
+    assert.deepEqual(started, [task.id]);
   } finally {
     await f.close();
   }

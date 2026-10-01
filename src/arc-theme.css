@@ -262,3 +262,121 @@ label[for="project-picker"] {
   white-space: nowrap;
   min-width: 2ch;
 }
+
+/* Single-column fields stretch rather than shrink to the placeholder's intrinsic width. */
+.composer > div:has(> textarea) {
+  grid-template-columns: minmax(0, 1fr);
+  justify-content: stretch;
+  align-items: stretch;
+  min-width: 0;
+}
+.composer textarea {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.model-roster {
+  display: grid;
+  gap: 10px;
+  margin: 22px 0;
+}
+.model-role {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.8fr) minmax(0, 1.2fr);
+  align-items: center;
+  gap: 24px;
+  padding: 18px;
+  border-radius: 10px;
+  background: var(--lr-sheet);
+}
+.model-role-label,
+.workflow-label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.model-role-label > div,
+.workflow-label > div {
+  display: grid;
+  gap: 4px;
+}
+.model-role-label strong,
+.workflow-label strong {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--lr-ink);
+}
+.model-role-label > div > span,
+.workflow-label > div > span {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--lr-muted);
+}
+.model-role-icon {
+  display: grid;
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--lr-signal) 12%, var(--lr-sheet));
+  color: var(--lr-signal);
+}
+.model-role-subagent .model-role-icon {
+  background: color-mix(in srgb, var(--lr-verified) 12%, var(--lr-sheet));
+  color: var(--lr-verified);
+}
+.model-role-judge .model-role-icon {
+  background: color-mix(in srgb, var(--lr-gate) 12%, var(--lr-sheet));
+  color: var(--lr-gate);
+}
+.model-role .model-setting {
+  margin: 0;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) minmax(100px, 0.45fr);
+}
+.model-role .model-setting label,
+.workflow-counter label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+.workflow-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 18px;
+  padding: 20px 18px;
+  margin: 0 0 24px;
+  border-radius: 10px;
+  background: var(--lr-sheet);
+}
+.workflow-label > svg {
+  flex: none;
+  color: var(--lr-muted);
+  margin-inline: 10px;
+}
+.workflow-counter {
+  --number-field-width: 160px;
+  flex: 0 0 160px;
+}
+.workflow-counter > div > div:first-child {
+  height: 0;
+  margin: 0;
+}
+.workflow-counter input[role="spinbutton"] {
+  color: transparent;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+@media (max-width: 780px) {
+  .model-role {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+}

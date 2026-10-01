@@ -241,10 +241,14 @@ export class Store {
         this.patch(gate.id, {
           judgeStatus:
             escalationMode(this.get(gate.projectId)) === "yolo" &&
-            (gate.judgeAttempts ?? 0) < 3
+            (gate.judgeFailures ?? 0) < 3
               ? "pending"
               : "failed",
           judgeError: "Coordinator restarted during judgment.",
+          judgeRecoveryStatus:
+            gate.judgeRecoveryStatus === "running"
+              ? "interrupted"
+              : gate.judgeRecoveryStatus,
         });
       for (const task of this.all("task").filter((task) =>
         ["running", "verifying"].includes(task.status),
