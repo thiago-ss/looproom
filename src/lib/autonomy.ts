@@ -16,6 +16,14 @@ export function needsHumanReview(
 ) {
   return (
     gate.status === "open" &&
-    (gate.type === "pr" || escalationMode(project) !== "yolo")
+    (gate.type === "pr" || gate.type === "interrupted" || escalationMode(project) !== "yolo")
   );
+}
+
+export function taskOpenGate<T extends { status: string; taskId?: string; type: string }>(
+  gates: T[],
+  taskId?: string,
+): T | undefined {
+  return gates.find((gate) => gate.status === "open" && gate.taskId === taskId && gate.type === "interrupted")
+    ?? gates.find((gate) => gate.status === "open" && gate.taskId === taskId);
 }

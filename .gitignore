@@ -5,3 +5,4 @@ dist/
 .looproom-data/
 .looproom-test-fixtures/
 .env
+.looproom-launch.sqlite*
