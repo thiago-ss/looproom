@@ -1,9 +1,9 @@
+import { testFixture } from "./test-fixtures.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
 import { Store } from "./store.ts";
@@ -11,7 +11,7 @@ import type { Runtime } from "./runtime.ts";
 
 const hash = (source: string) => createHash("sha256").update(source).digest("hex");
 async function fixture() {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-baseline-"));
+  const dir = await testFixture("looproom-baseline-");
   await mkdir(join(dir, "scripts"));
   const store = new Store(join(dir, "db"));
   const engine = new Engine(store, Object.assign(new EventEmitter(), { close() {} }) as Runtime, dir);

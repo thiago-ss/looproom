@@ -1,12 +1,12 @@
+import { testFixture } from "./test-fixtures.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { prepareDependencies } from "./dependencies.ts";
 
 test("dependency reuse requires identical lockfiles and never overwrites an existing task install", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-deps-"));
+  const dir = await testFixture("looproom-deps-");
   const repo = join(dir, "repo"),
     task = join(dir, "task");
   await mkdir(join(repo, "node_modules"), { recursive: true });

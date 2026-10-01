@@ -1,11 +1,11 @@
+import { testFixture } from "./test-fixtures.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, symlink, rm, realpath } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile, symlink, rm, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { folderPath, fileURI, droppedFolder } from "./folders.ts";
 test("folder drops accept only local folder URLs and canonicalize directories", async () => {
-  const folder = await mkdtemp(join(tmpdir(), "looproom-folders-"));
+  const folder = await testFixture("looproom-folders-");
   try {
     assert.equal(
       fileURI("file:///Users/test/My%20Project"),
