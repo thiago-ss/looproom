@@ -794,3 +794,106 @@ test("a human reply cannot dispatch a worker while YOLO recovery still owns its 
     await f.close();
   }
 });
+
+test("YOLO requests coordinator checks, reassesses actual evidence, and resumes without a permission grant", async () => {
+  let turns = 0,
+    verified = 0;
+  const f = await fixture(async (options) => {
+    options.onThread("fixture");
+    turns++;
+    return JSON.stringify({
+      action: turns === 1 ? "wait" : "retry",
+      answer:
+        turns === 1
+          ? "Request actual broker evidence."
+          : "Actual configured checks passed; finish the task using the evidence.",
+      summary: "Gate-specific verification",
+      sources: [],
+      verificationRequests: turns === 1 ? ["configured-checks"] : [],
+    });
+  });
+  try {
+    f.store.patch(f.project.id, {
+      escalationMode: "yolo",
+      checks: ["node --version"],
+    });
+    const task = f.store.put("task", {
+      projectId: f.project.id,
+      title: "Verify",
+      status: "ready",
+      dependencies: [],
+      worktree: f.project.path,
+      acceptance: ["Passing checks"],
+    });
+    const gate = f.engine.gate(
+      f.project.id,
+      "Missing broker",
+      "Need actual outputs",
+      "verification",
+      task.id,
+    );
+    f.engine.verificationRunner = async (options) => {
+      verified++;
+      assert.deepEqual(options.commands, ["node --version"]);
+      return {
+        id: "fixture-report",
+        sourceHash: "fixture-hash",
+        sourceUnchanged: true,
+        reportPath: "fixture.json",
+        createdAt: new Date().toISOString(),
+        results: [
+          {
+            command: "node --version",
+            code: 0,
+            output: "v25",
+            timedOut: false,
+            durationMs: 1,
+          },
+        ],
+      };
+    };
+    await f.engine.judge(f.store.get(f.project.id), gate);
+    assert.equal(verified, 1);
+    assert.equal(turns, 2);
+    assert.equal(f.store.get(gate.id).status, "resolved");
+    assert.equal(f.store.get(task.id).status, "ready");
+    assert.equal(f.store.get(task.id).checks[0].code, 0);
+    assert.equal(f.store.all("approval").length, 0);
+    const started: string[] = [];
+    f.engine.implement = async (_p, t) => {
+      started.push(t.id);
+    };
+    f.engine.tick();
+    await settle();
+    assert.deepEqual(started, [task.id]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a human reply during coordinator verification cannot dispatch the task before the judge releases it", async () => {
+  const f = await fixture(async (options) => {
+    options.onThread("fixture");
+    return JSON.stringify({action:"wait",answer:"Verify first",summary:"Check",sources:[],verificationRequests:["configured-checks"]});
+  });
+  try {
+    f.store.patch(f.project.id,{escalationMode:"yolo",checks:["node --version"]});
+    const task=f.store.put("task",{projectId:f.project.id,title:"Verify",status:"ready",dependencies:[],worktree:f.project.path,acceptance:[]});
+    const gate=f.engine.gate(f.project.id,"Missing checks","Verify","verification",task.id);
+    let finish!: ()=>void;
+    f.engine.verify=async()=>{
+      await new Promise<void>(ok=>{finish=ok;});
+      return {id:"fixture",sourceHash:"hash",sourceUnchanged:true,reportPath:"fixture",createdAt:new Date().toISOString(),results:[]};
+    };
+    const judging=f.engine.judge(f.store.get(f.project.id),gate);
+    while(!finish) await settle();
+    await f.engine.resolve(gate.id,"Proceed after verification",true);
+    const started:string[]=[];
+    f.engine.implement=async(_p,t)=>{started.push(t.id);};
+    f.engine.tick(); await settle();
+    assert.deepEqual(started,[]);
+    finish(); await judging;
+    f.engine.tick(); await settle();
+    assert.deepEqual(started,[task.id]);
+  } finally { await f.close(); }
+});

@@ -1,20 +1,14 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, realpath, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
 import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
-import {
-  inspectRepo,
-  checkApproval,
-  createWorktree,
-  git,
-  gh,
-  sandboxCheck,
-} from "./git.ts";
+import { runVerification } from "./verification.ts";
+import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
 const TaskPlan = z.object({
   title: z.string(),
@@ -44,6 +38,10 @@ const Judgment = z.object({
   answer: z.string().trim().min(1).max(6000),
   summary: z.string(),
   sources: z.array(z.string()),
+  verificationRequests: z
+    .array(z.enum(["configured-checks", "refresh-baseline"]))
+    .max(2)
+    .default([]),
 });
 export function validateDependencies(tasks: { dependencies: number[] }[]) {
   const active = new Set<number>(),
@@ -73,6 +71,7 @@ export class Engine extends EventEmitter {
   busy = new Set<string>();
   documentation = new Map<string, Promise<void>>();
   timer?: ReturnType<typeof setInterval>;
+  verificationRunner = runVerification;
   constructor(
     public store: Store,
     public runtime: Runtime,
@@ -456,7 +455,7 @@ export class Engine extends EventEmitter {
       .slice(-6)
       .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json for earlier recorded check evidence if it exists. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     const result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
@@ -491,27 +490,31 @@ export class Engine extends EventEmitter {
       return;
     }
     this.store.patch(task.id, { status: "verifying", summary: result.summary });
-    const checks = [];
-    for (const command of project.checks) {
-      const result = await sandboxCheck(
-        this.runtime.binary,
-        task.worktree,
-        command,
-        this.runtime.home,
+    const report = project.checks.length
+      ? await this.verify(project, task, project.checks)
+      : undefined;
+    const checks = report?.results ?? [];
+    if (this.store.get(project.id).status !== "running") {
+      this.store.patch(task.id, { status: "ready" });
+      return;
+    }
+    if (report && !report.sourceUnchanged) {
+      this.repairOrGate(
+        project,
+        task,
+        "Source changed during verification",
+        "Re-run checks against the current source; the snapshot is stale.",
+        "check",
       );
-      checks.push(result);
-      this.store.patch(task.id, { checks });
-      this.changed(
-        "check-completed",
-        { taskId: task.id, command, code: result.code },
-        project.id,
-      );
+      return;
+    }
+    for (const result of checks) {
       if (result.code !== 0) {
         this.repairOrGate(
           project,
           task,
           "Verification failed",
-          command + "\n" + result.output.slice(-6000),
+          result.command + "\n" + result.output.slice(-6000),
           "check",
         );
         return;
@@ -603,13 +606,15 @@ export class Engine extends EventEmitter {
       return;
     }
     await gh(["auth", "status"]);
-    const diff = await git(task.worktree, ["status", "--porcelain"]);
+    const productPaths = ["--", ".", ":(top,exclude).looproom-verification"];
+    const diff = await git(task.worktree, ["status", "--porcelain", ...productPaths]);
     const untracked = (
       await git(task.worktree, [
         "ls-files",
         "--others",
         "--exclude-standard",
         "-z",
+        ...productPaths,
       ])
     )
       .split("\0")
@@ -639,7 +644,7 @@ export class Engine extends EventEmitter {
       return;
     }
     if (diff) {
-      await git(task.worktree, ["add", "--all"]);
+      await git(task.worktree, ["add", "--all", ...productPaths]);
       await git(task.worktree, [
         "-c",
         "user.name=Looproom agent",
@@ -810,6 +815,74 @@ export class Engine extends EventEmitter {
     });
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
+  async verify(project: RecordData, task: RecordData, commands: string[]) {
+    const report = await this.verificationRunner({
+      cwd: task.worktree,
+      commands,
+      dataDir: this.dataDir,
+      codexBinary: this.runtime.binary,
+      protectedPorts: [4319, 5173, Number(process.env.PORT ?? 4319)],
+    });
+    this.store.patch(task.id, {
+      checks: report.results,
+      verification: {
+        id: report.id,
+        sourceHash: report.sourceHash,
+        sourceUnchanged: report.sourceUnchanged,
+        reportPath: report.reportPath,
+        createdAt: report.createdAt,
+      },
+    });
+    for (const result of report.results)
+      this.changed(
+        "check-completed",
+        {
+          taskId: task.id,
+          command: result.command,
+          code: result.code,
+          reportId: report.id,
+        },
+        project.id,
+      );
+    const evidenceDir = join(task.worktree, ".looproom-verification");
+    await mkdir(evidenceDir, { recursive: true });
+    if (
+      (await realpath(evidenceDir)) !==
+      join(await realpath(task.worktree), ".looproom-verification")
+    )
+      throw new Error("Verification evidence directory must not be a symlink.");
+    const temporary = join(evidenceDir, report.id + ".json");
+    await writeFile(temporary, JSON.stringify(report, null, 2), { flag: "wx" });
+    await rename(temporary, join(evidenceDir, "latest.json"));
+    return report;
+  }
+  async verificationCommands(
+    project: RecordData,
+    task: RecordData,
+    requests: string[],
+  ) {
+    const commands = requests.includes("configured-checks")
+      ? [...(project.checks ?? [])]
+      : [];
+    if (requests.includes("refresh-baseline")) {
+      const path = join(task.worktree, "scripts/measure-refresh.ts");
+      const hash = createHash("sha256")
+        .update(await readFile(path))
+        .digest("hex");
+      if (
+        task.verificationEvaluatorHash &&
+        task.verificationEvaluatorHash !== hash
+      )
+        throw new Error(
+          "Frozen refresh evaluator changed; restore the pinned evaluator before measuring.",
+        );
+      this.store.patch(task.id, { verificationEvaluatorHash: hash });
+      commands.push("node --import tsx scripts/measure-refresh.ts");
+    }
+    const unique = [...new Set(commands)];
+    if (unique.length > 8) throw new Error("Verification supports at most eight recipes per batch.");
+    return unique;
+  }
   async recoverEscalation(
     project: RecordData,
     gate: RecordData,
@@ -904,6 +977,7 @@ export class Engine extends EventEmitter {
               acceptance: t.acceptance,
               feedback: t.feedback,
               checks: t.checks,
+              verification: t.verification,
               judgeRetries: t.judgeRetries,
             }
           : {}),
@@ -915,7 +989,7 @@ export class Engine extends EventEmitter {
       let result = await this.run(
         project,
         "judge",
-        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. Never impersonate a human.
+        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request coordinator verification using verificationRequests: ["configured-checks"] and/or ["refresh-baseline"]. These are predefined recipes, never arbitrary shell commands. The coordinator runs a disposable isolated snapshot with child execution, fixture cleanup and test loopback; the worker permissions stay unchanged. If recorded evidence is missing for the available verification runner, request the appropriate recipe instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
 Goal: ${project.goal}
 Scope/exclusions: ${project.constraints}
 Repository: ${project.path}
@@ -930,6 +1004,44 @@ Action retry: your specific decision permits continuing within existing capabili
         task,
         false,
       );
+      if (
+        result.verificationRequests.length &&
+        task?.worktree &&
+        gate.type !== "pr" &&
+        escalationMode(this.store.get(project.id)) === "yolo" &&
+        this.store.get(project.id).status === "running" &&
+        this.store.get(gate.id).status === "open"
+      ) {
+        const commands = await this.verificationCommands(
+          project,
+          this.store.get(task.id),
+          result.verificationRequests,
+        );
+        if (commands.length) {
+          this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
+          this.changed(
+            "judge-verification-started",
+            { gateId: gate.id, taskId: task.id },
+            project.id,
+          );
+          const report = await this.verify(project, task, commands);
+          if (this.store.get(gate.id).status !== "open") return;
+          if (this.store.get(project.id).status !== "running" ||
+              escalationMode(this.store.get(project.id)) !== "yolo") {
+            this.store.patch(gate.id, { judgeRecoveryStatus: "verified", judgeStatus: "pending" });
+            return;
+          }
+          result = await this.run(
+            this.store.get(project.id),
+            "judge",
+            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator snapshot report: ${JSON.stringify(report)}\nThe report has real command outputs/exit status, original-source hash and a sourceUnchanged flag. It ran in a disposable isolated copy, not the worker shell. If checks failed, return retry with a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Do not claim checks passed when their exit code is nonzero. The worker can read .looproom-verification/latest.json; the coordinator runs configured checks after implementation. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
+            Judgment,
+            task,
+            false,
+          );
+          this.store.patch(gate.id, { judgeRecoveryStatus: "verified" });
+        }
+      }
       if (
         result.action === "wait" &&
         gate.type !== "pr" &&
@@ -1058,6 +1170,14 @@ Action retry: your specific decision permits continuing within existing capabili
           judgeError: error instanceof Error ? error.message : String(error),
         });
       this.changed("judge-failed", { gateId: gate.id }, project.id);
+    } finally {
+      const current = this.store.get(gate.id);
+      if (current.status !== "open" && current.judgeStatus === "running")
+        this.store.patch(gate.id, {
+          judgeStatus: "answered",
+          judgeRecoveryStatus: current.judgeRecoveryStatus === "verifying"
+            ? "verified" : current.judgeRecoveryStatus,
+        });
     }
   }
   dispatch(
@@ -1154,6 +1274,9 @@ Action retry: your specific decision permits continuing within existing capabili
         if (
           task.status !== "ready" ||
           this.busy.has(key) ||
+          this.store.all("gate", project.id).some((gate) =>
+            gate.taskId === task.id && gate.judgeStatus === "running" &&
+            ["running", "verifying"].includes(gate.judgeRecoveryStatus)) ||
           this.store
             .all("run", project.id)
             .some(

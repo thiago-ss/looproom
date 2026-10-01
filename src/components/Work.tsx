@@ -447,7 +447,9 @@ export default function Work({
                           <p role="status">
                             <JudgePending
                               text={
-                                gate.judgeRecoveryStatus === "running"
+                                gate.judgeRecoveryStatus === "verifying"
+                                  ? "Running isolated checks…"
+                                  : gate.judgeRecoveryStatus === "running"
                                   ? "Resolving this escalation…"
                                   : "Reviewing this escalation…"
                               }

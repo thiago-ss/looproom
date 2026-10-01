@@ -246,7 +246,7 @@ export class Store {
               : "failed",
           judgeError: "Coordinator restarted during judgment.",
           judgeRecoveryStatus:
-            gate.judgeRecoveryStatus === "running"
+            ["running", "verifying"].includes(gate.judgeRecoveryStatus)
               ? "interrupted"
               : gate.judgeRecoveryStatus,
         });

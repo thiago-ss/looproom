@@ -1382,7 +1382,9 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                 <p role="status" aria-live="polite">
                   <JudgePending
                     text={
-                      gate.judgeRecoveryStatus === "running"
+                      gate.judgeRecoveryStatus === "verifying"
+                        ? "Running isolated checks…"
+                        : gate.judgeRecoveryStatus === "running"
                         ? "Resolving this escalation…"
                         : "Reviewing this escalation…"
                     }

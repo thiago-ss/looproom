@@ -61,7 +61,7 @@ New open gates produce a Sonner toast with a Review action and a two-note Web Au
 
 One coordinator owns dispatch, SQLite writes and publication. One to four concurrent workflows share capacity across planning, task pipelines and judges; independent ready tasks can run within the same project. Task gates block only affected work and its actual dependents. Runtime wiki writes are serialized per project. Each bounded task has its own worktree. Native nested agents are disabled so every role uses an explicit model profile.
 
-Named Codex permission profiles deny reads outside the assigned workspace and minimum toolchain paths, keep Git metadata read-only, carve out environment/key files and deny direct network access. The native macOS smoke test verifies these boundaries for broker check commands. Model/auth service traffic is separate from worker shell traffic. See [the permission documentation](https://learn.chatgpt.com/docs/permissions).
+Named Codex permission profiles deny reads outside the assigned workspace and minimum toolchain paths, keep Git metadata read-only, carve out environment/key files and deny direct network access. The native macOS smoke test verifies these worker boundaries. Model/auth service traffic is separate from worker shell traffic. See [the permission documentation](https://learn.chatgpt.com/docs/permissions).
 
 Completed runs create `wiki/<project-id>/raw/<run-id>.json` with hashes, cited Markdown pages, an index and an append-only content log. Agent reports remain labeled as reports; checks and PR results are separate evidence. SQLite owns live state. Restart pauses interrupted work and opens a recovery gate. The wiki does not store hidden reasoning.
 
@@ -75,7 +75,7 @@ npm run check:ui
 npm run build
 ```
 
-Twenty tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
+Thirty-five tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
 
 ## Remaining work
 
@@ -98,3 +98,11 @@ Goal preserves linked escalation requests and replies, including migrated histor
 Use Arc for shared interactive controls and feedback. [MCP setup, component coverage and identity rules](docs/arc-ui.md). `npm run check:ui` rejects native controls outside the Arc sources.
 
 YOLO keeps PRs in your review inbox, while other escalations are handled by the judge. The response includes task-specific evidence and actionable next steps. Three task retries bound each recovery round. Unresolved YOLO blockers recheck after 5/10/20/30 minutes; three judge transport attempts use 15/30-second backoff followed by a 30-minute cooldown. Recovery may repair files and verify available alternatives in the task worktree; the coordinator never dispatches a worker while recovery still owns that worktree. Drafts are never worker instructions; submitted replies are recorded in SQLite and the goal chat. No mode grants unavailable capabilities or guarantees perfect judgments.
+
+## Isolated verification
+
+Configured checks run in disposable copies of task worktrees through a separate macOS verification sandbox. It permits child processes, fixture cleanup and loopback test servers; Internet access, coordinator ports, original checkout writes and known credential files remain denied. The environment is filtered and the home is empty. Dependencies must be local; external dependency links are normalized into the copy or rejected. Checks see synthetic, read-only Git metadata rather than the live repository's history.
+
+Reports record actual commands, exit codes, timeout status, durations and the original source fingerprint in `verification/<id>.json` under the data directory. Workers can read `.looproom-verification/latest.json`; this runtime evidence is excluded from publication. YOLO judges can request configured checks or the pinned refresh baseline, then reassess the real results. Worker permissions and human approval of PR merges remain unchanged.
+
+The v0 runner uses macOS `sandbox-exec`, which is deprecated. Native sandbox denial tests use a private socket to request the existing worker policy in a sibling sandbox, because macOS rejects nested policy application. Caller-supplied permission profiles are ignored. Normal timeouts terminate process groups and cancel native test children. A signed sandboxed runner and crash-proof process supervision remain packaging work.

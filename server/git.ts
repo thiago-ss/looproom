@@ -124,6 +124,7 @@ export async function sandboxCheck(
   cwd: string,
   command: string,
   codexHome: string,
+  signal?: AbortSignal,
 ) {
   const { permissionConfig, configArgs } = await import("./permissions.ts");
   await mkdir(codexHome, { recursive: true, mode: 0o700 });
@@ -151,21 +152,37 @@ export async function sandboxCheck(
           "-c",
           command,
         ],
-        { cwd, env, stdio: ["ignore", "pipe", "pipe"] },
+        { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true },
       );
       let output = "";
-      const timer = setTimeout(() => child.kill("SIGTERM"), 180_000);
+      let hard: ReturnType<typeof setTimeout> | undefined;
+      const kill = (kind: NodeJS.Signals) => {
+        if (child.pid) try { process.kill(-child.pid, kind); } catch {}
+      };
+      const stop = () => {
+        kill("SIGTERM");
+        hard ??= setTimeout(() => kill("SIGKILL"), 1000);
+      };
+      const timer = setTimeout(stop, 180_000);
+      signal?.addEventListener("abort", stop, { once: true });
+      if (signal?.aborted) stop();
+      const cleanup = () => {
+        clearTimeout(timer);
+        clearTimeout(hard);
+        signal?.removeEventListener("abort", stop);
+        kill("SIGKILL");
+      };
       const read = (chunk: Buffer) => {
         output = (output + chunk.toString()).slice(-100_000);
       };
       child.stdout.on("data", read);
       child.stderr.on("data", read);
       child.on("error", (error) => {
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
+        cleanup();
         resolve({ command, code: code ?? 1, output });
       });
     },
