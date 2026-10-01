@@ -122,3 +122,35 @@ The coordinator's isolated-copy check did not widen the worker
 profile. The npm permission path expands to the package root only for the
 recognized `npm/bin/npm-cli.js` layout; other layouts receive an exact file
 read grant.
+
+
+## Integrated application baseline (2026-10-01 UTC)
+
+The PR branch now incorporates the current application base and the YOLO recovery
+fixes. The evaluator remains `ec72c39beda16d1906aa92fdea71e89c56125477c2ca986406e3d6bf68ca0858`.
+Report `902097c9-9862-4933-85b5-f80bb0c71759` records source hash `fda70635feba4371c666f955a15a643815d1474e125954846a2a54fcae1e675d`,
+unchanged source, and exit 0 for build, tests and measurement. The measurements
+above are historical observations of the earlier application revision. These new
+figures are the baseline for the integrated application; no optimization
+improvement or cross-revision score comparison is claimed.
+
+| Metric | Five raw observations | Median |
+|---|---|---:|
+| Refresh bytes | 19094, 19243, 19393, 19543, 19693 | 19393 |
+| Coordinator round trip (ms) | 5.417042, 2.365084, 2.300458, 1.997375, 1.682042 | 2.300458 |
+| Update latency (ms) | 171.240459, 153.582625, 153.231958, 152.147625, 153.283458 | 153.283458 |
+
+The host suite passes all 42 tests with zero skips, including native verifier
+isolation. The isolated coordinator suite passes 41 tests with zero failures;
+its pre-existing guard skips the verifier-within-verifier isolation case to
+avoid nested Seatbelt application. The native worker denial test still runs
+and passes there. The coordinator handoff test uses a fixture verifier that
+checks the actual fixture output; native boundaries are tested separately.
+After base integration, an outdated dependency copy was replaced with the
+existing local dependency tree only after exact lockfile matching, with no
+network installation or lifecycle scripts. No worker capability was granted.
+
+This report fingerprint precedes the documentation of its own results. Final
+configured checks separately verify the documented publication source. Runtime
+evidence stays in ignored, ID-addressed report history and is not published as
+source code. Any merge requires human approval of the updated PR head.
