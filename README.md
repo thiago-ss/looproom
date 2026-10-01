@@ -92,3 +92,7 @@ Goal fills the viewport and scrolls within the conversation. Work offers a group
 The current interface uses continuous plum surfaces, soft citron actions and readable supporting text. Selected items use tonal fills; keyboard focus retains a visible outline. See [identity rules and verification](docs/identity-v2.md).
 
 Goal preserves linked escalation requests and replies, including migrated history. Human messages use a single byline; the composer can answer a selected non-PR gate directly. Judge bypass is opt-in under Project boundaries. Its read-only model is configured separately in Settings; genuine capability blockers remain open, and every PR merge needs human approval. Native GPT-6 Sol / Medium judge inference was verified on an isolated routine-choice gate; no PR or live gate was approved by that test.
+
+## Component development
+
+Use Arc for shared interactive controls and feedback. [MCP setup, component coverage and identity rules](docs/arc-ui.md). `npm run check:ui` rejects native controls outside the Arc sources.

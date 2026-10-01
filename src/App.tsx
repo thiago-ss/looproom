@@ -32,19 +32,9 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "./components/ui/button";
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from "./components/ui/select";
+import { Select } from "./components/ui/select";
 import { Checkbox } from "./components/ui/checkbox";
-import {
-  Collapsible,
-  CollapsibleTrigger,
-  CollapsibleContent,
-} from "./components/ui/collapsible";
+import { Accordion } from "./components/arc/accordion/accordion";
 import FolderPicker from "./components/FolderPicker";
 
 import {
@@ -52,17 +42,16 @@ import {
   NotificationSettings,
   useEscalations,
 } from "./components/Notifications";
-import { Toaster } from "./components/ui/sonner";
+import { ToastStack } from "./components/arc/toast-stack/toast-stack";
+import { NumberField } from "./components/arc/number-field/number-field";
+import { ScrollArea } from "./components/arc/scroll-area/scroll-area";
+import { Alert } from "./components/arc/alert/alert";
+import { EmptyState } from "./components/arc/empty-state/empty-state";
+import { ActionButton } from "./components/arc/action-button/action-button";
+import { Skeleton } from "./components/ui/skeleton";
 import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "./components/ui/dialog";
+import { Dialog, DialogContent } from "./components/ui/dialog";
 import { DotmSquare3 } from "./components/ui/dotm-square-3";
 import Stepper, { Step } from "./components/ui/Stepper";
 import StatusMark from "./components/ui/StatusMark";
@@ -139,11 +128,12 @@ function Empty({
   children?: React.ReactNode;
 }) {
   return (
-    <div className="empty">
-      <h2>{title}</h2>
-      <p>{text}</p>
-      {children}
-    </div>
+    <EmptyState
+      className="empty"
+      title={title}
+      description={text}
+      action={children}
+    />
   );
 }
 const statusText = (status: string) =>
@@ -182,6 +172,11 @@ export default function App() {
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [inspect, setInspect] = useState<any>(null);
+  const taskOpener = useRef<HTMLElement | null>(null);
+  function inspectTask(task: any) {
+    taskOpener.current = document.activeElement as HTMLElement;
+    setInspect(task);
+  }
   const refreshRef = useRef<() => Promise<void>>(async () => {});
   refreshRef.current = async () => {
     try {
@@ -223,7 +218,7 @@ export default function App() {
       setSelectedId(project.id);
     }
   }, [project?.id]);
-  async function act(fn: () => Promise<any>) {
+  async function act(fn: () => Promise<any>, rethrow = false) {
     setError("");
     setBusy(true);
     try {
@@ -231,6 +226,7 @@ export default function App() {
       await refreshRef.current();
     } catch (error) {
       setError((error as Error).message);
+      if (rethrow) throw error;
     } finally {
       setBusy(false);
     }
@@ -245,11 +241,10 @@ export default function App() {
         <img src="/brand/looproom-mark.svg?v=3" alt="Looproom" />
         <Pending label="Opening your workspace" />
         {connectionError ? (
-          <div role="alert">
-            <p>{connectionError}</p>
+          <Alert tone="danger" title={connectionError}>
             <p>Start the local coordinator with npm run dev.</p>
             <Button onClick={() => refreshRef.current()}>Retry</Button>
-          </div>
+          </Alert>
         ) : null}
       </main>
     );
@@ -267,7 +262,7 @@ export default function App() {
       className={"app" + (!onboarding && view === "goal" ? " goal-view" : "")}
       data-view={view}
     >
-      <Toaster position="bottom-right" closeButton />
+      <ToastStack position="bottom-right" />
       {onboarding ? (
         <Onboarding
           data={data}
@@ -294,27 +289,17 @@ export default function App() {
               <img src="/brand/looproom-mark-reverse.svg?v=3" alt="" />
               looproom
             </a>
-            <label className="sr-only" htmlFor="project-picker">
-              Project
-            </label>
             <Select
+              label="Project"
+              id="project-picker"
+              className="project-picker"
               value={project?.id ?? ""}
-              onValueChange={(id) => {
-                setSelectedId(id);
-                setView("goal");
-              }}
-            >
-              <SelectTrigger id="project-picker" className="project-picker">
-                <SelectValue placeholder="Choose project" />
-              </SelectTrigger>
-              <SelectContent>
-                {data.projects.map((project) => (
-                  <SelectItem key={project.id} value={project.id}>
-                    {project.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              onValueChange={setSelectedId}
+              options={data.projects.map((project) => ({
+                value: project.id,
+                label: project.name,
+              }))}
+            />
             <nav aria-label="Workspace">
               {NAV.map((item) => (
                 <Button
@@ -417,19 +402,15 @@ export default function App() {
               ) : null}
             </header>
             {error || connectionError ? (
-              <div className="error-banner" role="alert">
-                <span>{error || connectionError}</span>
-                <Button
-                  variant="ghost"
-                  aria-label="Dismiss error"
-                  onClick={() => {
-                    setError("");
-                    setConnectionError("");
-                  }}
-                >
-                  <X size={16} />
-                </Button>
-              </div>
+              <Alert
+                className="error-banner"
+                tone="danger"
+                title={error || connectionError}
+                onDismiss={() => {
+                  setError("");
+                  setConnectionError("");
+                }}
+              />
             ) : null}
             {!project ? (
               <Empty
@@ -456,11 +437,11 @@ export default function App() {
                     act={act}
                     busy={busy}
                     openReview={() => setView("review")}
-                    openTask={setInspect}
+                    openTask={inspectTask}
                   />
                 ) : null}
                 {view === "work" ? (
-                  <Work tasks={tasks} onSelect={setInspect} />
+                  <Work tasks={tasks} onSelect={inspectTask} />
                 ) : null}
                 {view === "room" ? (
                   <Suspense fallback={<Pending label="Opening agent room" />}>
@@ -468,7 +449,7 @@ export default function App() {
                       runs={runs}
                       tasks={tasks}
                       settings={data.settings}
-                      onSelectTask={setInspect}
+                      onSelectTask={inspectTask}
                       events={data.events.filter(
                         (event) => event.project_id === project.id,
                       )}
@@ -485,7 +466,9 @@ export default function App() {
                   />
                 ) : null}
                 {view === "memory" ? (
-                  <Suspense fallback={<Pending label="Opening memory" />}>
+                  <Suspense
+                    fallback={<Skeleton label="Opening memory" lines={4} />}
+                  >
                     <Memory
                       key={project.id}
                       project={project}
@@ -517,6 +500,7 @@ export default function App() {
         }
         tasks={data.tasks}
         onClose={() => setInspect(null)}
+        restoreFocus={() => taskOpener.current?.focus()}
       />
     </div>
   );
@@ -690,21 +674,6 @@ function Onboarding({
               ...(draft.step === 4 ? { onClick: create } : {}),
             }}
             backButtonProps={{ disabled: pending, className: "setup-back" }}
-            renderStepIndicator={({ step, currentStep }) => (
-              <span
-                className={
-                  "step-number " +
-                  (step === currentStep
-                    ? "active"
-                    : step < currentStep
-                      ? "complete"
-                      : "")
-                }
-                aria-current={step === currentStep ? "step" : undefined}
-              >
-                {step < currentStep ? <Check size={13} /> : step}
-              </span>
-            )}
           >
             <Step>
               <div className="step-heading">
@@ -728,11 +697,7 @@ function Onboarding({
                   New project
                 </Button>
               </div>
-              <label htmlFor="repo-path">
-                {draft.mode === "new"
-                  ? "New project folder"
-                  : "Repository folder"}
-              </label>
+
               <FolderPicker
                 value={draft.path}
                 onChange={(path) => update("path", path)}
@@ -828,7 +793,7 @@ function Onboarding({
                 defaults later in Settings.
               </p>
               {data.runtime.error ? (
-                <p className="field-error">{data.runtime.error}</p>
+                <Alert tone="danger" title={data.runtime.error} />
               ) : null}
               {account?.type !== "chatgpt" ? (
                 <label className="connect-later">
@@ -848,23 +813,23 @@ function Onboarding({
                 <h2>What should get better?</h2>
                 <p>Describe the outcome. Agents will research the path.</p>
               </div>
-              <label htmlFor="project-name">Project name</label>
               <Input
                 id="project-name"
+                label="Project name"
                 value={draft.name}
                 onChange={(event) => update("name", event.target.value)}
               />
-              <label htmlFor="project-goal">Your goal</label>
               <Textarea
                 id="project-goal"
+                label="Your goal"
                 rows={5}
                 value={draft.goal}
                 onChange={(event) => update("goal", event.target.value)}
                 placeholder="Build a workshop booking app that feels clear, fast, and welcoming. Organizers should manage sessions; visitors should reserve a place."
               />
-              <label htmlFor="project-constraints">Boundaries</label>
               <Textarea
                 id="project-constraints"
+                label="Boundaries"
                 rows={2}
                 value={draft.constraints}
                 onChange={(event) => update("constraints", event.target.value)}
@@ -884,11 +849,9 @@ function Onboarding({
                 <dt>Goal</dt>
                 <dd>{draft.goal}</dd>
               </dl>
-              <label htmlFor="setup-checks">
-                Acceptance checks · one command per line
-              </label>
               <Textarea
                 id="setup-checks"
+                label="Acceptance checks · one command per line"
                 rows={2}
                 value={draft.checks}
                 onChange={(event) => update("checks", event.target.value)}
@@ -904,9 +867,13 @@ function Onboarding({
             </Step>
           </Stepper>
           {error ? (
-            <p className="setup-error" role="alert">
+            <Alert
+              tone="danger"
+              title="Could not continue"
+              className="setup-error"
+            >
               {error}
-            </p>
+            </Alert>
           ) : null}
           {pending ? (
             <div className="setup-loading">
@@ -1012,11 +979,12 @@ function Goal({
             </PopoverContent>
           </Popover>
         </div>
-        <div
-          className="messages"
-          ref={chat}
-          tabIndex={0}
-          aria-label="Goal conversation"
+        <ScrollArea
+          className="conversation-scroll"
+          viewportClassName="messages"
+          viewportRef={chat}
+          label="Goal conversation"
+          fade={0}
           onScroll={() => {
             const element = chat.current!;
             follow.current =
@@ -1076,7 +1044,7 @@ function Goal({
               </div>
             ) : null}
           </div>
-        </div>
+        </ScrollArea>
         {showLatest ? (
           <Button
             className="latest-message"
@@ -1107,11 +1075,10 @@ function Goal({
               </Button>
             </div>
           ) : null}
-          <label className="sr-only" htmlFor="message">
-            Message your agents
-          </label>
+
           <Textarea
             id="message"
+            label="Message your agents"
             ref={input}
             value={text}
             onChange={(event) => setText(event.target.value)}
@@ -1221,6 +1188,7 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
     [loading, setLoading] = useState(false);
   const gate = gates.find((gate: any) => gate.id === selected) ?? gates[0];
   const task = tasks.find((task: any) => task.id === gate?.taskId);
+  const mergeOpener = useRef<HTMLElement | null>(null);
   useEffect(() => {
     setPr(null);
     setDiff("");
@@ -1255,23 +1223,19 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
     return (
       <section className="page">
         <h1 className="sr-only">Review</h1>
-        <div className="review-clear">
-          <ShieldCheck size={40} />
-          <h2>No decisions waiting.</h2>
-
-          <div>
-            <span className="gate-square" /> Approval before every merge
-          </div>
-        </div>
+        <EmptyState
+          className="review-clear"
+          title="No decisions waiting"
+          description="Approval before every merge"
+          icon={<ShieldCheck size={40} />}
+        />
       </section>
     );
   const response = (
     <div className="decision-response">
-      <label htmlFor="gate-answer">
-        {gate.type === "pr" ? "Request changes" : "Your decision"}
-      </label>
       <Textarea
         id="gate-answer"
+        label={gate.type === "pr" ? "Request changes" : "Your decision"}
         rows={3}
         value={answer}
         onChange={(event) => setAnswer(event.target.value)}
@@ -1456,11 +1420,7 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
               {loading ? (
                 <Pending label="Fetching the current PR revision and diff" />
               ) : null}
-              {loadError ? (
-                <p className="field-error" role="alert">
-                  {loadError}
-                </p>
-              ) : null}
+              {loadError ? <Alert tone="danger" title={loadError} /> : null}
               {pr ? (
                 <>
                   <dl className="revision">
@@ -1472,10 +1432,10 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
                     </dd>
                   </dl>
                   {pr.headRefOid !== gate.sha ? (
-                    <p className="field-error">
-                      Revision changed. Request changes so agents can verify and
-                      publish the new commit.
-                    </p>
+                    <Alert tone="warning" title="Revision changed">
+                      Request changes so agents can verify and publish the new
+                      commit.
+                    </Alert>
                   ) : null}
                   <h3>Verification</h3>
                   <ul className="check-list">
@@ -1539,9 +1499,11 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
                       pr.state !== "OPEN" ||
                       pr.mergeable !== "MERGEABLE"
                     }
-                    onClick={() =>
-                      setConfirm({ gateId: gate.id, sha: pr.headRefOid })
-                    }
+                    onClick={() => {
+                      mergeOpener.current =
+                        document.activeElement as HTMLElement;
+                      setConfirm({ gateId: gate.id, sha: pr.headRefOid });
+                    }}
                   >
                     <GitPullRequest size={15} />
                     Approve & merge
@@ -1559,16 +1521,16 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
           if (!open) setConfirm(null);
         }}
       >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Merge this revision?</DialogTitle>
-            <DialogDescription>
-              This merges the reviewed pull request on GitHub. Looproom will
-              check the commit again before submitting the merge.
-            </DialogDescription>
-          </DialogHeader>
+        <DialogContent
+          title="Merge this revision?"
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            mergeOpener.current?.focus();
+          }}
+          description="This merges the reviewed pull request on GitHub. Looproom will check the commit again before submitting the merge."
+        >
           <p className="mono confirm-sha">{confirm?.sha}</p>
-          <DialogFooter>
+          <div className="dialog-actions">
             <Button variant="outline" onClick={() => setConfirm(null)}>
               Keep reviewing
             </Button>
@@ -1586,7 +1548,7 @@ function ReviewInbox({ gates, tasks, act, busy, bypass }: any) {
             >
               Approve & merge
             </Button>
-          </DialogFooter>
+          </div>
         </DialogContent>
       </Dialog>
     </section>
@@ -1701,13 +1663,6 @@ function Settings({ data, project, act, busy, refresh }: any) {
         <p>Defaults apply to future runs. Unavailable models create a gate.</p>
         {(["orchestrator", "subagent", "judge"] as const).map((role) => (
           <div className="model-setting" key={role}>
-            <label htmlFor={role + "-model"}>
-              {role === "orchestrator"
-                ? "Orchestrator"
-                : role === "judge"
-                  ? "Escalation judge"
-                  : "Implementation & subagents"}
-            </label>
             <Select
               value={settings[role].model}
               onValueChange={(model) =>
@@ -1716,21 +1671,19 @@ function Settings({ data, project, act, busy, refresh }: any) {
                   [role]: { ...settings[role], model },
                 })
               }
-            >
-              <SelectTrigger id={role + "-model"}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {models.map((model) => (
-                  <SelectItem key={model.model} value={model.model}>
-                    {model.displayName}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <label className="sr-only" htmlFor={role + "-effort"}>
-              {role} reasoning effort
-            </label>
+              label={
+                role === "orchestrator"
+                  ? "Orchestrator"
+                  : role === "judge"
+                    ? "Escalation judge"
+                    : "Implementation & subagents"
+              }
+              id={role + "-model"}
+              options={models.map((model) => ({
+                value: model.model,
+                label: model.displayName,
+              }))}
+            />
             <Select
               value={settings[role].effort}
               onValueChange={(effort) =>
@@ -1739,50 +1692,43 @@ function Settings({ data, project, act, busy, refresh }: any) {
                   [role]: { ...settings[role], effort },
                 })
               }
-            >
-              <SelectTrigger id={role + "-effort"}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {["low", "medium", "high", "xhigh", "max"].map((effort) => (
-                  <SelectItem key={effort} value={effort}>
-                    {effort} reasoning
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+              label="Reasoning"
+              id={role + "-effort"}
+              options={["low", "medium", "high", "xhigh", "max"].map(
+                (effort) => ({ value: effort, label: effort + " reasoning" }),
+              )}
+            />
           </div>
         ))}
-        <label htmlFor="concurrency">Concurrent workflows</label>
-        <Input
+
+        <NumberField
           id="concurrency"
-          type="number"
+          label="Concurrent workflows"
           min={1}
           max={4}
           value={settings.concurrency}
-          onChange={(event) =>
-            setSettings({
-              ...settings,
-              concurrency: Number(event.target.value),
-            })
+          onValueChange={(concurrency) =>
+            setSettings({ ...settings, concurrency })
           }
-          className="short-input"
         />
-        <Button
+        <ActionButton
           disabled={busy}
-          onClick={() =>
-            act(() =>
-              api("/settings", {
-                orchestrator: settings.orchestrator,
-                subagent: settings.subagent,
-                judge: settings.judge,
-                concurrency: settings.concurrency,
-              }),
+          onAction={() =>
+            act(
+              () =>
+                api("/settings", {
+                  orchestrator: settings.orchestrator,
+                  subagent: settings.subagent,
+                  judge: settings.judge,
+                  concurrency: settings.concurrency,
+                }),
+              true,
             )
           }
-        >
-          Save model settings
-        </Button>
+          label="Save model settings"
+          pendingLabel="Saving…"
+          successLabel="Saved"
+        />
       </section>
       <NotificationSettings />
       <section className="setting-section">
@@ -1798,18 +1744,18 @@ function Settings({ data, project, act, busy, refresh }: any) {
             onCheckedChange={setBypass}
           />
         </div>
-        <label htmlFor="settings-constraints">Scope and exclusions</label>
+
         <Textarea
           id="settings-constraints"
+          label="Scope and exclusions"
           rows={3}
           value={constraints}
           onChange={(event) => setConstraints(event.target.value)}
         />
-        <label htmlFor="settings-checks">
-          Authorized checks · one command per line
-        </label>
+
         <Textarea
           id="settings-checks"
+          label="Authorized checks · one command per line"
           rows={3}
           value={checks}
           onChange={(event) => setChecks(event.target.value)}
@@ -1818,23 +1764,26 @@ function Settings({ data, project, act, busy, refresh }: any) {
           Commands run through the Codex workspace sandbox with direct network
           disabled. Package installation may need a human step.
         </p>
-        <Button
+        <ActionButton
           disabled={busy}
-          onClick={() =>
-            act(() =>
-              api("/projects/" + project.id + "/settings", {
-                checks: checks
-                  .split("\n")
-                  .map((line: string) => line.trim())
-                  .filter(Boolean),
-                constraints,
-                bypass,
-              }),
+          onAction={() =>
+            act(
+              () =>
+                api("/projects/" + project.id + "/settings", {
+                  checks: checks
+                    .split("\n")
+                    .map((line: string) => line.trim())
+                    .filter(Boolean),
+                  constraints,
+                  bypass,
+                }),
+              true,
             )
           }
-        >
-          Save project settings
-        </Button>
+          label="Save project settings"
+          pendingLabel="Saving…"
+          successLabel="Saved"
+        />
       </section>
       <section className="setting-section">
         <h2>Control</h2>
@@ -1863,10 +1812,12 @@ function TaskDetail({
   task,
   tasks,
   onClose,
+  restoreFocus,
 }: {
   task: any;
   tasks: any[];
   onClose: () => void;
+  restoreFocus: () => void;
 }) {
   return (
     <Dialog
@@ -1875,15 +1826,19 @@ function TaskDetail({
         if (!open) onClose();
       }}
     >
-      <DialogContent className="task-dialog">
-        <DialogHeader>
-          <DialogTitle>{task?.title}</DialogTitle>
-          <DialogDescription>
-            {task
-              ? frontierLabel(frontierState(task, tasks)) + " · " + task.kind
-              : ""}
-          </DialogDescription>
-        </DialogHeader>
+      <DialogContent
+        className="task-dialog"
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          restoreFocus();
+        }}
+        title={task?.title ?? "Task"}
+        description={
+          task
+            ? frontierLabel(frontierState(task, tasks)) + " · " + task.kind
+            : undefined
+        }
+      >
         {task ? (
           <div className="task-document">
             <p>{task.description}</p>
@@ -1905,26 +1860,19 @@ function TaskDetail({
                 <p>{task.summary}</p>
               </>
             ) : null}
-            {task.checks?.map((check: any, i: number) => (
-              <Collapsible key={i} className="task-check">
-                <CollapsibleTrigger asChild>
-                  <Button variant="ghost" className="task-check-trigger">
-                    <StatusMark
-                      label=""
-                      status={check.code === 0 ? "done" : "failed"}
-                      size={15}
-                    />
-                    <span className="mono">
-                      {check.command} · exit {check.code}
-                    </span>
-                    <ChevronRight size={14} />
-                  </Button>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <pre>{check.output}</pre>
-                </CollapsibleContent>
-              </Collapsible>
-            ))}
+            {task.checks?.length ? (
+              <Accordion
+                defaultOpen={-1}
+                items={task.checks.map((check: any) => ({
+                  title:
+                    (check.code === 0 ? "Passed: " : "Failed: ") +
+                    check.command +
+                    " · exit " +
+                    check.code,
+                  content: <pre>{check.output}</pre>,
+                }))}
+              />
+            ) : null}
             {task.pr ? (
               <a
                 className="source-link"

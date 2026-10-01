@@ -1,0 +1,248 @@
+{
+  "source": "Arc free registry via shadcn CLI",
+  "capturedAt": "2026-09-30",
+  "registry": "https://uiarc.dev/r/{name}.json",
+  "license": "MIT, src/components/arc/LICENSE",
+  "files": [
+    {
+      "file": "src/components/arc/accordion/accordion.module.css",
+      "sha256": "bdade6e956501b0147991cdb222dd9c67b866832c3151e4a2b6889300c9b8c66",
+      "registryItem": "accordion.json"
+    },
+    {
+      "file": "src/components/arc/accordion/accordion.tsx",
+      "sha256": "4d24d519b511812da9dd2b5e2c7d696c0f849ac9ea391480927acf5cfaa3a977",
+      "registryItem": "accordion.json"
+    },
+    {
+      "file": "src/components/arc/action-button/action-button.module.css",
+      "sha256": "eb53fc4e58b616a2e97a9ab305d71f240a0290d042434322536435e35b143ab6",
+      "registryItem": "action-button.json"
+    },
+    {
+      "file": "src/components/arc/action-button/action-button.tsx",
+      "sha256": "b5aa6b945d64f8b21a4745af7220ce893479f8367e19a7572b52e7d3ede5c5f5",
+      "registryItem": "action-button.json"
+    },
+    {
+      "file": "src/components/arc/alert/alert.module.css",
+      "sha256": "2a811753598388e58fccd54b58175fc520f6dff34e06132fe741bc465de94fec",
+      "registryItem": "alert.json"
+    },
+    {
+      "file": "src/components/arc/alert/alert.tsx",
+      "sha256": "9274031ede5420e54a3a65825e19062c12443731d4171143054f9104f8fc946c",
+      "registryItem": "alert.json"
+    },
+    {
+      "file": "src/components/arc/badge/badge.module.css",
+      "sha256": "e870891d804e29e20327f6e865908050d7a657cd02431587f920ab7a931d1a71",
+      "registryItem": "badge.json"
+    },
+    {
+      "file": "src/components/arc/badge/badge.tsx",
+      "sha256": "db73c22935a6e024a268d3df574d1dedb86800b5b764a8c2013ce843aff0f3b2",
+      "registryItem": "badge.json"
+    },
+    {
+      "file": "src/components/arc/button/button.module.css",
+      "sha256": "c974f3fb24bd1ad2622e085e915c65c5925019720ca88fdd55c2bffb2f19ad06",
+      "registryItem": "button.json"
+    },
+    {
+      "file": "src/components/arc/button/button.tsx",
+      "sha256": "2e33ac923371afa716fcf81d06006484fca9b6c7d25a6aa7d51a63c94bd1b105",
+      "registryItem": "button.json"
+    },
+    {
+      "file": "src/components/arc/checkbox/checkbox.module.css",
+      "sha256": "0e7f4de2ad61c88a7961ea60f4a9f2e61d0926f2072f4515c6a8459ada9c017c",
+      "registryItem": "checkbox.json"
+    },
+    {
+      "file": "src/components/arc/checkbox/checkbox.tsx",
+      "sha256": "4759251a0b2a83320cb4078e840f61481a23be0b38b9aa7c077c2e85e6dde00d",
+      "registryItem": "checkbox.json"
+    },
+    {
+      "file": "src/components/arc/copy-button/copy-button.module.css",
+      "sha256": "28ce9f2e3c2c8a7e7786a6d8bab980508e52279afde7c98aa0ea59f4f0981858",
+      "registryItem": "copy-button.json"
+    },
+    {
+      "file": "src/components/arc/copy-button/copy-button.tsx",
+      "sha256": "84b9042e13d89d0b6b8dc1dd1f3ef3c73e52cf1b4ef71270e2d0b24d0a6f8e38",
+      "registryItem": "copy-button.json"
+    },
+    {
+      "file": "src/components/arc/dialog/dialog.module.css",
+      "sha256": "567491d1dd6f95d95ebabed09a14e30ace4e2f0fb3984a1ce6c5f85e05494a61",
+      "registryItem": "dialog.json"
+    },
+    {
+      "file": "src/components/arc/dialog/dialog.tsx",
+      "sha256": "f86c1c7cd5877bb00d05fab0476a462301a776871adcb405b35dd3d260da6942",
+      "registryItem": "dialog.json"
+    },
+    {
+      "file": "src/components/arc/empty-state/empty-state.module.css",
+      "sha256": "e65e4c4b6e3bd31b8925cb6a5d58e8c4826ffca6efb100f786c70428f98afc1a",
+      "registryItem": "empty-state.json"
+    },
+    {
+      "file": "src/components/arc/empty-state/empty-state.tsx",
+      "sha256": "4a3d91c4fb7e2c4c316322854887a9e995e4e0343e41e64dbd6e3c505d7e3b5c",
+      "registryItem": "empty-state.json"
+    },
+    {
+      "file": "src/components/arc/foundation.css",
+      "sha256": "d7dcec62d67fe81b96318dd9896d37c469b117e9e9e6a0fae5042912b786a9d0",
+      "registryItem": "arc-foundation.json"
+    },
+    {
+      "file": "src/components/arc/input/input.module.css",
+      "sha256": "be49f7c950b34ba705800b12d3312de3c1a553d17a6148f1ed20a11915f4c4b4",
+      "registryItem": "input.json"
+    },
+    {
+      "file": "src/components/arc/input/input.tsx",
+      "sha256": "6021d18c8ab958bf5f1fa7fc3167c6d4ea2bc69e129a6bfc121a46991f7610c3",
+      "registryItem": "input.json"
+    },
+    {
+      "file": "src/components/arc/lib/motion-tokens.ts",
+      "sha256": "c0c2c9797d157845873b96233e88f66c75065e253180e533f79fb352dca664fe",
+      "registryItem": "arc-foundation.json"
+    },
+    {
+      "file": "src/components/arc/lib/use-copy-feedback.ts",
+      "sha256": "88d0ae55bb3e241f529912a4802bbf014e4ba437025acc90ab13e012702273c5",
+      "registryItem": "copy-button.json"
+    },
+    {
+      "file": "src/components/arc/motion-tokens.ts",
+      "sha256": "ce396c23c56399264eabd56207c3e24b33043ea453db9ccee88840c74dae7fc1",
+      "registryItem": "arc-foundation.json"
+    },
+    {
+      "file": "src/components/arc/number-field/number-field.module.css",
+      "sha256": "0a041b9fb7e9647040c99bf9362a8951336697067b3a056b221f753a8fc5fbee",
+      "registryItem": "number-field.json"
+    },
+    {
+      "file": "src/components/arc/number-field/number-field.tsx",
+      "sha256": "9aa6c16e49f2e3eeb7d59cb101b718b1e25c6ca48eb571b07406780d4003abc0",
+      "registryItem": "number-field.json"
+    },
+    {
+      "file": "src/components/arc/popover/popover.module.css",
+      "sha256": "9f967f132efd1d142ffb4303301a0fd43680ff9202d686079c939f26b60ecd48",
+      "registryItem": "popover.json"
+    },
+    {
+      "file": "src/components/arc/popover/popover.tsx",
+      "sha256": "c564d1974bc55e805cb92e37ab0d5dbf48b46429353981985f50adab2c93ff4c",
+      "registryItem": "popover.json"
+    },
+    {
+      "file": "src/components/arc/scroll-area/scroll-area.module.css",
+      "sha256": "5eaa354037b9bc4bb67440bf99677cdadb61bef975d36b6fbf572ffb9188ca55",
+      "registryItem": "scroll-area.json"
+    },
+    {
+      "file": "src/components/arc/scroll-area/scroll-area.tsx",
+      "sha256": "82c53c56af335d0a6d808ecd4cbb3c97e8fa83ca56ccd35f71605ae8dd8b0891",
+      "registryItem": "scroll-area.json"
+    },
+    {
+      "file": "src/components/arc/search-field/search-field.module.css",
+      "sha256": "3497a4e863e7f3a41775e95a6488411ac67afafb6acd2ad964e9b437982638d4",
+      "registryItem": "search-field.json"
+    },
+    {
+      "file": "src/components/arc/search-field/search-field.tsx",
+      "sha256": "fdfe15dde027d82ae0d6200dca761b9f0472b51e7f409d457cf9822295ed8b4c",
+      "registryItem": "search-field.json"
+    },
+    {
+      "file": "src/components/arc/select/select.module.css",
+      "sha256": "3c2d00542b6d757969a951c02267da4dd87320e4e6890d096bf871066923e9c6",
+      "registryItem": "select.json"
+    },
+    {
+      "file": "src/components/arc/select/select.tsx",
+      "sha256": "ce979731b099e9c7b4a5e40f051c4048f61c794b1ab6c4c57376a77d9801a99a",
+      "registryItem": "select.json"
+    },
+    {
+      "file": "src/components/arc/skeleton/skeleton.module.css",
+      "sha256": "29e4d2b6539380098b4baf43b7623779ab001fac956a54e890af0d823a990cf3",
+      "registryItem": "skeleton.json"
+    },
+    {
+      "file": "src/components/arc/skeleton/skeleton.tsx",
+      "sha256": "35efad9b9a34bcf283143c1782e22656645e3a8d9c8e6f11635d5587a9b3bf61",
+      "registryItem": "skeleton.json"
+    },
+    {
+      "file": "src/components/arc/stepper/stepper.module.css",
+      "sha256": "d495e43e23d4866dd9cced3b336b134a0a80072ebfc833129a63306bafcb54dc",
+      "registryItem": "stepper.json"
+    },
+    {
+      "file": "src/components/arc/stepper/stepper.tsx",
+      "sha256": "92a26f3f15bc89c4a9878e8f2149260a3c5a84a7d0dae6c3bb5fca5c0b2def62",
+      "registryItem": "stepper.json"
+    },
+    {
+      "file": "src/components/arc/switch/switch.module.css",
+      "sha256": "858b785b722912fadbd1977f66ec2462fc09d4e39638d2184a74ab5b4c8b1489",
+      "registryItem": "switch.json"
+    },
+    {
+      "file": "src/components/arc/switch/switch.tsx",
+      "sha256": "3b98f0d9ae9cf414f9763f2fc852710d0d53b4d548cdb02e5c1a00ecb9b03cfa",
+      "registryItem": "switch.json"
+    },
+    {
+      "file": "src/components/arc/tabs/tabs.module.css",
+      "sha256": "948079427496816a37eedfdfa1be4f3041209ae5694e223ea713ddd73179522e",
+      "registryItem": "tabs.json"
+    },
+    {
+      "file": "src/components/arc/tabs/tabs.tsx",
+      "sha256": "3b0aaf6f0c41ce486e697ee3c9c86ce874fb2a22b1dab433226027de7858af0a",
+      "registryItem": "tabs.json"
+    },
+    {
+      "file": "src/components/arc/textarea/textarea.module.css",
+      "sha256": "244c1ddb154c54b07b3fb5c30a45683e7f1ea532b6553b76c35223571803a7e9",
+      "registryItem": "textarea.json"
+    },
+    {
+      "file": "src/components/arc/textarea/textarea.tsx",
+      "sha256": "3370dc3041487d285d9c9a5caf34934426e6b76244e9fb666a13374d2cc04226",
+      "registryItem": "textarea.json"
+    },
+    {
+      "file": "src/components/arc/toast-stack/toast-stack.module.css",
+      "sha256": "36fc334213f43a5936744c1a24ecce494ca373e1a1d30dd671576bad26db1d1c",
+      "registryItem": "toast-stack.json"
+    },
+    {
+      "file": "src/components/arc/toast-stack/toast-stack.tsx",
+      "sha256": "173b975276d22610a01a1b2b5afe42b1d891ba0a1d074cbc6dc61476ad9f99c7",
+      "registryItem": "toast-stack.json"
+    },
+    {
+      "file": "src/components/arc/tooltip/tooltip.module.css",
+      "sha256": "1cc5c7e4317a6f31acdf785fdc3945954ec03ab9a5067261b1837f793757e9b5",
+      "registryItem": "tooltip.json"
+    },
+    {
+      "file": "src/components/arc/tooltip/tooltip.tsx",
+      "sha256": "16435f59da87c822c91db3de48cf4ee13e572882dbd48001917123f327f48451",
+      "registryItem": "tooltip.json"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
+import { Alert } from "./arc/alert/alert";
 import { lazy, Suspense, useState } from "react";
 import {
   Radio,
@@ -10,7 +11,7 @@ import {
   CircleHelp,
 } from "lucide-react";
 import { Button } from "./ui/button";
-import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
+import { Tooltip } from "./ui/tooltip";
 import { Badge } from "./ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 const Orb = lazy(() => import("./AgentOrb"));
@@ -100,84 +101,76 @@ export default function AgentRoom({
                     run.role === item.id && run.status === "running",
                 );
                 return (
-                  <Tooltip key={item.id}>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        className={`agent-station station-${item.id} ${selected === item.id ? "is-selected" : ""} ${running ? "is-active" : ""}`}
-                        onClick={() => setSelected(item.id)}
-                        aria-pressed={selected === item.id}
-                        aria-label={`Inspect ${item.name}, ${running ? "thinking" : "idle"}`}
-                      >
-                        <span className="station-orb">
-                          <Suspense
-                            fallback={<span className="orb-placeholder" />}
-                          >
-                            <Orb
-                              active={running}
-                              size={110}
-                              identity={item.id}
-                            />
-                          </Suspense>
-                        </span>
-                        <strong>{item.name}</strong>
-                        <span className="station-status">
-                          <i />
-                          {running ? "Thinking" : "Idle"}
-                        </span>
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      {item.job} · select to inspect
-                    </TooltipContent>
+                  <Tooltip
+                    key={item.id}
+                    content={<>{item.job} · select to inspect</>}
+                  >
+                    <Button
+                      variant="ghost"
+                      className={`agent-station station-${item.id} ${selected === item.id ? "is-selected" : ""} ${running ? "is-active" : ""}`}
+                      onClick={() => setSelected(item.id)}
+                      aria-pressed={selected === item.id}
+                      aria-label={`Inspect ${item.name}, ${running ? "thinking" : "idle"}`}
+                    >
+                      <span className="station-orb">
+                        <Suspense
+                          fallback={<span className="orb-placeholder" />}
+                        >
+                          <Orb active={running} size={110} identity={item.id} />
+                        </Suspense>
+                      </span>
+                      <strong>{item.name}</strong>
+                      <span className="station-status">
+                        <i />
+                        {running ? "Thinking" : "Idle"}
+                      </span>
+                    </Button>
                   </Tooltip>
                 );
               })}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  className={`agent-station station-judge ${selected === "judge" ? "is-selected" : ""}`}
-                  aria-label="Inspect Judge"
-                  aria-pressed={selected === "judge"}
-                  onClick={() => setSelected("judge")}
-                >
-                  <Suspense fallback={<span className="orb-placeholder" />}>
-                    <Orb
-                      active={runs.some(
-                        (run: any) =>
-                          run.role === "judge" && run.status === "running",
-                      )}
-                      size={56}
-                      identity="judge"
-                    />
-                  </Suspense>
-                  <strong>Judge</strong>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>
-                Answers escalations; you approve every merge.
-              </TooltipContent>
+            <Tooltip
+              content={<>Answers escalations; you approve every merge.</>}
+            >
+              <Button
+                variant="ghost"
+                className={`agent-station station-judge ${selected === "judge" ? "is-selected" : ""}`}
+                aria-label="Inspect Judge"
+                aria-pressed={selected === "judge"}
+                onClick={() => setSelected("judge")}
+              >
+                <Suspense fallback={<span className="orb-placeholder" />}>
+                  <Orb
+                    active={runs.some(
+                      (run: any) =>
+                        run.role === "judge" && run.status === "running",
+                    )}
+                    size={56}
+                    identity="judge"
+                  />
+                </Suspense>
+                <strong>Judge</strong>
+              </Button>
             </Tooltip>
           </div>
         </div>
         <aside className="agent-inspector" aria-label={`${role.name} details`}>
           <div className="inspector-heading">
             <Badge variant="outline">{active ? "Thinking" : "Idle"}</Badge>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label="About workflow connections"
-                >
-                  <CircleHelp size={15} />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>
-                Connections show planned handoffs. Activity records actual
-                events.
-              </TooltipContent>
+            <Tooltip
+              content={
+                <>
+                  Connections show planned handoffs. Activity records actual
+                  events.
+                </>
+              }
+            >
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label="About workflow connections"
+              >
+                <CircleHelp size={15} />
+              </Button>
             </Tooltip>
           </div>
           <h2>{role.name}</h2>
@@ -234,7 +227,7 @@ export default function AgentRoom({
               </p>
             </div>
           ) : null}
-          {latest?.error ? <p className="field-error">{latest.error}</p> : null}
+          {latest?.error ? <Alert tone="danger" title={latest.error} /> : null}
         </aside>
       </div>
       <div className="section-heading">

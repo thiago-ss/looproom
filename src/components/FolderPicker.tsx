@@ -1,3 +1,4 @@
+import { Alert } from "./arc/alert/alert";
 import { useState, type DragEvent } from "react";
 import { FolderOpen, ArrowDownToLine, Check, X } from "lucide-react";
 import { Button } from "./ui/button";
@@ -122,6 +123,7 @@ export default function FolderPicker({
       <div className="folder-path-row">
         <Input
           id="repo-path"
+          label={mode === "new" ? "New project folder" : "Repository folder"}
           aria-label={
             mode === "new" ? "New project folder" : "Repository folder"
           }
@@ -146,11 +148,7 @@ export default function FolderPicker({
           path.
         </p>
       ) : null}
-      {error ? (
-        <p className="field-error" role="alert">
-          {error}
-        </p>
-      ) : null}
+      {error ? <Alert tone="danger" title={error} /> : null}
     </div>
   );
 }

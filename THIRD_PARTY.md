@@ -14,3 +14,9 @@ Looproom's MIT license covers original application code. It does not replace the
 | [IBM Plex](https://github.com/IBM/plex) | Local font assets served through Fontsource | SIL Open Font License 1.1; `licenses/ibm-plex-sans.txt` (historical Mono notice retained) |
 
 UI registries were captured on 2026-09-30. Existing source captures and their hashes remain in the parent implementation wiki. Lockfile records exact npm versions. Application distribution must preserve these notices. Do not distribute the restricted files as an independent component collection.
+
+## Arc migration (2026-09-30)
+
+The shared shadcn primitive implementations and Sonner were replaced by 22 free [Arc UI](https://uiarc.dev/docs/ai) components installed through the shadcn registry CLI. Incorporated source and CSS modules: `src/components/arc/`; MIT, Copyright (c) 2026 Elia Kuratli, full notice in `src/components/arc/LICENSE`. See [upstream license](https://uiarc.dev/license), [source hashes](docs/arc-sources.json), and [coverage/setup](docs/arc-ui.md). No Arc Pro code is incorporated. The shadcn notice remains for the historical implementation and installation tooling.
+
+ReactBits Stepper now provides retained animated wizard content around Arc's progress indicator and buttons. StatusMark remains incorporated.

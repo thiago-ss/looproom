@@ -7,7 +7,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { recordGateSnapshot } from "../lib/escalations";
-import { toast } from "sonner";
+import { useToastStack } from "./arc/toast-stack/toast-stack";
 import { Button } from "./ui/button";
 import { Switch } from "./ui/switch";
 import { Popover, PopoverTrigger, PopoverContent } from "./ui/popover";
@@ -60,6 +60,7 @@ export function useEscalations(
   projects: any[] | undefined,
   open: (projectId: string) => void,
 ) {
+  const { toast } = useToastStack();
   const [ready, setReady] = useState(false);
   useEffect(() => {
     function unlock() {
@@ -95,10 +96,11 @@ export function useEscalations(
       for (const gate of fresh) {
         const project =
           projects?.find((p) => p.id === gate.projectId)?.name ?? "Project";
-        toast(gate.title ?? "Your decision is needed", {
+        toast({
+          type: "warning",
+          title: gate.title ?? "Your decision is needed",
           description: project + " · " + (gate.type ?? "Review"),
           duration: 12000,
-          icon: <ShieldAlert size={18} />,
           action: { label: "Review", onClick: () => open(gate.projectId) },
         });
         if (
@@ -127,7 +129,7 @@ export function useEscalations(
     if (navigator.locks)
       void navigator.locks.request("looproom-escalations", deliver);
     else void deliver();
-  }, [gates, projects, ready, open]);
+  }, [gates, projects, ready, open, toast]);
 }
 export function NotificationCenter({ gates, projects, onOpen }: any) {
   const open = gates.filter((gate: any) => gate.status === "open");

@@ -10,15 +10,10 @@ import {
   Network,
 } from "lucide-react";
 import { Button } from "./ui/button";
-import { Input } from "./ui/input";
+import { SearchField } from "./arc/search-field/search-field";
+import { EmptyState } from "./arc/empty-state/empty-state";
 import { Badge } from "./ui/badge";
-import {
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
-} from "./ui/select";
+import { Select } from "./ui/select";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import StatusMark from "./ui/StatusMark";
 import DependencyGraph from "./DependencyGraph";
@@ -115,36 +110,34 @@ export default function Work({
         {view === "frontier" ? (
           <div className="frontier-tools">
             <div className="frontier-search">
-              <Search size={14} />
-              <Input
-                aria-label="Search tasks"
+              <SearchField
+                label="Search tasks"
                 placeholder="Find a task…"
                 value={query}
-                onChange={(event) => setQuery(event.target.value)}
+                onValueChange={setQuery}
               />
             </div>
-            <Select value={filter} onValueChange={setFilter}>
-              <SelectTrigger aria-label="Filter work">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All work</SelectItem>
-                {groups.map((group) => (
-                  <SelectItem value={group.id} key={group.id}>
-                    {group.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Select
+              label="Filter work"
+              value={filter}
+              onValueChange={setFilter}
+              options={[
+                { value: "all", label: "All work" },
+                ...groups.map((group) => ({
+                  value: group.id,
+                  label: group.name,
+                })),
+              ]}
+            />
           </div>
         ) : null}
       </div>
       {!tasks.length ? (
-        <div className="frontier-empty">
-          <Layers3 size={28} />
-          <h2>The first useful step starts with your goal.</h2>
-          <p>Start planning in Goal.</p>
-        </div>
+        <EmptyState
+          title="The first useful step starts with your goal."
+          description="Start planning in Goal."
+          icon={<Layers3 size={28} />}
+        />
       ) : view === "graph" ? (
         <>
           <div className="graph-caption">
@@ -153,19 +146,22 @@ export default function Work({
           <DependencyGraph tasks={tasks} onSelect={onSelect} />
         </>
       ) : !visible.length ? (
-        <div className="frontier-empty">
-          <Search size={26} />
-          <h2>No matching work.</h2>
-          <Button
-            variant="outline"
-            onClick={() => {
-              setFilter("all");
-              setQuery("");
-            }}
-          >
-            Clear filters
-          </Button>
-        </div>
+        <EmptyState
+          title="No matching work"
+          description="Clear filters to see all tasks."
+          icon={<Search size={26} />}
+          action={
+            <Button
+              variant="outline"
+              onClick={() => {
+                setFilter("all");
+                setQuery("");
+              }}
+            >
+              Clear filters
+            </Button>
+          }
+        />
       ) : (
         <div className="frontier-sections">
           {groups.map((group) => {

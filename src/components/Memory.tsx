@@ -1,3 +1,5 @@
+import { EmptyState } from "./arc/empty-state/empty-state";
+import { Alert } from "./arc/alert/alert";
 import { useMemo, useRef, useState, type FormEvent } from "react";
 import Markdown from "react-markdown";
 import {
@@ -8,15 +10,14 @@ import {
   BookOpen,
   Network,
   X,
-  Copy,
-  Check,
   ChevronRight,
   CircleHelp,
 } from "lucide-react";
 import { Button } from "./ui/button";
-import { Input } from "./ui/input";
+import { SearchField } from "./arc/search-field/search-field";
+import { CopyButton } from "./arc/copy-button/copy-button";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
-import { Tooltip, TooltipTrigger, TooltipContent } from "./ui/tooltip";
+import { Tooltip } from "./ui/tooltip";
 import { api } from "../lib/api";
 function excerpt(content: string) {
   return content
@@ -37,7 +38,9 @@ function sourceName(source: string) {
 }
 function headline(page: any) {
   if (
-    !/^(orchestrator|implementation|review|research) outcome$/i.test(page.title)
+    !/^(orchestrator|implementation|review|research|judge) outcome$/i.test(
+      page.title,
+    )
   )
     return page.title;
   const sentence = excerpt(page.content).split(/(?<=[.!?])\s/)[0];
@@ -46,14 +49,15 @@ function headline(page: any) {
     : sentence;
 }
 function teaser(page: any) {
-  const rest = /^(orchestrator|implementation|review|research) outcome$/i.test(
-    page.title,
-  )
-    ? page.content
-        .split(/(?<=[.!?])\s/)
-        .slice(1)
-        .join(" ")
-    : page.content;
+  const rest =
+    /^(orchestrator|implementation|review|research|judge) outcome$/i.test(
+      page.title,
+    )
+      ? page.content
+          .split(/(?<=[.!?])\s/)
+          .slice(1)
+          .join(" ")
+      : page.content;
   return rest.length > 160
     ? excerpt(rest).replace(/\s+\S*$/, "") + "…"
     : excerpt(rest);
@@ -71,7 +75,6 @@ export default function Memory({ project, pages }: any) {
     [view, setView] = useState("library"),
     [error, setError] = useState(""),
     [pending, setPending] = useState(false),
-    [copied, setCopied] = useState(false),
     [sourceFilter, setSourceFilter] = useState("");
   const request = useRef(0);
   const all = useMemo(
@@ -123,50 +126,25 @@ export default function Memory({ project, pages }: any) {
       if (version === request.current) setPending(false);
     }
   }
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(page.content);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
-      setError("Copy is unavailable in this browser.");
-    }
-  }
   return (
     <section className="page memory-page">
       <h1 className="sr-only">Memory</h1>
 
       <div className="memory-toolbar">
         <form onSubmit={search} className="memory-search-field">
-          <Search size={17} />
-          <Input
-            aria-label="Search project memory"
+          <SearchField
+            label="Search project memory"
             placeholder="Find a decision, source, or outcome…"
             value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              if (!e.target.value) {
+            onValueChange={(value) => {
+              setQuery(value);
+              if (!value) {
                 ++request.current;
                 setResults(null);
                 setPending(false);
               }
             }}
           />
-          {query ? (
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Clear search"
-              onClick={() => {
-                ++request.current;
-                setQuery("");
-                setResults(null);
-                setPending(false);
-              }}
-            >
-              <X size={14} />
-            </Button>
-          ) : null}
           <Button
             variant="secondary"
             size="sm"
@@ -281,7 +259,6 @@ export default function Memory({ project, pages }: any) {
                     aria-pressed={page?.id === record.id}
                     onClick={() => {
                       setSelected(record.id);
-                      setCopied(false);
                     }}
                   >
                     <span className="memory-card-top">
@@ -306,30 +283,30 @@ export default function Memory({ project, pages }: any) {
               </div>
               <article className="memory-reader" aria-label="Selected memory">
                 <div className="reader-top">
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="outcome-provenance"
-                      >
-                        <FileText size={12} /> Agent outcome{" "}
-                        <CircleHelp size={13} />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      Agent report. Verified checks and approvals are recorded
-                      in Work and Review.
-                    </TooltipContent>
-                  </Tooltip>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    aria-label={copied ? "Copied" : "Copy memory"}
-                    onClick={copy}
+                  <Tooltip
+                    content={
+                      <>
+                        Agent report. Verified checks and approvals are recorded
+                        in Work and Review.
+                      </>
+                    }
                   >
-                    {copied ? <Check size={15} /> : <Copy size={15} />}
-                  </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="outcome-provenance"
+                    >
+                      <FileText size={12} /> Agent outcome{" "}
+                      <CircleHelp size={13} />
+                    </Button>
+                  </Tooltip>
+                  <CopyButton
+                    key={page.id}
+                    value={page.content}
+                    label="Copy memory"
+                    iconOnly
+                    variant="plain"
+                  />
                   <Button
                     variant="ghost"
                     size="icon-sm"
@@ -406,35 +383,33 @@ export default function Memory({ project, pages }: any) {
               </article>
             </div>
           ) : (
-            <div className="memory-empty">
-              <div className="archive-illustration" aria-hidden="true">
-                <span />
-                <span />
-                <span />
-                <BookOpen size={30} />
-              </div>
-              <h2>
-                {results
+            <EmptyState
+              className="memory-empty"
+              title={
+                results
                   ? "No matches yet"
-                  : "A library that grows with the work"}
-              </h2>
-              <p>
-                {results
-                  ? "Try a different term, or clear your search to browse all outcomes."
-                  : "Agent outcomes and their sources will appear here."}
-              </p>
-              {results ? (
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    setResults(null);
-                    setQuery("");
-                  }}
-                >
-                  Browse all memory
-                </Button>
-              ) : null}
-            </div>
+                  : "A library that grows with the work"
+              }
+              description={
+                results
+                  ? "Try a different term, or browse all outcomes."
+                  : "Agent outcomes and their sources will appear here."
+              }
+              icon={<BookOpen size={30} />}
+              action={
+                results ? (
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setResults(null);
+                      setQuery("");
+                    }}
+                  >
+                    Browse all memory
+                  </Button>
+                ) : undefined
+              }
+            />
           )}
         </>
       )}
