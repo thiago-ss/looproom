@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { Store } from "./store.ts";
 import { Engine } from "./engine.ts";
 import { Runtime } from "./runtime.ts";
 import { createRepo } from "./git.ts";
+import { testFixture } from "./test-fixtures.ts";
 
 class FixtureRuntime extends EventEmitter {
   binary = "";
@@ -49,7 +49,7 @@ class FixtureRuntime extends EventEmitter {
 }
 
 test("planner → isolated worker → check → reviewer preserves artifacts and gates a missing GitHub remote", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-engine-"));
+  const dir = await testFixture("looproom-engine-");
   const store = new Store(join(dir, "db"));
   const runtime = new FixtureRuntime();
   runtime.home = join(dir, "codex");
@@ -113,7 +113,7 @@ test("planner → isolated worker → check → reviewer preserves artifacts and
 });
 
 test("routine verification failures get bounded autonomous repair before human escalation", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-repair-"));
+  const dir = await testFixture("looproom-repair-");
   const store = new Store(join(dir, "db"));
   const engine = new Engine(
     store,

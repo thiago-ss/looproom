@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { Store } from "./store.ts";
+import { testFixture } from "./test-fixtures.ts";
 
 test("SQLite survives restart, searches only the selected project, and rolls back failed writes", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-store-"));
+  const dir = await testFixture("looproom-store-");
   const path = join(dir, "state.sqlite");
   let store = new Store(path);
   try {
@@ -35,7 +35,7 @@ test("SQLite survives restart, searches only the selected project, and rolls bac
 });
 
 test("a crash preserves work and creates one actionable recovery gate", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-recovery-"));
+  const dir = await testFixture("looproom-recovery-");
   const store = new Store(join(dir, "db"));
   try {
     store.put("project", { status: "running" }, "p");
@@ -63,7 +63,7 @@ test("a crash preserves work and creates one actionable recovery gate", async ()
 });
 
 test("recovery also catches a crash between the agent turn and broker verification", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-check-recovery-"));
+  const dir = await testFixture("looproom-check-recovery-");
   const store = new Store(join(dir, "db"));
   try {
     store.put("project", { status: "running" }, "p");

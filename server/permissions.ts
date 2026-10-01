@@ -1,6 +1,18 @@
 import { realpath } from "node:fs/promises";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 import { git } from "./git.ts";
+
+// npm's standard CLI needs its package files. Other layouts get only the
+// resolved entry point; never infer a broad parent from an unfamiliar path.
+export function npmReadPath(resolved: string): string {
+  const bin = dirname(resolved);
+  const packageRoot = dirname(bin);
+  return basename(resolved) === "npm-cli.js" &&
+    basename(bin) === "bin" &&
+    basename(packageRoot) === "npm"
+    ? packageRoot
+    : resolved;
+}
 
 // Named profiles keep credential reads and direct network outside the worker boundary.
 export async function permissionConfig(cwd: string, write: boolean) {
@@ -31,7 +43,10 @@ export async function permissionConfig(cwd: string, write: boolean) {
     const location = await exec("/usr/bin/which", [command])
       .then((result) => result.stdout.trim())
       .catch(() => "");
-    if (location) filesystem[dirname(await realpath(location))] = "read";
+    if (location) {
+      const resolved = await realpath(location);
+      filesystem[command === "npm" ? npmReadPath(resolved) : dirname(resolved)] = "read";
+    }
   }
   return {
     default_permissions: "looproom",

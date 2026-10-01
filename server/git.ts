@@ -131,6 +131,8 @@ export async function sandboxCheck(
     HOME: process.env.HOME,
     CODEX_HOME: codexHome,
     TMPDIR: process.env.TMPDIR,
+    // Node otherwise probes a system OpenSSL config outside the worker profile.
+    OPENSSL_CONF: "/dev/null",
   };
   return new Promise<{ command: string; code: number; output: string }>(
     (resolve, reject) => {

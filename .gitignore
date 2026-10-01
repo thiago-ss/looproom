@@ -3,4 +3,5 @@ dist/
 .DS_Store
 *.log
 .looproom-data/
+.looproom-test-fixtures/
 .env

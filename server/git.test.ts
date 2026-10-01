@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { testFixture } from "./test-fixtures.ts";
 import {
   checkApproval,
   createRepo,
@@ -62,7 +62,7 @@ test("dependency frontier rejects invalid edges and cycles", () => {
 });
 
 test("a task worktree preserves uncommitted changes in the original checkout", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "looproom-git-"));
+  const dir = await testFixture("looproom-git-");
   try {
     const repo = await createRepo(join(dir, "repo"));
     await writeFile(join(repo.path, "existing.txt"), "committed");
