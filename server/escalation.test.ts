@@ -858,6 +858,7 @@ test("YOLO requests coordinator checks, reassesses actual evidence, and resumes 
     assert.equal(f.store.get(gate.id).status, "resolved");
     assert.equal(f.store.get(task.id).status, "ready");
     assert.equal(f.store.get(task.id).checks[0].code, 0);
+    assert.equal(JSON.parse(await readFile(join(task.worktree, ".looproom-verification/fixture-report.json"), "utf8")).id, "fixture-report");
     assert.equal(f.store.all("approval").length, 0);
     const started: string[] = [];
     f.engine.implement = async (_p, t) => {

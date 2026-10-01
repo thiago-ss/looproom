@@ -455,7 +455,7 @@ export class Engine extends EventEmitter {
       .slice(-6)
       .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json for earlier recorded check evidence if it exists. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     const result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
@@ -851,7 +851,8 @@ export class Engine extends EventEmitter {
       join(await realpath(task.worktree), ".looproom-verification")
     )
       throw new Error("Verification evidence directory must not be a symlink.");
-    const temporary = join(evidenceDir, report.id + ".json");
+    await writeFile(join(evidenceDir, report.id + ".json"), JSON.stringify(report, null, 2), { flag: "wx" });
+    const temporary = join(evidenceDir, report.id + ".tmp");
     await writeFile(temporary, JSON.stringify(report, null, 2), { flag: "wx" });
     await rename(temporary, join(evidenceDir, "latest.json"));
     return report;
@@ -1034,7 +1035,7 @@ Action retry: your specific decision permits continuing within existing capabili
           result = await this.run(
             this.store.get(project.id),
             "judge",
-            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator snapshot report: ${JSON.stringify(report)}\nThe report has real command outputs/exit status, original-source hash and a sourceUnchanged flag. It ran in a disposable isolated copy, not the worker shell. If checks failed, return retry with a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Do not claim checks passed when their exit code is nonzero. The worker can read .looproom-verification/latest.json; the coordinator runs configured checks after implementation. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
+            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator snapshot report: ${JSON.stringify(report)}\nThe report has real command outputs/exit status, original-source hash and a sourceUnchanged flag. It ran in a disposable isolated copy, not the worker shell. If checks failed, return retry with a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Do not claim checks passed when their exit code is nonzero. The worker can read .looproom-verification/latest.json and .looproom-verification/<report-id>.json; the coordinator runs configured checks after implementation. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
             Judgment,
             task,
             false,
