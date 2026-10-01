@@ -243,6 +243,36 @@
       "file": "src/components/arc/tooltip/tooltip.tsx",
       "sha256": "16435f59da87c822c91db3de48cf4ee13e572882dbd48001917123f327f48451",
       "registryItem": "tooltip.json"
+    },
+    {
+      "file": "src/components/arc/progress/progress.tsx",
+      "sha256": "0f8387b3cc87691a6f7003ad4c5abe53ed83bca554c0fd347fd58d417280c2a7",
+      "registryItem": "progress.json"
+    },
+    {
+      "file": "src/components/arc/progress/progress.module.css",
+      "sha256": "b1d5a36aa3b3d38683904c6e722d95569ea862255ad9d3dfd1c306bde2497f70",
+      "registryItem": "progress.json"
+    },
+    {
+      "file": "src/components/arc/timeline/timeline.tsx",
+      "sha256": "e60644384d17a69db7ad4405d99dffe3f80a48e0f13253c73522366919a35341",
+      "registryItem": "timeline.json"
+    },
+    {
+      "file": "src/components/arc/timeline/timeline.module.css",
+      "sha256": "595a6171c5d2f49c250dfad2f250530da159ec3d6eccac7a4eee9cb1b7bb4e0c",
+      "registryItem": "timeline.json"
+    },
+    {
+      "file": "src/components/arc/segmented-control/segmented-control.tsx",
+      "sha256": "9e1a4bc135246c86ed2d8875a3a1266490aa38a3d7800759db630e700188e840",
+      "registryItem": "segmented-control.json"
+    },
+    {
+      "file": "src/components/arc/segmented-control/segmented-control.module.css",
+      "sha256": "60ea2632e1f3056f39c727c6e3ac230ee853b6406be6bab2ade943b8b8595fba",
+      "registryItem": "segmented-control.json"
     }
   ]
 }

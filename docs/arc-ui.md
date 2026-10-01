@@ -39,8 +39,11 @@ For a change: search the intent, inspect the chosen component, get its install c
 | ScrollArea | Native Goal viewport, forwarded ref, bottom-follow and user scroll tracking |
 | EmptyState | Empty project/review/work/Memory surfaces |
 | Alert | Setup, network, operation, folder, memory, agent and PR errors |
+| Progress | Actual completed-task fraction in Work |
+| SegmentedControl | Five Work state filters with keyboard navigation |
+| Timeline | Latest twelve actual task turns with attributed response details |
 
-These are 22 applicable free components. Do not install unrelated controls just to inflate coverage. Arc has no free standalone Kbd or Collapsible entry in the retrieved catalog: the shortcut stays semantic text; check disclosures use Accordion. No Pro source or Pro token is incorporated.
+These are 25 applicable free components. Do not install unrelated controls just to inflate coverage. Arc has no free standalone Kbd or Collapsible entry in the retrieved catalog: the shortcut stays semantic text; check disclosures use Accordion. No Pro source or Pro token is incorporated.
 
 ## Identity and source boundary
 
@@ -49,3 +52,9 @@ These are 22 applicable free components. Do not install unrelated controls just 
 Source hashes: `docs/arc-sources.json`. License: `src/components/arc/LICENSE`, MIT, Copyright (c) 2026 Elia Kuratli. The upstream license page was marked draft on capture. Preserve the notice in distributions. Registry JSON and MCP evidence are archived in the parent LLM wiki. Captured registry source matches installed code after removal of CSS comments; installed byte hashes are authoritative for this revision.
 
 Orbkit owns agent visual identities, DotMatrix owns operation indicators, and ReactBits StatusMark owns task state marks. Those domain visuals complement Arc controls. Native macOS folder selection/drop stays behind the existing local bridge. Human approval of every PR merge and model defaults are retained.
+
+## Work expansion (2026-09-30)
+
+Work uses Progress, SegmentedControl and Timeline retrieved through the official MCP and installed with shadcn. Timeline registry metadata contained an invalid dependency named ` animate=`; the first CLI attempt failed. Installation metadata was normalized to existing `motion`/`lucide-react` dependencies and omitted the already installed matching foundation. Component TS/CSS source was preserved, with the CLI's CSS comment/format normalization verified. Exact upstream registries, derived installer files and MCP API captures are immutable in the parent wiki's work-redesign batch. The original 48 installed source hashes are unchanged; six new files bring coverage to 54 source files. No new npm dependency or Pro code was added.
+
+Record buttons adapt Arc's animated label wrappers to intrinsic height and full-width wrapping at the application boundary. Work and its CSS load as a separate route chunk. The activity timeline uses supplied timestamps, profile metadata and attributed run messages already in state; it does not enlarge coordinator state with full run outputs or fabricate progress.

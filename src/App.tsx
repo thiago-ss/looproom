@@ -70,7 +70,7 @@ import {
 } from "./components/ui/popover";
 import ConversationMessages from "./components/ConversationMessages";
 import { Switch } from "./components/ui/switch";
-import Work from "./components/Work";
+const Work = lazy(() => import("./components/Work"));
 import { frontierState, frontierLabel } from "./lib/work";
 import { api, type Data } from "./lib/api";
 
@@ -452,7 +452,21 @@ export default function App() {
                   />
                 ) : null}
                 {view === "work" ? (
-                  <Work tasks={tasks} onSelect={inspectTask} />
+                  <Suspense fallback={<Pending label="Opening Work" />}>
+                    <Work
+                      key={project.id}
+                      tasks={tasks}
+                      runs={runs}
+                      messages={messages}
+                      gates={data.gates.filter(
+                        (gate) => gate.projectId === project.id,
+                      )}
+                      project={project}
+                      onSelect={inspectTask}
+                      onReview={() => setView("review")}
+                      onGoal={() => setView("goal")}
+                    />
+                  </Suspense>
                 ) : null}
                 {view === "room" ? (
                   <Suspense fallback={<Pending label="Opening agent room" />}>

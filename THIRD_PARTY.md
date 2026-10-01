@@ -22,3 +22,7 @@ The shared shadcn primitive implementations and Sonner were replaced by 22 free 
 ReactBits Stepper now provides retained animated wizard content around Arc's progress indicator and buttons. StatusMark remains incorporated.
 
 ReactBits Shiny Text’s CSS gradient sweep (MIT + Commons Clause) is adapted in `src/components/judge-pending.css`; original TS/CSS are captured in the parent wiki’s `raw/2026-09-30-followthrough/`. Full existing ReactBits license applies. The per-frame JavaScript component is not incorporated.
+
+## Work components (2026-09-30)
+
+Three additional free MIT Arc components—Progress, Timeline and SegmentedControl—are incorporated under `src/components/arc/`, bringing current Arc coverage to 25. Existing Arc notice and [source hashes](docs/arc-sources.json) apply. Upstream registry metadata required a documented installation-only normalization; source comparison passed. Bencho, devl, BoardUI, Refero, Jalco, Pixel Perfect and Efferd were design references only; their component code and paid assets are not incorporated.
