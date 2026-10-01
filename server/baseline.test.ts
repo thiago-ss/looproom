@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
@@ -27,6 +27,7 @@ test("baseline setup repairs require independent review and fresh results before
   const f = await fixture();
   try {
     await f.engine.verificationCommands(f.project, f.task, ["refresh-baseline"]);
+    assert.equal(await f.engine.evaluatorSnapshot(hash("original")), "original");
     await writeFile(f.source, "cleanup repair");
     let reviews = 0;
     f.engine.run = async (_p, role, _prompt, _schema, task, write) => {
@@ -89,5 +90,19 @@ test("a refused verification recipe reaches YOLO recovery with the actual error 
     assert.equal(f.store.get(gate.id).judgeFailures, 0);
     assert.equal(f.store.get(gate.id).awaitingCapability, true);
     assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+test("evaluator snapshots preserve original bytes and reject missing legacy evidence or tampering", async () => {
+  const f = await fixture();
+  try {
+    f.store.patch(f.task.id, { verificationEvaluatorHash: hash("lost legacy source") });
+    await assert.rejects(f.engine.verificationCommands(f.project, f.store.get(f.task.id), ["refresh-baseline"]), /Original evaluator source is missing/);
+    const path = join(f.dir, "verification/evaluators", hash("original") + ".ts");
+    assert.equal(await readFile(path, "utf8"), "original");
+    await assert.rejects(f.engine.evaluatorSnapshot(hash("original"), Buffer.from("tampered")), /does not match/);
+    assert.equal(await readFile(path, "utf8"), "original");
+    await writeFile(path, "tampered");
+    await assert.rejects(f.engine.evaluatorSnapshot(hash("original"), Buffer.from("original")), /snapshot was changed/);
+    assert.equal(await readFile(path, "utf8"), "tampered", "Never silently overwrite immutable evidence");
   } finally { await f.close(); }
 });
