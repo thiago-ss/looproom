@@ -897,7 +897,18 @@ export class Engine extends EventEmitter {
       );
       return;
     }
-    await gh(["auth", "status"]);
+    try {
+      await gh(["auth", "status"]);
+    } catch (error) {
+      this.gate(
+        project.id,
+        "Prepare GitHub publishing",
+        `Verified work remains in ${task.worktree}. Install GitHub CLI and run gh auth login before retrying publication. GitHub reported: ${error instanceof Error ? error.message : String(error)}`,
+        "github",
+        task.id,
+      );
+      return;
+    }
     const productPaths = ["--", ".", ":(top,exclude).looproom-verification"];
     const diff = await git(task.worktree, ["status", "--porcelain", ...productPaths]);
     const untracked = (
@@ -1192,6 +1203,8 @@ export class Engine extends EventEmitter {
   ) {
     const gate = this.store.get(gateId);
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
+    if (actor === "judge" && gate.type === "interrupted")
+      throw new Error("Interrupted work requires explicit human resolution.");
     if (gate.type === "pr" && gate.mergeAttempt)
       throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
     if (actor === "judge" && gate.type === "pr")
@@ -1238,7 +1251,8 @@ export class Engine extends EventEmitter {
           .some((task) => !["completed", "cancelled"].includes(task.status))
       )
         this.store.patch(gate.projectId, { planned: false });
-      this.store.patch(gate.projectId, { status: "running" });
+      if (!this.store.hasOpenInterruption(gate.projectId))
+        this.store.patch(gate.projectId, { status: "running" });
     });
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
@@ -1412,6 +1426,7 @@ export class Engine extends EventEmitter {
       !task?.worktree ||
       this.store.get(gate.id).status !== "open" ||
       gate.type === "pr" ||
+      this.store.hasOpenInterruption(project.id) ||
       escalationMode(currentProject) !== "yolo" ||
       currentProject.status !== "running"
     )
@@ -1461,7 +1476,7 @@ export class Engine extends EventEmitter {
     }
   }
   async judge(project: RecordData, gate: RecordData) {
-    if (gate.status !== "open") return;
+    if (gate.status !== "open" || this.store.hasOpenInterruption(project.id)) return;
     const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
     if (
       escalationMode(project) === "yolo" &&
@@ -1739,7 +1754,7 @@ Action retry: your specific decision permits continuing within existing capabili
   tick() {
     const limit = this.settings().concurrency;
     for (const project of this.store.all("project")) {
-      if (project.status !== "running") continue;
+      if (project.status !== "running" || this.store.hasOpenInterruption(project.id)) continue;
       const gates = this.store
         .all("gate", project.id)
         .filter((gate) => gate.status === "open");

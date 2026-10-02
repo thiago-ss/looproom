@@ -126,10 +126,10 @@ export default function ConversationMessages({
                             variant="secondary"
                             onClick={() => onReply(gate)}
                           >
-                            {mode === "yolo" ? "Add context" : "Reply"}
+                            {mode === "yolo" && gate.type !== "interrupted" ? "Add context" : "Reply"}
                           </Button>
                         ) : null}
-                        {mode !== "yolo" || gate.type === "pr" ? (
+                        {mode !== "yolo" || gate.type === "pr" || gate.type === "interrupted" ? (
                           <Button size="sm" variant="ghost" onClick={onReview}>
                             Review <ArrowRight size={14} />
                           </Button>

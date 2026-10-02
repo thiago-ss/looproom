@@ -4,7 +4,9 @@ import { spawn } from "node:child_process";
 import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { createRepo } from "./git.ts";
+import { Store } from "./store.ts";
 import { testFixture } from "./test-fixtures.ts";
+import { stopChild } from "./child-test.ts";
 
 test("local API requires a session, rejects foreign origins and keeps projects after restart", async () => {
   const dir = await testFixture("looproom-api-");
@@ -17,7 +19,9 @@ test("local API requires a session, rejects foreign origins and keeps projects a
     { mode: 0o755 },
   );
   let child: ReturnType<typeof spawn>;
+  let childOutput = "";
   async function start() {
+    childOutput = "";
     child = spawn(process.execPath, ["--import", "tsx", "server/index.ts"], {
       env: {
         ...process.env,
@@ -27,14 +31,16 @@ test("local API requires a session, rejects foreign origins and keeps projects a
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    child.stderr?.on("data", (chunk) => { childOutput += chunk; });
     return new Promise<string>((resolve, reject) => {
       let output = "";
       const timer = setTimeout(
-        () => reject(new Error("Server did not start")),
+        () => reject(new Error("Server did not start: " + childOutput)),
         10000,
       );
       child.stdout!.on("data", (chunk) => {
         output += chunk;
+        childOutput += chunk;
         const match = output.match(/coordinator: (http:\/\/127\.0\.0\.1:\d+)/);
         if (match) {
           clearTimeout(timer);
@@ -43,16 +49,12 @@ test("local API requires a session, rejects foreign origins and keeps projects a
       });
       child.once("exit", () => {
         clearTimeout(timer);
-        reject(new Error("Server exited: " + output));
+        reject(new Error("Server exited: " + childOutput));
       });
     });
   }
   async function stop() {
-    if (child.exitCode !== null) return;
-    await new Promise<void>((resolve) => {
-      child.once("exit", () => resolve());
-      child.kill("SIGTERM");
-    });
+    await stopChild(child, () => childOutput);
   }
   try {
     let url = await start();
@@ -135,6 +137,26 @@ test("local API requires a session, rejects foreign origins and keeps projects a
     assert.equal(state.messages[0].text, body.goal);
     assert.equal(state.settings.orchestrator.model, "gpt-6.1-sol");
     assert.equal(state.settings.subagent.effort, "medium");
+    await stop();
+    const interrupted = new Store(join(dir, "data", "looproom.sqlite"));
+    interrupted.patch(created.id, { status: "running" });
+    interrupted.put("task", { projectId: created.id, status: "running", worktree: "/preserved/worktree" }, "interrupted-task");
+    interrupted.close();
+    url = await start();
+    response = await fetch(url + "/api/state");
+    const recoveryCookie = response.headers.get("set-cookie")!.split(";")[0];
+    const recovered = await response.json();
+    assert.equal(recovered.projects[0].status, "paused");
+    assert.equal(recovered.gates.filter((gate: any) => gate.type === "interrupted").length, 1);
+    response = await fetch(url + "/api/projects/" + created.id + "/control", {
+      method: "POST",
+      headers: { ...settingHeaders, cookie: recoveryCookie },
+      body: JSON.stringify({ action: "start" }),
+    });
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /resolve the interrupted work/);
+    response = await fetch(url + "/api/state");
+    assert.equal((await response.json()).projects[0].status, "paused");
   } finally {
     await stop();
     await rm(dir, { recursive: true, force: true });

@@ -48,6 +48,157 @@ class FixtureRuntime extends EventEmitter {
   close() {}
 }
 
+test("interruption waits for a human even after another decision is answered", async () => {
+  const dir = await testFixture("looproom-human-restart-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  try {
+    const project = store.put("project", { status: "running" });
+    const task = store.put("task", { projectId: project.id, status: "running", worktree: "/preserved/worktree" });
+    const decision = store.put("gate", { projectId: project.id, taskId: task.id, status: "open", type: "decision" });
+    store.recover();
+    const interruption = store.all("gate", project.id).find((gate) => gate.type === "interrupted")!;
+    await assert.rejects(engine.resolve(interruption.id, "retry", true, "judge"), /human resolution/);
+    await engine.resolve(decision.id, "Continue after recovery", true);
+    assert.equal(store.get(project.id).status, "paused");
+    await engine.resolve(interruption.id, "I reviewed the preserved worktree; retry", true);
+    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+  } finally {
+    engine.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("YOLO cannot recover a preserved worktree while an interruption gate is open", async () => {
+  const dir = await testFixture("looproom-interruption-judge-");
+  const store = new Store(join(dir, "db"));
+  const runtime = new FixtureRuntime();
+  const engine = new Engine(store, runtime as unknown as Runtime, dir);
+  try {
+    store.put("settings", { concurrency: 1, subagent: { model: "gpt-6-sol", effort: "medium" } }, "settings");
+    const project = store.put("project", { status: "running", escalationMode: "yolo", planned: true });
+    const task = store.put("task", { projectId: project.id, status: "blocked", worktree: dir });
+    const decision = store.put("gate", { projectId: project.id, taskId: task.id, type: "decision", status: "open" });
+    store.put("gate", { projectId: project.id, taskId: task.id, type: "interrupted", status: "open" });
+    engine.tick();
+    assert.equal(runtime.profiles.length, 0);
+    await engine.judge(project, decision);
+    assert.equal(runtime.profiles.length, 0);
+    const assessment = { action: "wait" as const, answer: "Wait", summary: "Wait", sources: [], verificationRequests: [] };
+    const result = await engine.recoverEscalation(project, decision, task, assessment);
+    assert.equal(result, assessment);
+    assert.equal(runtime.profiles.length, 0);
+  } finally {
+    engine.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restart gates interrupted YOLO worktree recovery until a human resolves it", async () => {
+  const dir = await testFixture("looproom-yolo-restart-");
+  const path = join(dir, "db");
+  let store = new Store(path);
+  let engine: Engine | undefined;
+  try {
+    store.put("settings", { concurrency: 1, subagent: { model: "gpt-6-sol", effort: "medium" } }, "settings");
+    const project = store.put("project", { status: "running", escalationMode: "yolo", planned: true });
+    const task = store.put("task", { projectId: project.id, status: "blocked", worktree: "/preserved/worktree" });
+    const decision = store.put("gate", {
+      projectId: project.id, taskId: task.id, type: "decision", status: "open",
+      judgeStatus: "running", judgeRecoveryStatus: "running",
+    });
+    const judgeRun = store.put("run", {
+      projectId: project.id, taskId: task.id, role: "judge", status: "running",
+    });
+    store.close();
+    store = new Store(path);
+    store.recover();
+    store.close();
+    store = new Store(path);
+    store.recover();
+    const interruptions = store.all("gate", project.id).filter((gate) => gate.type === "interrupted");
+    assert.equal(interruptions.length, 1);
+    assert.equal(store.get(project.id).status, "paused");
+    assert.equal(store.get(task.id).status, "blocked");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+    assert.equal(store.get(judgeRun.id).status, "interrupted");
+    assert.equal(store.get(decision.id).judgeRecoveryStatus, "interrupted");
+    const runtime = new FixtureRuntime();
+    engine = new Engine(store, runtime as unknown as Runtime, dir);
+    engine.tick();
+    await engine.judge(store.get(project.id), store.get(decision.id));
+    const assessment = { action: "wait" as const, answer: "Wait", summary: "Wait", sources: [], verificationRequests: [] };
+    assert.equal(await engine.recoverEscalation(store.get(project.id), store.get(decision.id), store.get(task.id), assessment), assessment);
+    assert.equal(runtime.profiles.length, 0);
+    await engine.resolve(decision.id, "Continue after review", true);
+    assert.equal(store.get(project.id).status, "paused");
+    await assert.rejects(engine.resolve(interruptions[0].id, "retry", true, "judge"), /human resolution/);
+    assert.equal(runtime.profiles.length, 0);
+    await engine.resolve(interruptions[0].id, "I reviewed the preserved worktree; stop this task", false);
+    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(task.id).status, "cancelled");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+    assert.equal(runtime.profiles.length, 0);
+  } finally {
+    engine?.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("judge-only YOLO restart pauses dispatch until human recovery", async () => {
+  const dir = await testFixture("looproom-yolo-judge-only-restart-");
+  const path = join(dir, "db");
+  let store = new Store(path);
+  let engine: Engine | undefined;
+  try {
+    store.put("settings", { concurrency: 1, subagent: { model: "gpt-6-sol", effort: "medium" } }, "settings");
+    const project = store.put("project", { status: "running", escalationMode: "yolo", planned: true });
+    const task = store.put("task", { projectId: project.id, status: "blocked", worktree: "/preserved/worktree" });
+    const decision = store.put("gate", {
+      projectId: project.id, taskId: task.id, type: "decision", status: "open",
+      judgeStatus: "running",
+    });
+    const judgeRun = store.put("run", {
+      projectId: project.id, taskId: task.id, role: "judge", status: "running",
+    });
+    store.close();
+    store = new Store(path);
+    store.recover();
+    store.close();
+    store = new Store(path);
+    store.recover();
+    const interruptions = store.all("gate", project.id).filter((gate) => gate.type === "interrupted");
+    assert.equal(interruptions.length, 1);
+    assert.equal(store.get(judgeRun.id).status, "interrupted");
+    assert.equal(store.get(project.id).status, "paused");
+    assert.equal(store.get(task.id).status, "blocked");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+    const runtime = new FixtureRuntime();
+    engine = new Engine(store, runtime as unknown as Runtime, dir);
+    engine.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.profiles.length, 0);
+    await engine.resolve(decision.id, "Review this decision after restart", true);
+    engine.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.get(project.id).status, "paused");
+    assert.equal(runtime.profiles.length, 0);
+    await assert.rejects(engine.resolve(interruptions[0].id, "retry", true, "judge"), /human resolution/);
+    await engine.resolve(interruptions[0].id, "I reviewed the preserved worktree; stop this task", false);
+    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(task.id).status, "cancelled");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+  } finally {
+    engine?.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 const reviewedSha = "a".repeat(40);
 function mergeFixture(store: Store) {
   const project = store.put("project", { github: "example/repo", status: "running" });

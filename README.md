@@ -6,7 +6,7 @@ A local macOS workspace for continuous, goal-directed agent work. Give a project
 
 ## Run
 
-Requires macOS, Node **22.13 or later**, Git, Codex CLI with named permission profiles (developed against **0.159.2**), Apple Command Line Tools for compiling the native folder picker, and GitHub CLI for publishing PRs. Keep the requested models available on your ChatGPT account.
+Requires macOS, Node **22.13 or later**, Git **2.35 or later**, Codex CLI **0.159.2 or later** with named permission profiles, and Apple Command Line Tools for compiling the native folder picker. GitHub CLI and authentication are needed when publishing PRs, not when launching or working locally. Keep the requested models available on your ChatGPT account.
 
 ```sh
 npm ci
@@ -22,7 +22,7 @@ npm run build
 npm start
 ```
 
-Open **http://127.0.0.1:4319**. After installing dependencies, double-click `Looproom.command` to build, launch and open the application. This is a local web application; a signed native macOS package is not shipped yet. Keep the coordinator running for continuous work. Sleep, shutdown or closing its terminal interrupts it; preserved work is reconciled on restart.
+Open **http://127.0.0.1:4319**. Double-click `Looproom.command` to check prerequisites, install dependencies against the lockfile when install provenance is missing, build changed sources, launch and open the application. An unchanged build is reused after its source, dependency and output hashes match. Launch preparation is serialized per application worktree, including launches that request different ports or data directories; a waiting launcher times out with an actionable error after two minutes. One coordinator owns each data directory even if `PORT` differs; a second launch opens its healthy window when found, while an unrelated port occupant or active owner conflict produces an error. This is a local web application; a signed native macOS package is not shipped yet. Keep the coordinator running for continuous work. Sleep suspends work and cannot be kept alive by the launcher. Shutdown or closing its terminal interrupts in-flight work; worktrees and SQLite state are preserved, and restart requires a human to review and resolve each interruption gate before resuming.
 
 Configuration environment variables:
 
@@ -97,7 +97,7 @@ Goal preserves linked escalation requests and replies, including migrated histor
 
 Use Arc for shared interactive controls and feedback. [MCP setup, component coverage and identity rules](docs/arc-ui.md). `npm run check:ui` rejects native controls outside the Arc sources.
 
-YOLO keeps PRs in your review inbox, while other escalations are handled by the judge. The response includes task-specific evidence and actionable next steps. Three task retries bound each recovery round. Unresolved YOLO blockers recheck after 5/10/20/30 minutes; three judge transport attempts use 15/30-second backoff followed by a 30-minute cooldown. Recovery may repair files and verify available alternatives in the task worktree; the coordinator never dispatches a worker while recovery still owns that worktree. Drafts are never worker instructions; submitted replies are recorded in SQLite and the goal chat. No mode grants unavailable capabilities or guarantees perfect judgments.
+YOLO keeps PRs and restart interruption gates in your review inbox; other escalations are handled by the judge. The response includes task-specific evidence and actionable next steps. Three task retries bound each recovery round. Unresolved YOLO blockers recheck after 5/10/20/30 minutes; three judge transport attempts use 15/30-second backoff followed by a 30-minute cooldown. Recovery may repair files and verify available alternatives in the task worktree; the coordinator never dispatches a worker while recovery still owns that worktree. Drafts are never worker instructions; submitted replies are recorded in SQLite and the goal chat. No mode grants unavailable capabilities or guarantees perfect judgments.
 
 ## Isolated verification
 
