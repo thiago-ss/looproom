@@ -442,11 +442,11 @@ export class Engine extends EventEmitter {
       const gate = this.store.get(approval.gateId);
       if (gate.status !== "approved" || gate.reviewedSha !== approval.reviewedSha ||
           gate.mergedSha !== approval.mergedSha) continue;
-      const intent = this.store.all("wiki-ingest", approval.projectId).findLast((item) =>
-        item.taskId === approval.taskId && item.pendingEvidence?.prEvidence?.url === gate.pr &&
-        item.pendingEvidence.prEvidence.headSha === approval.reviewedSha &&
-        this.store.all("run", approval.projectId).some((run) => run.id === item.runId &&
-          run.taskId === approval.taskId && run.role === "implementation"));
+      const run = this.prEvidenceRun(gate, approval.reviewedSha);
+      const intent = run && this.store.all("wiki-ingest", approval.projectId).find((item) => item.runId === run.id);
+      if (run) this.store.patch(run.id, { prEvidence: { ...run.prEvidence, url: gate.pr,
+        headSha: approval.reviewedSha, status: "merged", reviewedSha: approval.reviewedSha,
+        mergedSha: approval.mergedSha } });
       if (intent && intent.pendingEvidence.prEvidence.status !== "merged")
         this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence,
           prEvidence: { ...intent.pendingEvidence.prEvidence, status: "merged",
@@ -467,11 +467,9 @@ export class Engine extends EventEmitter {
       const gate = this.store.get(approval.gateId);
       if (gate.status !== "approved" || gate.reviewedSha !== approval.reviewedSha ||
           gate.mergedSha !== approval.mergedSha) continue;
-      const page = this.store.all("memory", approval.projectId).find((item) =>
-        item.taskId === approval.taskId && item.runId &&
-        this.store.all("run", approval.projectId).some((run) =>
-          run.id === item.runId && run.taskId === approval.taskId && run.role === "implementation") &&
-        item.prEvidence?.url === gate.pr && item.prEvidence?.headSha === approval.reviewedSha);
+      const run = this.prEvidenceRun(gate, approval.reviewedSha);
+      const page = run && this.store.all("memory", approval.projectId).find((item) =>
+        item.runId === run.id && item.prEvidence?.url === gate.pr && item.prEvidence?.headSha === approval.reviewedSha);
       if (!page || page.prEvidence.status === "merged" ||
           this.store.all("wiki-ingest", approval.projectId).some((intent) => intent.runId === page.runId)) continue;
       const updated = this.store.patch(page.id, { prEvidence: {
@@ -1146,6 +1144,7 @@ export class Engine extends EventEmitter {
     this.store.transaction(() => {
       const mergedPr = { ...existingPr, url: gate.pr, headSha: reviewedSha,
         status: "merged", reviewedSha, mergedSha: result.sha };
+      if (run) this.store.patch(run.id, { prEvidence: mergedPr });
       if (intent) this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence: mergedPr } });
       this.store.patch(gateId, {
         status: "approved",

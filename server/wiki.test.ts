@@ -295,6 +295,13 @@ test("approved PR evidence survives restart replay without changing raw capture"
       : JSON.stringify({ merged: true, sha: "merged-sha" });
     await engine.approve("g", "reviewed-sha");
     assert.equal(store.get("wiki-ingest:r").pendingEvidence.prEvidence.status, "merged");
+    assert.equal(store.get("g").mergeAttempt.prRunId, "r");
+    // A later retry can have identical source bytes; it is still another run.
+    store.put("run", { projectId: "p", taskId: "t", role: "implementation", status: "completed" }, "later");
+    await engine.document("p", "Later retry", "Separate outcome", ["source-b"], "later");
+    await engine.recordRunEvidence("t", { prEvidence: {
+      url: "https://github.com/owner/repo/pull/1", headSha: "reviewed-sha", status: "awaiting_human",
+    } }, "later");
     store.close();
     store = new Store(path);
     engine = new Engine(store, { close() {} } as unknown as Runtime, dir);
@@ -307,6 +314,9 @@ test("approved PR evidence survives restart replay without changing raw capture"
     assert.equal(store.all("approval", "p")[0].reviewedSha, "reviewed-sha");
     assert.equal(store.get("memory:r").prEvidence.status, "merged");
     assert.equal(store.get("memory:r").prEvidence.mergedSha, "merged-sha");
+    assert.equal(store.get("later").prEvidence.status, "awaiting_human");
+    assert.equal(store.get("wiki-ingest:later").pendingEvidence.prEvidence.status, "awaiting_human");
+    assert.equal(store.get("memory:later").prEvidence.status, "awaiting_human");
     const folder = join(dir, "wiki", "p");
     assert.match(await readFile(join(folder, "memory:r.md"), "utf8"), /PR outcome.*merged; head reviewed-sha; merged merged-sha/);
     assert.deepEqual(await readFile(rawPath), raw);
