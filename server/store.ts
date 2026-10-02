@@ -83,20 +83,28 @@ export class Store {
       .all(projectId ?? null, projectId ?? null) as any[];
     return rows.map((row) => ({ ...row, data: JSON.parse(row.data) }));
   }
-  memory(projectId: string, title: string, content: string, sources: string[]) {
+  memory(projectId: string, title: string, content: string, sources: string[], runId?: string, claims: any[] = [], taskId?: string) {
+    const id = runId ? "memory:" + runId : randomUUID();
+    const existing = runId ? this.db.prepare("SELECT data FROM records WHERE id=?").get(id) as { data: string } | undefined : undefined;
+    if (existing) return JSON.parse(existing.data) as RecordData;
+    return this.transaction(() => {
     const record = this.put("memory", {
       projectId,
       title,
       content,
       sources,
+      runId,
+      taskId,
+      claims,
       createdAt: new Date().toISOString(),
-    });
+    }, id);
     this.db
       .prepare(
         "INSERT INTO memory_search(id,project_id,title,content) VALUES(?,?,?,?)",
       )
       .run(record.id, projectId, title, content);
     return record;
+    });
   }
   search(projectId: string, query: string) {
     const terms = query

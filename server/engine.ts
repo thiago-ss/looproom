@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, writeFile, realpath, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, realpath, rename, rm, link } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
@@ -17,21 +17,30 @@ const TaskPlan = z.object({
   dependencies: z.array(z.number().int()),
   kind: z.enum(["implementation", "research"]),
 });
+const Claims = z.array(z.object({
+  key: z.string().trim().min(1),
+  statement: z.string().trim().min(1),
+  sources: z.array(z.string()).min(1),
+  relation: z.enum(["new", "supports", "contradicts", "supersedes"]).default("new"),
+})).default([]);
 const Plan = z.object({
   summary: z.string(),
   gate: z.string(),
   tasks: z.array(TaskPlan).max(6),
   sources: z.array(z.string()),
+  claims: Claims,
 });
 const Result = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   humanQuestion: z.string(),
+  claims: Claims,
 });
 const Review = z.object({
   verdict: z.enum(["pass", "changes", "gate"]),
   summary: z.string(),
   sources: z.array(z.string()),
+  claims: Claims,
 });
 const BaselineRevision = z.object({
   baselineSetupOnly: z.boolean(),
@@ -50,6 +59,25 @@ const Judgment = z.object({
     .max(3)
     .default([]),
 });
+type WikiLogEntry = { runId: string; pageId: string; capturedAt: string; text: string };
+
+function parseWikiLog(content: string): WikiLogEntry[] {
+  const header = "# Memory log\n";
+  if (!content.startsWith(header)) throw new Error("Unparseable wiki log header.");
+  const body = content.slice(header.length);
+  if (!body) return [];
+  const starts = [...body.matchAll(/\n## \[/g)].map((match) => match.index);
+  if (!starts.length || starts[0] !== 0) throw new Error("Unparseable wiki log entry.");
+  return starts.map((start, index) => {
+    const text = body.slice(start, starts[index + 1] ?? body.length);
+    const match = /^\n## \[([^\]\n]+)\] outcome \| ([^\n]+)\n\nRun ([A-Za-z0-9:_-]+); page ([A-Za-z0-9:_-]+)\.\n$/.exec(text);
+    if (!match || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(match[1]) ||
+        !Number.isFinite(Date.parse(match[1])) || new Date(match[1]).toISOString() !== match[1])
+      throw new Error("Unparseable wiki log entry.");
+    return { capturedAt: match[1], runId: match[3], pageId: match[4], text };
+  });
+}
+
 export function validateDependencies(tasks: { dependencies: number[] }[]) {
   const active = new Set<number>(),
     done = new Set<number>();
@@ -72,7 +100,7 @@ export function validateDependencies(tasks: { dependencies: number[] }[]) {
   }
   tasks.forEach((_, i) => visit(i));
 }
-const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
+const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Where the output schema offers claims, use a stable subject key, precise statement, and source references; explicitly mark contradictions or supersession. An earlier agent report is never independent support. Omit claims if no specific sourced claim can be extracted. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
 
 export class Engine extends EventEmitter {
   busy = new Set<string>();
@@ -80,6 +108,12 @@ export class Engine extends EventEmitter {
   timer?: ReturnType<typeof setInterval>;
   verificationRunner = runVerification;
   mergeBroker = gh;
+  get github() { return this.mergeBroker; }
+  set github(broker: typeof gh) { this.mergeBroker = broker; }
+  wikiFailureStage?: string;
+  wikiCheckpoint(stage: string) {
+    if (this.wikiFailureStage === stage) throw new Error("Injected wiki failure: " + stage);
+  }
   constructor(
     public store: Store,
     public runtime: Runtime,
@@ -180,6 +214,8 @@ export class Engine extends EventEmitter {
       output: "",
       createdAt: new Date().toISOString(),
     });
+    if (role === "implementation" && task)
+      this.store.patch(task.id, { implementationRunId: run.id });
     this.changed(
       "run-started",
       { runId: run.id, role, taskId: task?.id },
@@ -238,29 +274,47 @@ export class Engine extends EventEmitter {
         },
       });
       const parsed = schema.parse(JSON.parse(output));
-      this.store.patch(run.id, {
-        status: "completed",
-        output,
-        finishedAt: new Date().toISOString(),
+      this.store.transaction(() => {
+        this.store.patch(run.id, {
+          status: "completed",
+          output,
+          finishedAt: new Date().toISOString(),
+        });
+        this.wikiCheckpoint("completed");
+        this.prepareWikiIntent(project.id, role + " outcome", parsed.summary,
+          parsed.sources ?? [], run.id, parsed.claims ?? []);
       });
-      await this.document(
-        project.id,
-        role + " outcome",
-        parsed.summary,
-        parsed.sources ?? [],
-        run.id,
-      );
+      try {
+        await this.document(
+          project.id,
+          role + " outcome",
+          parsed.summary,
+          parsed.sources ?? [],
+          run.id,
+          parsed.claims ?? [],
+        );
+      } catch (error) {
+        // Completion and the intent are durable. Restart can replay the wiki;
+        // this filesystem failure must not become a task decision gate.
+        this.store.patch("wiki-ingest:" + run.id, {
+          replayError: error instanceof Error ? error.message : String(error),
+        });
+        this.changed("wiki-recovery-needed", { runId: run.id }, project.id);
+      }
       this.changed("run-completed", { runId: run.id, role }, project.id);
       return parsed;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const paused = this.store.get(project.id).status !== "running";
-      this.store.patch(run.id, {
-        status: paused ? "interrupted" : "failed",
-        error: message,
-        output: stream,
-        finishedAt: new Date().toISOString(),
-      });
+      // The agent outcome is durable once its ingestion intent commits. A later
+      // filesystem failure must not turn that completed run into a failed run.
+      if (!this.store.all("wiki-ingest").some((intent) => intent.runId === run.id))
+        this.store.patch(run.id, {
+          status: paused ? "interrupted" : "failed",
+          error: message,
+          output: stream,
+          finishedAt: new Date().toISOString(),
+        });
       if (paused && task && role !== "judge")
         this.store.patch(task.id, { status: "ready" });
       else if (
@@ -289,12 +343,13 @@ export class Engine extends EventEmitter {
     content: string,
     sources: string[],
     runId: string,
+    claims: any[] = [],
   ) {
     const previous = this.documentation.get(projectId) ?? Promise.resolve();
     const next = previous
       .catch(() => {})
       .then(() =>
-        this.writeDocument(projectId, title, content, sources, runId),
+        this.writeDocument(projectId, title, content, sources, runId, claims),
       );
     this.documentation.set(projectId, next);
     try {
@@ -310,41 +365,185 @@ export class Engine extends EventEmitter {
     content: string,
     sources: string[],
     runId: string,
+    claims: any[] = [],
   ) {
+    const intent = this.prepareWikiIntent(projectId, title, content, sources, runId, claims);
+    this.wikiCheckpoint("intent");
+    await this.replayDocument(intent);
+  }
+  prepareWikiIntent(projectId: string, title: string, content: string,
+    sources: string[], runId: string, claims: any[] = []) {
+    const intentId = "wiki-ingest:" + runId;
+    let intent: RecordData;
+    try {
+      intent = this.store.get(intentId);
+      if (intent.projectId !== projectId || intent.title !== title || intent.content !== content ||
+          JSON.stringify(intent.sources) !== JSON.stringify(sources) ||
+          JSON.stringify(intent.claims) !== JSON.stringify(claims))
+        throw new Error("Wiki ingestion intent differs from the existing run.");
+    } catch (error) {
+      if (error instanceof Error && error.message !== "Record not found") throw error;
+      intent = this.store.put("wiki-ingest", {
+        projectId, title, content, sources, claims, runId,
+        raw: JSON.stringify(this.store.get(runId), null, 2),
+        taskId: this.store.get(runId).taskId,
+        capturedAt: new Date().toISOString(),
+      }, intentId);
+    }
+    return intent;
+  }
+  prEvidenceRun(gate: RecordData, headSha: string, strict = false) {
+    const matches = (pr: any) => pr?.url === gate.pr && pr.headSha === headSha;
+    const intents = this.store.all("wiki-ingest", gate.projectId);
+    const pages = this.store.all("memory", gate.projectId);
+    const candidates = this.store.all("run", gate.projectId).filter((run) =>
+      run.taskId === gate.taskId && run.role === "implementation" && run.status === "completed" &&
+      (matches(run.prEvidence) || intents.some((intent) => intent.runId === run.id && matches(intent.pendingEvidence?.prEvidence)) ||
+        pages.some((page) => page.runId === run.id && matches(page.prEvidence))));
+    const origin = gate.mergeAttempt?.prRunId ?? gate.prRunId;
+    const run = origin ? candidates.find((run) => run.id === origin) : candidates.length === 1 ? candidates[0] : undefined;
+    if (strict && !run && (origin || candidates.length > 1))
+      throw new Error("Originating PR evidence run is missing or ambiguous; review attribution before merging.");
+    return run;
+  }
+  async repairReconciledEvidence(gate: RecordData) {
+    const attempt = gate.mergeAttempt;
+    if (gate.type !== "pr" || gate.status !== "reconciled" || !attempt ||
+        gate.pr !== attempt.pr || !gate.mergedSha) return;
+    // A reconciled remote fact is not a human approval. Attribute only records
+    // already tied to this exact PR/head, never the task's newest retry.
+    const matches = (pr: any) => pr?.url === attempt.pr && pr.headSha === attempt.reviewedSha;
+    const run = this.prEvidenceRun(gate, attempt.reviewedSha);
+    if (!run) return;
+    {
+      const intent = this.store.all("wiki-ingest", gate.projectId).find((item) => item.runId === run.id);
+      const page = this.store.all("memory", gate.projectId).find((item) => item.runId === run.id);
+      const evidence = [run.prEvidence, intent?.pendingEvidence?.prEvidence, page?.prEvidence].find(matches);
+      if (!evidence) return;
+      const prEvidence = { ...evidence, status: "merged", mergedSha: gate.mergedSha,
+        mergeActor: "unverified", reconciledAt: gate.resolvedAt };
+      this.store.transaction(() => {
+        if (!run.prEvidence || matches(run.prEvidence)) this.store.patch(run.id, { prEvidence });
+        if (intent && (!intent.pendingEvidence?.prEvidence || matches(intent.pendingEvidence.prEvidence)))
+          this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence } });
+        if (page && (!page.prEvidence || matches(page.prEvidence))) this.store.patch(page.id, { prEvidence });
+      });
+      if (page && (!page.prEvidence || matches(page.prEvidence)))
+        await this.writeIfChanged(join(this.dataDir, "wiki", gate.projectId, page.id + ".md"),
+          this.pageMarkdown(this.store.get(page.id)));
+    }
+  }
+  async recoverWiki() {
+    // The durable reconciled gate also repairs a crash before derived writes.
+    for (const gate of this.store.all("gate")) await this.repairReconciledEvidence(gate);
+    // Repair approvals written before merged PR evidence was stored on intents.
+    // Approval and gate records are authoritative for this derived evidence.
+    for (const approval of this.store.all("approval")) {
+      const gate = this.store.get(approval.gateId);
+      if (gate.status !== "approved" || gate.reviewedSha !== approval.reviewedSha ||
+          gate.mergedSha !== approval.mergedSha) continue;
+      const run = this.prEvidenceRun(gate, approval.reviewedSha);
+      const intent = run && this.store.all("wiki-ingest", approval.projectId).find((item) => item.runId === run.id);
+      if (run) this.store.patch(run.id, { prEvidence: { ...run.prEvidence, url: gate.pr,
+        headSha: approval.reviewedSha, status: "merged", reviewedSha: approval.reviewedSha,
+        mergedSha: approval.mergedSha } });
+      if (intent && intent.pendingEvidence.prEvidence.status !== "merged")
+        this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence,
+          prEvidence: { ...intent.pendingEvidence.prEvidence, status: "merged",
+            reviewedSha: approval.reviewedSha, mergedSha: approval.mergedSha } } });
+    }
+    const projects = new Map<string, Set<string>>();
+    for (const intent of this.store.all("wiki-ingest")) {
+      await this.replayDocument(intent, true);
+      const current = projects.get(intent.projectId) ?? new Set<string>();
+      current.add("memory:" + intent.runId);
+      projects.set(intent.projectId, current);
+    }
+    for (const [projectId, current] of projects)
+      await this.reconcileWiki(projectId, current);
+    // Older runs may have a Memory page but no ingestion intent. The approval
+    // record is durable; reconcile its derived page without touching raw files.
+    for (const approval of this.store.all("approval")) {
+      const gate = this.store.get(approval.gateId);
+      if (gate.status !== "approved" || gate.reviewedSha !== approval.reviewedSha ||
+          gate.mergedSha !== approval.mergedSha) continue;
+      const run = this.prEvidenceRun(gate, approval.reviewedSha);
+      const page = run && this.store.all("memory", approval.projectId).find((item) =>
+        item.runId === run.id && item.prEvidence?.url === gate.pr && item.prEvidence?.headSha === approval.reviewedSha);
+      if (!page || page.prEvidence.status === "merged" ||
+          this.store.all("wiki-ingest", approval.projectId).some((intent) => intent.runId === page.runId)) continue;
+      const updated = this.store.patch(page.id, { prEvidence: {
+        ...page.prEvidence, status: "merged", reviewedSha: approval.reviewedSha, mergedSha: approval.mergedSha,
+      } });
+      await this.atomicWrite(join(this.dataDir, "wiki", approval.projectId, page.id + ".md"), this.pageMarkdown(updated));
+    }
+  }
+  async replayDocument(intent: RecordData, deferDerived = false) {
+    const { projectId, title, content, sources, claims, runId } = intent;
     const folder = join(this.dataDir, "wiki", projectId);
     await mkdir(join(folder, "raw"), { recursive: true });
     const rawPath = join(folder, "raw", runId + ".json");
-    const raw = JSON.stringify(this.store.get(runId), null, 2);
-    await writeFile(rawPath, raw, {
-      flag: "wx",
-    });
+    const raw = intent.raw as string;
+    const hash = createHash("sha256").update(raw).digest("hex");
+    const rawTemporary = rawPath + "." + randomUUID() + ".tmp";
+    try {
+      await writeFile(rawTemporary, raw, { flag: "wx" });
+      try { await link(rawTemporary, rawPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    } finally { await rm(rawTemporary, { force: true }); }
+    if (createHash("sha256").update(await readFile(rawPath)).digest("hex") !== hash)
+      throw new Error("Existing raw capture differs from the ingestion intent: " + runId);
+    this.wikiCheckpoint("raw");
     const manifestPath = join(folder, "raw", "manifest.json");
     const manifest = JSON.parse(
-      await readFile(manifestPath, "utf8").catch(() => '{"sources":[]}'),
+      await readFile(manifestPath, "utf8").catch((error) => {
+        if (error.code === "ENOENT") return '{"sources":[]}';
+        throw error;
+      }),
     );
-    manifest.sources.push({
-      file: runId + ".json",
-      sha256: createHash("sha256").update(raw).digest("hex"),
-      capturedAt: new Date().toISOString(),
-      origin: "codex-run:" + runId,
+    const entry = manifest.sources.find((item: any) => item.file === runId + ".json");
+    if (entry && entry.sha256 !== hash) throw new Error("Raw manifest hash differs: " + runId);
+    if (!entry) {
+      manifest.sources.push({ file: runId + ".json", sha256: hash,
+        capturedAt: intent.capturedAt, origin: "codex-run:" + runId });
+      await this.atomicWrite(manifestPath, JSON.stringify(manifest, null, 2));
+    }
+    this.wikiCheckpoint("manifest");
+    let record = this.store.memory(projectId, title, content, sources, runId, claims, intent.taskId);
+    if (intent.pendingEvidence) record = this.store.patch(record.id, intent.pendingEvidence);
+    this.wikiCheckpoint("memory");
+    if (!deferDerived) await this.reconcileWiki(projectId, new Set([record.id]));
+    if (intent.replayError) this.store.patch(intent.id, { replayError: null });
+  }
+  async reconcileWiki(projectId: string, current: Set<string>) {
+    const folder = join(this.dataDir, "wiki", projectId);
+    const logPath = join(folder, "log.md");
+    const previousLog = await readFile(logPath, "utf8").catch((error) => {
+      if (error.code === "ENOENT") return "# Memory log\n";
+      throw error;
     });
-    await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
-    const record = this.store.memory(projectId, title, content, sources);
-    const path = join(folder, record.id + ".md");
-    await writeFile(
-      path,
-      "# " +
-        title +
-        "\n\n" +
-        content +
-        "\n\n## Evidence\n\n- [Raw run](raw/" +
-        runId +
-        ".json)\n" +
-        sources.map((source) => "- " + source).join("\n") +
-        "\n\nStatus: agent-reported outcome; checks and PR state are recorded separately.\n",
-    );
+    const entries = new Map<string, WikiLogEntry>();
+    for (const entry of parseWikiLog(previousLog)) {
+      const prior = entries.get(entry.runId);
+      if (prior && prior.text !== entry.text)
+        throw new Error("Conflicting wiki log entries for run: " + entry.runId);
+      entries.set(entry.runId, entry);
+    }
+    for (const intent of this.store.all("wiki-ingest", projectId)) {
+      if (entries.has(intent.runId)) continue;
+      entries.set(intent.runId, {
+        runId: intent.runId, pageId: "memory:" + intent.runId,
+        capturedAt: intent.capturedAt,
+        text: "\n## [" + intent.capturedAt + "] outcome | " + intent.title +
+          "\n\nRun " + intent.runId + "; page memory:" + intent.runId + ".\n",
+      });
+    }
+    const changed = this.reviseClaims(projectId);
     const pages = this.store.all("memory", projectId);
-    await writeFile(
+    for (const page of pages.filter((page) => page.runId && (current.has(page.id) || changed.has(page.id))))
+      await this.writeIfChanged(join(folder, page.id + ".md"), this.pageMarkdown(page));
+    this.wikiCheckpoint("page");
+    await this.writeIfChanged(
       join(folder, "index.md"),
       "# Project memory\n\n" +
         pages
@@ -352,21 +551,102 @@ export class Engine extends EventEmitter {
           .join("\n") +
         "\n",
     );
-    const log = join(folder, "log.md");
-    const previous = await readFile(log, "utf8").catch(() => "# Memory log\n");
-    await writeFile(
-      log,
-      previous +
-        "\n## [" +
-        new Date().toISOString() +
-        "] outcome | " +
-        title +
-        "\n\nRun " +
-        runId +
-        "; page " +
-        record.id +
-        ".\n",
-    );
+    this.wikiCheckpoint("index");
+    await this.writeIfChanged(logPath, "# Memory log\n" + [...entries.values()]
+      .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt) || a.runId.localeCompare(b.runId))
+      .map((entry) => entry.text).join(""));
+    this.wikiCheckpoint("log");
+  }
+  async writeIfChanged(path: string, content: string) {
+    const existing = await readFile(path, "utf8").catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (existing !== content) await this.atomicWrite(path, content);
+  }
+  async atomicWrite(path: string, content: string) {
+    const temporary = path + "." + randomUUID() + ".tmp";
+    try { await writeFile(temporary, content, { flag: "wx" }); await rename(temporary, path); }
+    finally { await rm(temporary, { force: true }); }
+  }
+  reviseClaims(projectId: string) {
+    const pages = this.store.all("memory", projectId);
+    const changed = new Set<string>();
+    const groups = new Map<string, { page: RecordData; index: number; claim: any }[]>();
+    for (const page of pages) for (const [index, claim] of (page.claims ?? []).entries()) {
+      const key = claim.key.trim().toLowerCase();
+      const group = groups.get(key) ?? [];
+      group.push({ page, index, claim }); groups.set(key, group);
+    }
+    for (const page of pages) {
+      if (!page.claims?.length) continue;
+      const revisions = page.claims.map((claim: any, index: number) => {
+        const related = (groups.get(claim.key.trim().toLowerCase()) ?? [])
+          .filter((item) => (item.page.id !== page.id || item.index !== index) &&
+            item.claim.statement !== claim.statement);
+        // Source labels come from agent output. A new spelling cannot prove independence.
+        // An agent's proposed relation cannot establish independent corroboration.
+        return { ...claim, status: related.length || claim.relation === "supersedes" || claim.relation === "contradicts" ? "unresolved" : "reported",
+          related: related.map((item) => ({ pageId: item.page.id, claimIndex: item.index,
+            statement: item.claim.statement, sources: item.claim.sources })) };
+      });
+      if (JSON.stringify(page.claimRevisions) !== JSON.stringify(revisions)) {
+        this.store.patch(page.id, { claimRevisions: revisions });
+        changed.add(page.id);
+      }
+    }
+    return changed;
+  }
+  pageMarkdown(page: RecordData) {
+    return "# " + page.title + "\n\n" + page.content + "\n\n## Evidence\n\n- [Raw run](raw/" + page.runId + ".json)\n" +
+      page.sources.map((source: string) => "- " + source).join("\n") +
+      "\n\nStatus: agent-reported outcome; checks and PR state are separate evidence.\n" +
+      (page.claimRevisions?.length ? "\n## Claim revisions\n" + page.claimRevisions.map((claim: any) =>
+        "\n- **" + claim.status + (claim.relation === "supersedes" ? "; proposed supersession" : claim.relation === "contradicts" ? "; proposed contradiction" : "") + "** " + claim.key + ": " + claim.statement +
+        " (sources: " + claim.sources.join(", ") + ")" +
+        claim.related.map((item: any) => "\n  - Conflicts with [" + item.pageId + " claim " + (item.claimIndex + 1) + "](" + item.pageId + ".md): " + item.statement + " (sources: " + item.sources.join(", ") + ")").join("")
+      ).join("\n") + "\n" : "") +
+      ((page.checkEvidenceHistory?.length || page.checkEvidence || page.prEvidence) ? "\n## Separate evidence\n" +
+        (page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : [])).map((check: any) =>
+          "\n- [Check report](/api/verification/" + check.reportId + ") (source hash " + check.sourceHash + ")").join("") + "\n" +
+        (page.prEvidence ? "\n- [PR outcome](" + page.prEvidence.url + "): " + page.prEvidence.status + "; head " + page.prEvidence.headSha +
+          (page.prEvidence.mergedSha ? "; merged " + page.prEvidence.mergedSha : "") +
+          (page.prEvidence.mergeActor === "unverified" ? "; merge actor unverified" : "") + "\n" : "") : "");
+  }
+  async recordRunEvidence(taskId: string, evidence: Record<string, any>, runId?: string) {
+    const task = this.store.get(taskId);
+    const pages = this.store.all("memory", task.projectId);
+    // The optional lookup retains the existing PR publication path. Check
+    // callers provide the exact run, including failed retries without Memory.
+    const run = runId ? this.store.get(runId) : this.store.all("run", task.projectId).findLast((item) =>
+      item.taskId === taskId && item.role === "implementation" && item.status === "completed" &&
+      (pages.some((page) => page.runId === item.id) ||
+        this.store.all("wiki-ingest", task.projectId).some((intent) => intent.runId === item.id)));
+    if (run) {
+      if (run.projectId !== task.projectId || run.taskId !== taskId || run.role !== "implementation")
+        throw new Error("Evidence run does not match the implementation task.");
+      const current = pages.find((page) => page.runId === run.id);
+      const intent = this.store.all("wiki-ingest", task.projectId).find((item) => item.runId === run.id);
+      const existing = { ...run, ...current, ...intent?.pendingEvidence };
+      const check = evidence.checkEvidence;
+      const history = check ? existing.checkEvidenceHistory ??
+        (existing.checkEvidence ? [existing.checkEvidence] : []) : undefined;
+      const next = check ? {
+        ...evidence,
+        checkEvidenceHistory: history!.some((item: any) => item.reportId === check.reportId)
+          ? history : [...history!, check],
+      } : evidence;
+      // The run owns evidence even if it failed before wiki ingestion. An
+      // intent also keeps a durable copy for repair of its derived page.
+      this.store.patch(run.id, next);
+      const pendingEvidence = { ...intent?.pendingEvidence, ...next };
+      if (intent) this.store.patch(intent.id, { pendingEvidence });
+      if (current) {
+        const page = this.store.patch(current.id, pendingEvidence);
+        await this.writeIfChanged(join(this.dataDir, "wiki", task.projectId, page.id + ".md"), this.pageMarkdown(page));
+      }
+    }
+    return run?.id;
   }
   async plan(project: RecordData) {
     const memory = this.store
@@ -502,7 +782,7 @@ export class Engine extends EventEmitter {
     }
     this.store.patch(task.id, { status: "verifying", summary: result.summary });
     const report = project.checks.length
-      ? await this.verify(project, task, project.checks)
+      ? await this.verify(project, task, project.checks, false, this.store.get(task.id).implementationRunId)
       : undefined;
     const checks = report?.results ?? [];
     if (this.store.get(project.id).status !== "running") {
@@ -692,9 +972,11 @@ export class Engine extends EventEmitter {
       ]);
     }
     this.store.patch(task.id, { status: "awaiting_human", pr: url, sha });
+    const prRunId = await this.recordRunEvidence(task.id, { prEvidence: { url, headSha: sha, status: "awaiting_human" } });
     this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
       pr: url,
       sha,
+      prRunId,
     });
     this.store.patch(task.id, { status: "awaiting_human" });
     this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
@@ -735,6 +1017,7 @@ export class Engine extends EventEmitter {
         this.store.patch(gateId, { status: "reconciled", mergeRecovery: "Remote PR merged at the reviewed head; merge actor unverified.", mergedSha: info.mergeCommit?.oid, resolvedAt: new Date().toISOString() });
         this.store.patch(gate.taskId, { status: "completed" });
       });
+      await this.repairReconciledEvidence(this.store.get(gateId));
     } else if (info.state === "OPEN" && info.headRefOid === attempt.reviewedSha) {
       if (releaseOpenAttempt) {
         this.store.transaction(() => {
@@ -784,8 +1067,14 @@ export class Engine extends EventEmitter {
           this.changed("merge-reconciled", { gateId: gate.id }, gate.projectId);
         }
       } catch (error) {
-        const message = `Could not inspect PR after interrupted merge: ${String(error)}`;
-        this.store.patch(gate.id, { status: "open", mergeRecovery: message });
+        // A derived wiki failure cannot undo an already committed remote fact.
+        const current = this.store.get(gate.id);
+        if (current.status === "reconciled") {
+          this.store.patch(gate.id, { evidenceRecovery: `Merged PR evidence needs replay: ${String(error)}` });
+        } else {
+          const message = `Could not inspect PR after interrupted merge: ${String(error)}`;
+          this.store.patch(gate.id, { status: "open", mergeRecovery: message });
+        }
         this.changed("merge-reconciliation-error", { gateId: gate.id, error: String(error) }, gate.projectId);
       }
     }
@@ -812,18 +1101,24 @@ export class Engine extends EventEmitter {
       info.mergeable,
     );
     const project = this.store.get(gate.projectId);
+    const run = this.prEvidenceRun(gate, reviewedSha, true);
+    const intent = run && this.store.all("wiki-ingest", project.id).find((item) => item.runId === run.id && item.taskId === gate.taskId);
+    const existingPr = intent?.pendingEvidence?.prEvidence;
+    if (intent && (existingPr?.url !== gate.pr || existingPr?.headSha !== reviewedSha))
+      throw new Error("Wiki PR evidence does not match the approved revision.");
     this.store.transaction(() => {
       const current = this.store.get(gateId);
       if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha)
         throw new Error("This revision already has a merge attempt or is no longer open.");
       this.store.patch(gateId, {
         status: "merging",
-        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, requestedAt: new Date().toISOString() },
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, prRunId: run?.id, requestedAt: new Date().toISOString() },
       });
     });
     let result: any;
     try {
       result = JSON.parse(await this.mergeBroker([
+
         "api",
         "--method",
         "PUT",
@@ -847,6 +1142,10 @@ export class Engine extends EventEmitter {
       throw new Error(result.message ?? "GitHub did not merge this revision.");
     }
     this.store.transaction(() => {
+      const mergedPr = { ...existingPr, url: gate.pr, headSha: reviewedSha,
+        status: "merged", reviewedSha, mergedSha: result.sha };
+      if (run) this.store.patch(run.id, { prEvidence: mergedPr });
+      if (intent) this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence: mergedPr } });
       this.store.patch(gateId, {
         status: "approved",
         reviewedSha,
@@ -854,6 +1153,10 @@ export class Engine extends EventEmitter {
         resolvedAt: new Date().toISOString(),
       });
       this.store.patch(gate.taskId, { status: "completed" });
+      const page = run && this.store.all("memory", project.id).find((item) =>
+        item.runId === run.id && item.taskId === gate.taskId &&
+        item.prEvidence?.headSha === reviewedSha && item.prEvidence?.url === gate.pr);
+      if (page) this.store.patch(page.id, { prEvidence: mergedPr });
       this.store.recordGateResponse(
         gate,
         `Approved and merged revision ${reviewedSha}.`,
@@ -869,6 +1172,11 @@ export class Engine extends EventEmitter {
         createdAt: new Date().toISOString(),
       });
     });
+    const outcomePage = run && this.store.all("memory", project.id).find((item) =>
+      item.runId === run.id && item.taskId === gate.taskId &&
+      item.prEvidence?.headSha === reviewedSha && item.prEvidence?.url === gate.pr);
+    if (outcomePage) await this.atomicWrite(
+      join(this.dataDir, "wiki", project.id, outcomePage.id + ".md"), this.pageMarkdown(outcomePage));
     this.changed(
       "pr-merged",
       { gateId, reviewedSha, mergedSha: result.sha },
@@ -934,13 +1242,21 @@ export class Engine extends EventEmitter {
     });
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
-  async verify(project: RecordData, task: RecordData, commands: string[], cleanupFixtures = false) {
+  async verify(project: RecordData, task: RecordData, commands: string[], cleanupFixtures = false, runId?: string) {
+    const originatingRunId = runId ?? this.store.get(task.id).implementationRunId;
+    if (originatingRunId) {
+      const run = this.store.get(originatingRunId);
+      if (run.projectId !== project.id || run.taskId !== task.id || run.role !== "implementation" ||
+          task.projectId !== project.id)
+        throw new Error("Verification run does not match the implementation task.");
+    }
     const evaluatorHash = commands.includes("node --import tsx scripts/measure-refresh.ts")
       ? createHash("sha256").update(await readFile(join(task.worktree, "scripts/measure-refresh.ts"))).digest("hex")
       : undefined;
     const report = await this.verificationRunner({
       cwd: task.worktree,
       commands,
+      runId: originatingRunId,
       dataDir: this.dataDir,
       codexBinary: this.runtime.binary,
       protectedPorts: [4319, 5173, Number(process.env.PORT ?? 4319)],
@@ -956,6 +1272,13 @@ export class Engine extends EventEmitter {
         createdAt: report.createdAt,
       },
     });
+    if (originatingRunId) await this.recordRunEvidence(task.id, { checkEvidence: {
+      reportId: report.id,
+      sourceHash: report.sourceHash,
+      sourceUnchanged: report.sourceUnchanged,
+      results: report.results.map((result) => ({ command: result.command, code: result.code })),
+      createdAt: report.createdAt,
+    } }, originatingRunId);
     for (const result of report.results)
       this.changed(
         "check-completed",
@@ -1216,7 +1539,9 @@ Action retry: your specific decision permits continuing within existing capabili
           if (commands.length) {
             this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
             this.changed("judge-verification-started", { gateId: gate.id, taskId: task.id }, project.id);
-            report = await this.verify(project, task, commands, result.verificationRequests.includes("cleanup-test-fixtures"));
+            report = await this.verify(project, task, commands,
+              result.verificationRequests.includes("cleanup-test-fixtures"),
+              this.store.get(task.id).implementationRunId);
           }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
