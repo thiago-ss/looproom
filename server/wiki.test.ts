@@ -486,7 +486,7 @@ test("reconciled remote merge repairs exact run evidence after a derived-write c
     let engine = new Engine(store, runtime, dir);
     const pr = "https://github.com/owner/repo/pull/1";
     const head = "a".repeat(40), mergedSha = "b".repeat(40);
-    for (const [id, sha] of [["origin", head], ["newer", "c".repeat(40)]]) {
+    for (const [id, sha] of [["origin", head], ["newer", head]]) {
       store.put("run", { projectId: "p", taskId: "t", role: "implementation", status: "completed" }, id);
       await engine.document("p", id, "Outcome " + id, ["source-a"], id);
       await engine.recordRunEvidence("t", { prEvidence: { url: pr, headSha: sha, status: "awaiting_human" } }, id);
@@ -494,14 +494,15 @@ test("reconciled remote merge repairs exact run evidence after a derived-write c
     const rawPath = join(dir, "wiki", "p", "raw", "origin.json");
     const raw = await readFile(rawPath);
     store.put("gate", { projectId: "p", taskId: "t", type: "pr", status: "merging", pr,
-      sha: head, mergeAttempt: { pr, number: 1, reviewedSha: head, requestedAt: "attempt" } }, "g");
+      sha: head, mergeAttempt: { pr, number: 1, reviewedSha: head, prRunId: "origin", requestedAt: "attempt" } }, "g");
     let writes = 0;
     engine.mergeBroker = async (args: string[]) => {
       if (args[0] !== "pr") { writes++; throw new Error("Unexpected merge write"); }
       return JSON.stringify({ number: 1, url: pr, state: "MERGED", headRefOid: head, mergeCommit: { oid: mergedSha } });
     };
     engine.writeIfChanged = async () => { throw new Error("Derived write interrupted"); };
-    await assert.rejects(engine.reconcileMerge("g"), /Derived write interrupted/);
+    await engine.reconcileMerges();
+    assert.match(store.get("g").evidenceRecovery, /Derived write interrupted/);
     assert.equal(store.get("g").status, "reconciled");
     assert.equal(store.get("t").status, "completed");
     // Simulate evidence writes lost before replay; the remote fact remains durable.

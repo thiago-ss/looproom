@@ -392,6 +392,20 @@ export class Engine extends EventEmitter {
     }
     return intent;
   }
+  prEvidenceRun(gate: RecordData, headSha: string, strict = false) {
+    const matches = (pr: any) => pr?.url === gate.pr && pr.headSha === headSha;
+    const intents = this.store.all("wiki-ingest", gate.projectId);
+    const pages = this.store.all("memory", gate.projectId);
+    const candidates = this.store.all("run", gate.projectId).filter((run) =>
+      run.taskId === gate.taskId && run.role === "implementation" && run.status === "completed" &&
+      (matches(run.prEvidence) || intents.some((intent) => intent.runId === run.id && matches(intent.pendingEvidence?.prEvidence)) ||
+        pages.some((page) => page.runId === run.id && matches(page.prEvidence))));
+    const origin = gate.mergeAttempt?.prRunId ?? gate.prRunId;
+    const run = origin ? candidates.find((run) => run.id === origin) : candidates.length === 1 ? candidates[0] : undefined;
+    if (strict && !run && (origin || candidates.length > 1))
+      throw new Error("Originating PR evidence run is missing or ambiguous; review attribution before merging.");
+    return run;
+  }
   async repairReconciledEvidence(gate: RecordData) {
     const attempt = gate.mergeAttempt;
     if (gate.type !== "pr" || gate.status !== "reconciled" || !attempt ||
@@ -399,12 +413,13 @@ export class Engine extends EventEmitter {
     // A reconciled remote fact is not a human approval. Attribute only records
     // already tied to this exact PR/head, never the task's newest retry.
     const matches = (pr: any) => pr?.url === attempt.pr && pr.headSha === attempt.reviewedSha;
-    for (const run of this.store.all("run", gate.projectId).filter((run) =>
-      run.taskId === gate.taskId && run.role === "implementation")) {
+    const run = this.prEvidenceRun(gate, attempt.reviewedSha);
+    if (!run) return;
+    {
       const intent = this.store.all("wiki-ingest", gate.projectId).find((item) => item.runId === run.id);
       const page = this.store.all("memory", gate.projectId).find((item) => item.runId === run.id);
       const evidence = [run.prEvidence, intent?.pendingEvidence?.prEvidence, page?.prEvidence].find(matches);
-      if (!evidence) continue;
+      if (!evidence) return;
       const prEvidence = { ...evidence, status: "merged", mergedSha: gate.mergedSha,
         mergeActor: "unverified", reconciledAt: gate.resolvedAt };
       this.store.transaction(() => {
@@ -633,6 +648,7 @@ export class Engine extends EventEmitter {
         await this.writeIfChanged(join(this.dataDir, "wiki", task.projectId, page.id + ".md"), this.pageMarkdown(page));
       }
     }
+    return run?.id;
   }
   async plan(project: RecordData) {
     const memory = this.store
@@ -958,10 +974,11 @@ export class Engine extends EventEmitter {
       ]);
     }
     this.store.patch(task.id, { status: "awaiting_human", pr: url, sha });
-    await this.recordRunEvidence(task.id, { prEvidence: { url, headSha: sha, status: "awaiting_human" } });
+    const prRunId = await this.recordRunEvidence(task.id, { prEvidence: { url, headSha: sha, status: "awaiting_human" } });
     this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
       pr: url,
       sha,
+      prRunId,
     });
     this.store.patch(task.id, { status: "awaiting_human" });
     this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
@@ -1052,8 +1069,14 @@ export class Engine extends EventEmitter {
           this.changed("merge-reconciled", { gateId: gate.id }, gate.projectId);
         }
       } catch (error) {
-        const message = `Could not inspect PR after interrupted merge: ${String(error)}`;
-        this.store.patch(gate.id, { status: "open", mergeRecovery: message });
+        // A derived wiki failure cannot undo an already committed remote fact.
+        const current = this.store.get(gate.id);
+        if (current.status === "reconciled") {
+          this.store.patch(gate.id, { evidenceRecovery: `Merged PR evidence needs replay: ${String(error)}` });
+        } else {
+          const message = `Could not inspect PR after interrupted merge: ${String(error)}`;
+          this.store.patch(gate.id, { status: "open", mergeRecovery: message });
+        }
         this.changed("merge-reconciliation-error", { gateId: gate.id, error: String(error) }, gate.projectId);
       }
     }
@@ -1080,11 +1103,7 @@ export class Engine extends EventEmitter {
       info.mergeable,
     );
     const project = this.store.get(gate.projectId);
-    const run = this.store.all("run", project.id).findLast((item) =>
-      item.taskId === gate.taskId && item.role === "implementation" && item.status === "completed" &&
-      (this.store.all("wiki-ingest", project.id).some((intent) => intent.runId === item.id && intent.taskId === gate.taskId) ||
-        this.store.all("memory", project.id).some((page) => page.runId === item.id && page.taskId === gate.taskId &&
-          page.prEvidence?.url === gate.pr && page.prEvidence?.headSha === reviewedSha)));
+    const run = this.prEvidenceRun(gate, reviewedSha, true);
     const intent = run && this.store.all("wiki-ingest", project.id).find((item) => item.runId === run.id && item.taskId === gate.taskId);
     const existingPr = intent?.pendingEvidence?.prEvidence;
     if (intent && (existingPr?.url !== gate.pr || existingPr?.headSha !== reviewedSha))
@@ -1095,7 +1114,7 @@ export class Engine extends EventEmitter {
         throw new Error("This revision already has a merge attempt or is no longer open.");
       this.store.patch(gateId, {
         status: "merging",
-        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, requestedAt: new Date().toISOString() },
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, prRunId: run?.id, requestedAt: new Date().toISOString() },
       });
     });
     let result: any;
