@@ -186,6 +186,7 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
       f.store.patch(t.id, { checks: [{ command: "fixture-check", code: 0, output: "fixture" }] });
       return { sourceUnchanged: true, results: [{ command: "fixture-check", code: 0, output: "fixture" }] } as any;
     };
+    f.engine.prInfo = async () => ({ number: 1, url, baseRefName: "main", state: "OPEN", headRefOid: await git(tree.path, ["rev-parse", "origin/" + tree.branch]), mergeable: "MERGEABLE" });
     f.engine.githubRunner = async args => { assert.equal(args[0], "auth"); return "fixture"; };
     await f.engine.implement(f.store.get(project.id), task);
     const published = f.store.get(task.id);
@@ -306,7 +307,7 @@ test("publication rejects added source or index changes after review instead of 
   try {
     const repo = await createRepo(join(f.dir, "review-guard-repo"));
     await writeFile(join(repo.path, "new.txt"), "reviewed contents\n");
-    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", attempt: 1, checks: [], review: { verdict: "pass" } });
+    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", pr: null, attempt: 1, checks: [], review: { verdict: "pass" } });
     await f.engine.stageProduct(task);
     const source = { sourceHash: await sourceFingerprint(repo.path), tree: await git(repo.path, ["write-tree"]), head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" };
     task = f.store.patch(task.id, { reviewedSource: source });
@@ -344,7 +345,7 @@ test("a formatting commit hook invalidates publication until its new source is v
   try {
     const repo = await createRepo(join(f.dir, "hook-guard-repo"));
     await writeFile(join(repo.path, "new.txt"), "checked source\n");
-    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", attempt: 1, title: "Source", checks: [], review: { verdict: "pass" } });
+    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", pr: null, attempt: 1, title: "Source", checks: [], review: { verdict: "pass" } });
     await f.engine.stageProduct(task);
     task = f.store.patch(task.id, { reviewedSource: { sourceHash: await sourceFingerprint(repo.path), tree: await git(repo.path, ["write-tree"]), head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" } });
     await writeFile(join(repo.path, ".git/hooks/pre-commit"), '#!/bin/sh\nprintf "formatted after review\\n" > new.txt\ngit add new.txt\n', { mode: 0o755 });
@@ -378,7 +379,7 @@ test("a hook that changes commit parents while retaining reviewed files cannot p
   try {
     const repo = await createRepo(join(f.dir, "parent-guard-repo"));
     await writeFile(join(repo.path, "new.txt"), "checked source\n");
-    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", attempt: 1, title: "Source", checks: [], review: { verdict: "pass" } });
+    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", pr: null, attempt: 1, title: "Source", checks: [], review: { verdict: "pass" } });
     await f.engine.stageProduct(task);
     const tree = await git(repo.path, ["write-tree"]);
     task = f.store.patch(task.id, { reviewedSource: { sourceHash: await sourceFingerprint(repo.path), tree, head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" } });
@@ -427,6 +428,68 @@ test("request changes on a paused project queues the task without resuming its a
     f.store.patch(f.project.id, { status: "running" });
     f.engine.tick(); await new Promise(resolve => setImmediate(resolve));
     assert.equal(starts, 1);
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("superseded repair PRs remain observed without marking active unmerged repairs complete", async () => {
+  const f = await fixture("paused");
+  try {
+    f.setInfo({ state: "OPEN", mergeable: "CONFLICTING" });
+    await f.engine.syncProject(f.project.id);
+    f.store.patch(f.task.id, { status: "running" });
+    f.engine.busy.add("task:" + f.task.id);
+    f.setInfo({ state: "MERGED", mergeable: "MERGEABLE" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.gate.id).status, "superseded");
+    assert.equal(f.store.get(f.task.id).status, "running");
+    assert.equal(f.store.get(f.task.id).prRepair.remoteObservation.state, "MERGED");
+    f.engine.busy.clear();
+    const retired = await f.engine.preparePrRepair(f.project, f.store.get(f.task.id));
+    assert.equal(retired.pr, null);
+    assert.equal(retired.status, "ready");
+    assert.equal(retired.followupPr.state, "MERGED");
+    assert.equal(f.store.get(f.gate.id).status, "reconciled");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("a PR merging across publication preserves remaining code for a newly reviewed PR", async () => {
+  const f = await fixture("running");
+  try {
+    const repo = await createRepo(join(f.dir, "merge-race-repo"));
+    await git(repo.path, ["config", "user.name", "Fixture"]); await git(repo.path, ["config", "user.email", "fixture@localhost"]);
+    const base = await git(repo.path, ["rev-parse", "HEAD"]);
+    const origin = join(f.dir, "merge-race-origin.git");
+    await git(repo.path, ["clone", "--bare", repo.path, origin]); await git(repo.path, ["remote", "add", "origin", origin]);
+    const tree = await createWorktree(repo.path, f.dir, f.task.id);
+    await writeFile(join(tree.path, "original.txt"), "original feature\n"); await git(tree.path, ["add", "."]); await git(tree.path, ["commit", "-m", "Original"]); await git(tree.path, ["push", "origin", tree.branch]);
+    const original = await git(tree.path, ["rev-parse", "HEAD"]);
+    await writeFile(join(tree.path, "extra.txt"), "additional repair\n");
+    const project = f.store.patch(f.project.id, { path: repo.path });
+    let task = f.store.patch(f.task.id, { worktree: tree.path, branch: tree.branch, baseSha: base, sha: original, status: "verifying", attempt: 1, checks: [], review: { verdict: "pass" }, title: "Repair" });
+    f.store.patch(f.gate.id, { sha: original });
+    await f.engine.stageProduct(task);
+    const source = { sourceHash: await sourceFingerprint(tree.path), tree: await git(tree.path, ["write-tree"]), head: original, mergeHead: "" };
+    task = f.store.patch(task.id, { reviewedSource: source });
+    let reads = 0;
+    f.engine.prInfo = async () => {
+      reads++;
+      if (reads === 1) return { number: 1, url, baseRefName: "main", headRefOid: original, state: "OPEN" };
+      await git(repo.path, ["merge", "--no-ff", original, "-m", "Human merged original"]); await git(repo.path, ["push", "origin", "main"]);
+      return { number: 1, url, baseRefName: "main", headRefOid: await git(tree.path, ["rev-parse", "HEAD"]), state: "MERGED", mergedAt: new Date().toISOString(), mergeCommit: { oid: await git(repo.path, ["rev-parse", "HEAD"]) } };
+    };
+    f.engine.githubRunner = async args => { assert.equal(args[0], "auth"); return "fixture"; };
+    await f.engine.publish(project, task);
+    const pending = f.store.get(task.id);
+    assert.equal(pending.status, "ready"); assert.equal(pending.pr, null); assert.equal(pending.followupPr.state, "MERGED");
+    assert.equal(await git(tree.path, ["show", "HEAD:extra.txt"]), "additional repair");
+    assert.notEqual(await git(repo.path, ["rev-parse", "HEAD^{tree}"]), source.tree);
+    const candidate = await git(tree.path, ["rev-parse", "HEAD"]);
+    task = f.store.patch(task.id, { status: "verifying", reviewedSource: { ...source, head: candidate } });
+    f.engine.createPrOrReuse = async () => "https://github.com/example/repo/pull/2";
+    await f.engine.publish(project, task);
+    assert.equal(f.store.get(task.id).status, "awaiting_human"); assert.equal(f.store.get(task.id).pr, "https://github.com/example/repo/pull/2");
     assert.equal(f.store.all("approval").length, 0);
   } finally { await f.close(); }
 });

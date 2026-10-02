@@ -761,6 +761,7 @@ export class Engine extends EventEmitter {
   }
   async implement(project: RecordData, task: RecordData) {
     if (task.prRepair) task = await this.preparePrRepair(project, task);
+    if (this.closed || task.status === "blocked" || this.store.get(project.id).status !== "running") return;
     if (!task.worktree) {
       let base = "HEAD";
       if (project.github) {
@@ -996,6 +997,23 @@ export class Engine extends EventEmitter {
     if (await git(task.worktree, ["diff", "--name-only", "--diff-filter=U"]))
       throw new Error("Resolve all merge conflicts before publication.");
     const merging = !!(await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => ""));
+    if (task.pr) {
+      const { gate, info } = await this.publicationPrInfo(project, task);
+      if (this.closed) return;
+      if (info.state !== "OPEN") { this.retireRepairPr(project, task, gate, info); return; }
+      if (![task.prRepair?.expectedHead, task.sha, task.reviewedSource?.head].includes(info.headRefOid))
+        throw new Error("Remote PR head changed during implementation; preserve this work and refresh integration before publication.");
+    }
+    if (!task.pr && task.followupPr?.state === "MERGED") {
+      await git(project.path, ["fetch", "origin", project.branch]);
+      const baseSha = await git(project.path, ["rev-parse", "refs/remotes/origin/" + project.branch]);
+      const baseTree = await git(project.path, ["rev-parse", baseSha + "^{tree}"]);
+      if (baseTree === task.reviewedSource?.tree && await this.reviewedSourceMatches(task)) {
+        this.store.patch(task.id, { status: "completed", completedReason: "Verified source already exists in the merged base.", mergedBaseEvidence: { baseSha, baseTree, pr: task.followupPr.url } });
+        this.changed("task-completed", { taskId: task.id, baseSha, baseTree }, project.id);
+        return;
+      }
+    }
     const productPaths = ["--", ".", ":(top,exclude).looproom-verification"];
     const diff = await git(task.worktree, ["status", "--porcelain", ...productPaths]);
     if (!(await this.reviewedSourceMatches(task))) {
@@ -1004,7 +1022,12 @@ export class Engine extends EventEmitter {
         "Repeat checks and review before publishing the changed source or Git tree.", "check");
       return;
     }
-    if (!diff && !task.pr) {
+    const publicationBase = task.prRepair?.baseSha ?? task.baseSha ??
+      await git(task.worktree, ["merge-base", "HEAD", project.branch]).catch(() => "");
+    const alreadyCommittedChanges = publicationBase
+      ? task.reviewedSource.tree !== await git(task.worktree, ["rev-parse", publicationBase + "^{tree}"])
+      : true;
+    if (!diff && !task.pr && !alreadyCommittedChanges) {
       this.store.patch(task.id, {
         status: "completed",
         summary: task.summary + "\nNo code changes were needed.",
@@ -1037,6 +1060,12 @@ export class Engine extends EventEmitter {
     }
     await git(task.worktree, ["push", "origin", task.branch]);
     const sha = await git(task.worktree, ["rev-parse", "HEAD"]);
+    if (task.pr) {
+      const { gate, info } = await this.publicationPrInfo(project, task);
+      if (this.closed) return;
+      if (info.state !== "OPEN") { this.retireRepairPr(project, task, gate, info); return; }
+      if (info.headRefOid !== sha) throw new Error("GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.");
+    }
     let url = task.pr;
     if (!url) {
       const bodyPath = join(this.dataDir, "pr-" + task.id + ".md");
@@ -1056,6 +1085,31 @@ export class Engine extends EventEmitter {
     });
     this.store.patch(task.id, { status: "awaiting_human" });
     this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
+  }
+  async publicationPrInfo(project: RecordData, task: RecordData) {
+    const gate = this.store.all("gate", project.id).findLast(g => g.type === "pr" && g.taskId === task.id && g.pr === task.pr);
+    if (!gate) throw new Error("Existing PR has no matching durable task gate.");
+    const info = await this.prInfo(gate.id);
+    if (!this.closed) this.validateRemotePr(gate, project, info);
+    return { gate, info };
+  }
+  retireRepairPr(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    if (this.closed) return;
+    const observedAt = new Date().toISOString();
+    const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid,
+      base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
+    this.store.transaction(() => {
+      this.store.patch(gate.id, { remoteObservation: observation,
+        ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
+      this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
+        baseSha: task.prRepair?.baseSha ?? task.baseSha,
+        followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
+        feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
+      this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
+        text: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
+    });
+    if (info.state !== "MERGED") this.gate(project.id, "PR closed during integration", "Decide whether remaining work needs a fresh PR or should be discarded. The earlier PR was closed without merging.", "publication", task.id);
+    this.changed("repair-pr-retired", { taskId: task.id, ...observation }, project.id);
   }
   async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
     try {
@@ -1096,14 +1150,15 @@ export class Engine extends EventEmitter {
     let failed = false;
     try {
       const gates = this.store.all("gate", projectId).filter(g =>
-        g.type === "pr" && ["open", "merging"].includes(g.status));
+        g.type === "pr" && (["open", "merging"].includes(g.status) ||
+          (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id)));
       for (const snapshot of gates) {
         if (this.closed) return;
         if (this.prDecisionBusy.has(snapshot.id)) continue;
         this.prDecisionBusy.add(snapshot.id);
         try {
           const gate = this.store.get(snapshot.id);
-          if (!["open", "merging"].includes(gate.status)) continue;
+          if (!["open", "merging", "superseded"].includes(gate.status)) continue;
           if (gate.mergeAttempt) { await this.reconcileMergeReserved(gate.id); continue; }
           const info = await this.prInfo(gate.id);
           if (this.closed) return;
@@ -1113,6 +1168,16 @@ export class Engine extends EventEmitter {
             throw new Error("Remote PR identity, base or head does not match this project.");
           const task = this.store.get(gate.taskId, "task");
           if (task.projectId !== projectId) throw new Error("Remote PR task belongs to another project.");
+          if (gate.status === "superseded") {
+            const previous = gate.remoteObservation;
+            if (previous?.state !== info.state || previous?.headSha !== info.headRefOid || previous?.mergeable !== info.mergeable) {
+              const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt: new Date().toISOString() };
+              this.store.patch(gate.id, { remoteObservation: observation });
+              if (task.prRepair?.gateId === gate.id) this.store.patch(task.id, { prRepair: { ...task.prRepair, remoteObservation: observation } });
+              this.changed("repair-pr-observed", { gateId: gate.id, ...observation }, projectId);
+            }
+            continue;
+          }
           if (this.busy.has("task:" + task.id) || this.store.all("run", projectId).some(r => r.taskId === task.id && r.status === "running")) continue;
           const observedAt = new Date().toISOString();
           const observation = { url: info.url, number: info.number, state: info.state,
@@ -1193,6 +1258,12 @@ export class Engine extends EventEmitter {
   }
   async preparePrRepair(project: RecordData, task: RecordData) {
     const repair = task.prRepair;
+    const current = await this.publicationPrInfo(project, task);
+    if (this.closed) return task;
+    if (current.info.state !== "OPEN") {
+      this.retireRepairPr(project, task, current.gate, current.info);
+      return this.store.get(task.id);
+    }
     if (!task.worktree || !task.branch || repair.pr !== task.pr || repair.base !== project.branch)
       throw new Error("PR repair has no matching preserved task worktree.");
     if (await this.gitRunner(task.worktree, ["branch", "--show-current"]) !== task.branch)
@@ -2087,7 +2158,7 @@ Action retry: your specific decision permits continuing within existing capabili
     for (const project of this.store.all("project")) {
       if (!project.github || !project.branch || this.syncingProjects.has(project.id) ||
           (this.nextRemoteSync.get(project.id) ?? 0) > Date.now()) continue;
-      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" && ["open", "merging"].includes(g.status)))
+      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" && (["open", "merging"].includes(g.status) || (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id))))
         void this.syncProject(project.id);
     }
     const limit = this.settings().concurrency;
