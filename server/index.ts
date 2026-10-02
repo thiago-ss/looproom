@@ -74,6 +74,7 @@ const runtime = new Runtime(
   join(canonicalDataDir, "codex"),
 );
 const engine = new Engine(store, runtime, canonicalDataDir);
+await engine.recoverWiki();
 const app = express();
 const session = randomBytes(32).toString("hex");
 app.disable("x-powered-by");
@@ -443,6 +444,13 @@ app.post(
   }),
 );
 app.post(
+  "/api/gates/:id/reconcile-merge",
+  route(async (req, res) => {
+    await engine.reconcileMerge(String(req.params.id), true);
+    res.json({ ok: true });
+  }),
+);
+app.post(
   "/api/gates/:id/resolve",
   route(async (req, res) => {
     const body = z
@@ -478,6 +486,18 @@ app.post(
 app.get("/api/projects/:id/memory", (req, res) =>
   res.json(store.search(String(req.params.id), String(req.query.q ?? ""))),
 );
+app.get("/api/verification/:id", route(async (req, res) => {
+  const id = String(req.params.id);
+  if (!/^[0-9a-f-]{36}$/i.test(id) ||
+      !store.all("memory").some((page) =>
+        (page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : []))
+          .some((check: { reportId: string }) => check.reportId === id))) {
+    res.status(404).json({ error: "Check report not found." });
+    return;
+  }
+  const report = await readFile(join(dataDir, "verification", id + ".json"), "utf8");
+  res.type("json").send(report);
+}));
 app.get(
   "/api/tasks/:id/diff",
   route(async (req, res) => {

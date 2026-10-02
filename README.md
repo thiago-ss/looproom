@@ -63,7 +63,7 @@ One coordinator owns dispatch, SQLite writes and publication. One to four concur
 
 Named Codex permission profiles deny reads outside the assigned workspace and minimum toolchain paths, keep Git metadata read-only, carve out environment/key files and deny direct network access. The native macOS smoke test verifies these worker boundaries. Model/auth service traffic is separate from worker shell traffic. See [the permission documentation](https://learn.chatgpt.com/docs/permissions).
 
-Completed runs create `wiki/<project-id>/raw/<run-id>.json` with hashes, cited Markdown pages, an index and an append-only content log. Agent reports remain labeled as reports; checks and PR results are separate evidence. SQLite owns live state. Restart pauses interrupted work and opens a recovery gate. The wiki does not store hidden reasoning.
+Completed runs create `wiki/<project-id>/raw/<run-id>.json` with hashes, cited Markdown pages, an index and a chronological content log. Run completion and its durable ingestion intent commit together; restart repairs incomplete wiki writes without changing raw captures. Structured claim revisions retain conflicting source references and explicit unresolved status. Agent proposed supersession stays unresolved until independent evidence can establish it. Checks and PR outcomes are separate evidence attached to their originating run in Memory. SQLite owns live state. Restart pauses interrupted work and opens a recovery gate. The wiki does not store hidden reasoning. Reconciliation with the original parent wiki remains pending because runtime workers cannot access it.
 
 Workflow adaptation and exact v0 boundaries: [Looproom v1](docs/workflows/looproom-v1.md). Original references: [resources](docs/resources.md). Defaults: [model profiles](config/model-profiles.json).
 
@@ -79,7 +79,7 @@ Forty-two tests cover scoped gates, concurrent reservation, attributed judge rep
 
 ## Remaining work
 
-Native independent review and PR round-trip; simultaneous native task/PR pipelines; contradiction review and versioned memory synthesis; protected experiment harness and evaluator promotion; Jev comparison against FTS5; accessibility and performance benchmarks with representative projects; signed macOS distribution. Runtime threads are recorded for audit; retries currently use a fresh thread with preserved worktree and project memory.
+Native independent review and PR round-trip; simultaneous native task/PR pipelines; semantic contradiction review beyond structured claim keys and parent-wiki reconciliation; protected experiment harness and evaluator promotion; Jev comparison against FTS5; accessibility and performance benchmarks with representative projects; signed macOS distribution. Runtime threads are recorded for audit; retries currently use a fresh thread with preserved worktree and project memory.
 
 ## License
 

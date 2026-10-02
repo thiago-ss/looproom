@@ -18,6 +18,8 @@ test("SQLite survives restart, searches only the selected project, and rolls bac
     );
     store.memory("two", "Worktree isolation", "Private second project.", []);
     assert.equal(store.search("one", 'worktree " OR **').length, 1);
+    assert.equal(store.search("two", "sandbox").length, 0);
+    assert.equal(store.search("two", "worktree")[0].projectId, "two");
     assert.throws(() =>
       store.transaction(() => {
         store.put("task", { projectId: "one" }, "rolled-back");
