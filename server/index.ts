@@ -138,7 +138,7 @@ runtime.on("disconnected", (error) => {
 app.get("/api/health", (_req, res) =>
   res.json({ app: "looproom", status: "ok" }),
 );
-app.get("/api/state", (_req, res) =>
+app.get("/api/state", (req, res) =>
   res.json({
     projects: store.all("project"),
     tasks: store.all("task"),
@@ -147,7 +147,7 @@ app.get("/api/state", (_req, res) =>
     messages: store.conversation(),
     runs: store.all("run").map(({ output, ...run }) => run),
     memory: store.all("memory"),
-    events: store.events(),
+    events: req.query.events === "1" ? store.events() : [],
     settings: store.get("settings"),
     runtime: runtimeState,
   }),

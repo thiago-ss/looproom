@@ -73,6 +73,7 @@ import { Switch } from "./components/ui/switch";
 const Work = lazy(() => import("./components/Work"));
 import { frontierState, frontierLabel, waitingOnBlocker } from "./lib/work";
 import { api, type Data } from "./lib/api";
+import { createRefresh } from "./lib/refresh";
 
 const Memory = lazy(() => import("./components/Memory"));
 const Room = lazy(() => import("./components/AgentRoom"));
@@ -176,6 +177,11 @@ export default function App() {
   );
   const [view, setView] = useState<View>("goal"),
     [onboarding, setOnboarding] = useState(false);
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const roomFetchRef = useRef(false);
+  const [roomHistoryStatus, setRoomHistoryStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [roomHistoryError, setRoomHistoryError] = useState("");
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [inspect, setInspect] = useState<any>(null);
@@ -185,24 +191,36 @@ export default function App() {
     setInspect(task);
   }
   const refreshRef = useRef<() => Promise<void>>(async () => {});
-  refreshRef.current = async () => {
-    try {
-      setData(await api("/state"));
-      setConnectionError("");
-    } catch (error) {
-      setConnectionError((error as Error).message);
-    }
-  };
   useEffect(() => {
     let alive = true;
-    void api<Data>("/state")
-      .then((state) => {
-        if (alive) {
-          setData(state);
+    let initialized = false;
+    const refresh = createRefresh(
+      () => {
+        roomFetchRef.current = viewRef.current === "room";
+        return api<Data>(roomFetchRef.current ? "/state?events=1" : "/state");
+      },
+      (state) => {
+        setData(state);
+        setConnectionError("");
+        if (roomFetchRef.current && viewRef.current === "room") {
+          setRoomHistoryStatus("ready");
+          setRoomHistoryError("");
+        }
+        if (!initialized) {
+          initialized = true;
           if (!state.projects.length) setOnboarding(true);
         }
-      })
-      .catch((error) => setConnectionError(error.message));
+      },
+      (error) => {
+        setConnectionError(error.message);
+        if (roomFetchRef.current && viewRef.current === "room") {
+          setRoomHistoryStatus("error");
+          setRoomHistoryError(error.message);
+        }
+      },
+    );
+    refreshRef.current = refresh.request;
+    void refresh.request();
     const events = new EventSource("/api/events");
     events.onmessage = () => {
       if (alive) void refreshRef.current();
@@ -212,10 +230,20 @@ export default function App() {
     }, 15000);
     return () => {
       alive = false;
+      refresh.dispose();
       clearInterval(timer);
       events.close();
     };
   }, []);
+  useLayoutEffect(() => {
+    if (view === "room") {
+      setRoomHistoryStatus("loading");
+      setRoomHistoryError("");
+      void refreshRef.current();
+    } else {
+      setRoomHistoryStatus("idle");
+    }
+  }, [view]);
   const project =
     data?.projects.find((project) => project.id === selectedId) ??
     data?.projects[0];
@@ -484,6 +512,13 @@ export default function App() {
                       events={data.events.filter(
                         (event) => event.project_id === project.id,
                       )}
+                      historyStatus={roomHistoryStatus === "idle" ? "loading" : roomHistoryStatus}
+                      historyError={roomHistoryError}
+                      retryHistory={() => {
+                        setRoomHistoryStatus("loading");
+                        setRoomHistoryError("");
+                        void refreshRef.current();
+                      }}
                     />
                   </Suspense>
                 ) : null}

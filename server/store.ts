@@ -1,5 +1,5 @@
 import { escalationMode } from "../src/lib/autonomy.ts";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
@@ -7,6 +7,7 @@ import { dirname } from "node:path";
 export type RecordData = { id: string; [key: string]: any };
 export class Store {
   db: DatabaseSync;
+  private allRecordsStatement: StatementSync;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
@@ -16,11 +17,12 @@ export class Store {
       CREATE INDEX IF NOT EXISTS record_kind ON records(kind);
       CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, project_id UNINDEXED, title, content);`);
+    this.allRecordsStatement = this.db.prepare(
+      "SELECT data FROM records WHERE kind=? ORDER BY rowid",
+    );
   }
   all(kind: string, projectId?: string): RecordData[] {
-    const rows = this.db
-      .prepare("SELECT data FROM records WHERE kind=? ORDER BY rowid")
-      .all(kind) as { data: string }[];
+    const rows = this.allRecordsStatement.all(kind) as { data: string }[];
     return rows
       .map((row) => JSON.parse(row.data))
       .filter((row) => !projectId || row.projectId === projectId);

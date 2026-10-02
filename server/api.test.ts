@@ -100,6 +100,10 @@ test("local API requires a session, rejects foreign origins and keeps projects a
     assert.equal(response.status, 200);
     const created = await response.json();
     assert.equal(created.status, "paused");
+    response = await fetch(url + "/api/state");
+    assert.deepEqual((await response.json()).events, []);
+    response = await fetch(url + "/api/state?events=1");
+    assert.ok((await response.json()).events.length > 0);
     const settingHeaders = {
       "content-type": "application/json",
       "x-looproom-client": "ui",

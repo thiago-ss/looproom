@@ -14,6 +14,7 @@ import { Button } from "./ui/button";
 import { Tooltip } from "./ui/tooltip";
 import { Badge } from "./ui/badge";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
+import { DotmSquare3 } from "./ui/dotm-square-3";
 const Orb = lazy(() => import("./AgentOrb"));
 const roles = [
   {
@@ -43,6 +44,9 @@ export default function AgentRoom({
   tasks,
   settings,
   events,
+  historyStatus,
+  historyError,
+  retryHistory,
   onSelectTask,
 }: any) {
   const [selected, setSelected] = useState("orchestrator"),
@@ -242,7 +246,17 @@ export default function AgentRoom({
         </Tabs>
       </div>
       <div className="room-feed">
-        {visibleEvents.length ? (
+        {historyStatus === "loading" ? (
+          <div className="room-feed-empty" role="status">
+            <DotmSquare3 size={20} dotSize={3} color="var(--lr-signal)" />
+            <p>Loading recorded activity…</p>
+          </div>
+        ) : historyStatus === "error" ? (
+          <Alert tone="danger" title="Could not load recorded activity">
+            <span>{historyError} </span>
+            <Button variant="ghost" onClick={retryHistory}>Retry</Button>
+          </Alert>
+        ) : visibleEvents.length ? (
           visibleEvents.slice(0, 18).map((event: any) => (
             <div className="room-event" key={event.seq}>
               <span
