@@ -107,7 +107,9 @@ export class Engine extends EventEmitter {
   documentation = new Map<string, Promise<void>>();
   timer?: ReturnType<typeof setInterval>;
   verificationRunner = runVerification;
-  github = gh;
+  mergeBroker = gh;
+  get github() { return this.mergeBroker; }
+  set github(broker: typeof gh) { this.mergeBroker = broker; }
   wikiFailureStage?: string;
   wikiCheckpoint(stage: string) {
     if (this.wikiFailureStage === stage) throw new Error("Injected wiki failure: " + stage);
@@ -128,6 +130,9 @@ export class Engine extends EventEmitter {
   }
   start() {
     this.timer = setInterval(() => this.tick(), 1500);
+    void this.reconcileMerges().catch((error) =>
+      this.changed("merge-reconciliation-error", { error: String(error) }),
+    );
     this.tick();
   }
   close() {
@@ -936,26 +941,108 @@ export class Engine extends EventEmitter {
     const gate = this.store.get(gateId);
     if (gate.type !== "pr") throw new Error("This gate is not a pull request.");
     return JSON.parse(
-      await this.github([
+      await this.mergeBroker([
         "pr",
         "view",
         gate.pr,
         "--json",
-        "number,url,title,headRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName",
+        "number,url,title,headRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt",
       ]),
     );
+  }
+  mergeTarget(pr: string, number: number) {
+    const match = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/([1-9]\d*)$/.exec(pr);
+    if (!match || Number(match[3]) !== number)
+      throw new Error("Pull request URL and number do not identify the same GitHub PR.");
+    return `repos/${match[1]}/${match[2]}/pulls/${number}/merge`;
+  }
+  async reconcileMerge(gateId: string, releaseOpenAttempt = false) {
+    const gate = this.store.get(gateId);
+    if (gate.type !== "pr" || !gate.mergeAttempt || !["merging", "open"].includes(gate.status))
+      throw new Error("No interrupted PR merge to reconcile.");
+    const attempt = gate.mergeAttempt;
+    this.mergeTarget(attempt.pr, attempt.number);
+    const info = await this.prInfo(gateId);
+    if (info.url !== gate.pr || info.url !== attempt.pr || info.number !== attempt.number)
+      throw new Error("PR identity changed; inspect GitHub before continuing.");
+    if (info.state === "MERGED" && info.headRefOid === attempt.reviewedSha) {
+      this.store.transaction(() => {
+        const current = this.store.get(gateId);
+        if (current.mergeAttempt?.requestedAt !== attempt.requestedAt || !["merging", "open"].includes(current.status))
+          throw new Error("Merge attempt changed during reconciliation.");
+        this.store.patch(gateId, { status: "reconciled", mergeRecovery: "Remote PR merged at the reviewed head; merge actor unverified.", mergedSha: info.mergeCommit?.oid, resolvedAt: new Date().toISOString() });
+        this.store.patch(gate.taskId, { status: "completed" });
+      });
+    } else if (info.state === "OPEN" && info.headRefOid === attempt.reviewedSha) {
+      if (releaseOpenAttempt) {
+        this.store.transaction(() => {
+          const current = this.store.get(gateId);
+          if (current.status !== "open" || current.mergeAttempt?.requestedAt !== attempt.requestedAt)
+            throw new Error("Merge attempt changed during reconciliation.");
+          this.store.patch(gateId, {
+            mergeAttempt: null,
+            mergeAttempts: [...(current.mergeAttempts ?? []), attempt],
+            mergeRecovery: null,
+          });
+        });
+      } else {
+        this.store.patch(gateId, { status: "open", mergeRecovery: "Merge result uncertain. GitHub reports the reviewed PR still open; reconcile before another approval." });
+      }
+    } else {
+      const changedHead = info.state === "OPEN" && /^[0-9a-f]{40}$/i.test(info.headRefOid ?? "") && info.headRefOid !== attempt.reviewedSha;
+      const closedUnmerged = info.state === "CLOSED" && info.mergedAt === null;
+      const message = changedHead
+        ? "GitHub reports a different PR head. This attempt cannot authorize it. Request changes to verify and publish the new revision."
+        : closedUnmerged
+          ? "GitHub reports the PR closed without a merge. Request changes to retry the task."
+          : "Remote merge state is ambiguous; inspect GitHub before releasing this attempt.";
+      if (releaseOpenAttempt && (changedHead || closedUnmerged)) {
+        this.store.transaction(() => {
+          const current = this.store.get(gateId);
+          if (current.status !== "open" || current.mergeAttempt?.requestedAt !== attempt.requestedAt)
+            throw new Error("Merge attempt changed during reconciliation.");
+          this.store.patch(gateId, {
+            mergeAttempt: null,
+            mergeAttempts: [...(current.mergeAttempts ?? []), attempt],
+            mergeRecovery: message,
+          });
+        });
+      } else {
+        this.store.patch(gateId, { status: "open", mergeRecovery: message });
+      }
+    }
+    this.changed("merge-reconciled", { gateId }, gate.projectId);
+  }
+  async reconcileMerges() {
+    for (const gate of this.store.all("gate").filter((gate) => gate.type === "pr" && gate.mergeAttempt && gate.status === "merging")) {
+      try {
+        await this.reconcileMerge(gate.id);
+        if (this.store.get(gate.id).status === "merging") {
+          this.store.patch(gate.id, { status: "open", mergeRecovery: "Merge result uncertain. Reconcile the remote PR before another approval." });
+          this.changed("merge-reconciled", { gateId: gate.id }, gate.projectId);
+        }
+      } catch (error) {
+        const message = `Could not inspect PR after interrupted merge: ${String(error)}`;
+        this.store.patch(gate.id, { status: "open", mergeRecovery: message });
+        this.changed("merge-reconciliation-error", { gateId: gate.id, error: String(error) }, gate.projectId);
+      }
+    }
   }
   async approve(gateId: string, reviewedSha: string) {
     const gate = this.store.get(gateId);
     if (gate.status !== "open" || gate.type !== "pr")
       throw new Error("This PR approval is no longer open.");
+    if (gate.mergeAttempt)
+      throw new Error("A prior merge attempt needs manual reconciliation before another approval.");
     const info = await this.prInfo(gateId);
     if (reviewedSha !== gate.sha)
       throw new Error(
         "Review the currently displayed revision before approving.",
       );
     if (info.state !== "OPEN") throw new Error("Pull request is not open.");
-    if (info.url !== gate.pr) throw new Error("Pull request URL changed. Refresh review.");
+    if (info.url !== gate.pr || !Number.isInteger(info.number))
+      throw new Error("Pull request identity changed. Refresh and review.");
+    const target = this.mergeTarget(gate.pr, info.number);
     checkApproval(
       reviewedSha,
       info.headRefOid,
@@ -972,20 +1059,41 @@ export class Engine extends EventEmitter {
     const existingPr = intent?.pendingEvidence?.prEvidence;
     if (intent && (existingPr?.url !== gate.pr || existingPr?.headSha !== reviewedSha))
       throw new Error("Wiki PR evidence does not match the approved revision.");
-    const result = JSON.parse(
-      await this.github([
+    this.store.transaction(() => {
+      const current = this.store.get(gateId);
+      if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha)
+        throw new Error("This revision already has a merge attempt or is no longer open.");
+      this.store.patch(gateId, {
+        status: "merging",
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, requestedAt: new Date().toISOString() },
+      });
+    });
+    let result: any;
+    try {
+      result = JSON.parse(await this.mergeBroker([
+
         "api",
         "--method",
         "PUT",
-        `repos/${project.github}/pulls/${info.number}/merge`,
+        target,
         "-f",
         "sha=" + reviewedSha,
         "-f",
         "merge_method=squash",
-      ]),
-    );
-    if (!result.merged)
+      ]));
+    } catch (error) {
+      // A timeout or lost response can follow remote success. Never submit a second PUT.
+      if (this.store.get(gateId).status === "merging")
+        this.store.patch(gateId, { status: "open", mergeRecovery: `Merge result uncertain: ${String(error)}. Reconcile the remote PR before another approval.` });
+      this.changed("merge-result-uncertain", { gateId }, project.id);
+      throw error;
+    }
+    if (!result.merged) {
+      if (this.store.get(gateId).status === "merging")
+        this.store.patch(gateId, { status: "open", mergeRecovery: result.message ?? "GitHub did not merge this revision. Reconcile before another approval." });
+      this.changed("merge-result-uncertain", { gateId }, project.id);
       throw new Error(result.message ?? "GitHub did not merge this revision.");
+    }
     this.store.transaction(() => {
       const mergedPr = { ...existingPr, url: gate.pr, headSha: reviewedSha,
         status: "merged", reviewedSha, mergedSha: result.sha };
@@ -1036,6 +1144,8 @@ export class Engine extends EventEmitter {
   ) {
     const gate = this.store.get(gateId);
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
+    if (gate.type === "pr" && gate.mergeAttempt)
+      throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
     if (actor === "judge" && gate.type === "pr")
       throw new Error("Every PR merge requires human approval.");
     if (gate.type === "github")
@@ -1048,6 +1158,8 @@ export class Engine extends EventEmitter {
         project = this.store.get(gate.projectId);
       if (current.status !== "open")
         throw new Error("Gate is already resolved.");
+      if (current.type === "pr" && current.mergeAttempt)
+        throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
       if (
         actor === "judge" &&
         (escalationMode(project) === "human" || project.status !== "running")
