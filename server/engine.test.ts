@@ -201,7 +201,8 @@ test("judge-only YOLO restart pauses dispatch until human recovery", async () =>
 
 const reviewedSha = "a".repeat(40);
 function mergeFixture(store: Store) {
-  const project = store.put("project", { github: "example/repo", branch: "main", status: "running" });
+  store.put("settings", { concurrency: 1 }, "settings");
+  const project = store.put("project", { planned: true, github: "example/repo", branch: "main", status: "running" });
   const task = store.put("task", { projectId: project.id, status: "awaiting_human" });
   const gate = store.put("gate", {
     projectId: project.id, taskId: task.id, type: "pr", status: "open",

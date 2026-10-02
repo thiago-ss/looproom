@@ -1023,7 +1023,11 @@ export class Engine extends EventEmitter {
         task.title,
       ]);
     }
-    if (await git(task.worktree, ["rev-parse", "HEAD^{tree}"]) !== task.reviewedSource.tree ||
+    const expectedParents = [task.reviewedSource.head, task.reviewedSource.mergeHead].filter(Boolean).join(" ");
+    const changedParents = (diff || merging)
+      ? await git(task.worktree, ["show", "-s", "--format=%P", "HEAD"]) !== expectedParents
+      : await git(task.worktree, ["rev-parse", "HEAD"]) !== task.reviewedSource.head;
+    if (changedParents || await git(task.worktree, ["rev-parse", "HEAD^{tree}"]) !== task.reviewedSource.tree ||
         await sourceFingerprint(task.worktree) !== task.reviewedSource.sourceHash ||
         await git(task.worktree, ["branch", "--show-current"]) !== task.branch) {
       this.store.patch(task.id, { reviewedSource: null });
@@ -1294,7 +1298,10 @@ export class Engine extends EventEmitter {
           remoteObservation: { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable, mergedSha: info.mergeCommit.oid, mergedAt: info.mergedAt, observedAt: new Date().toISOString() } });
         this.store.patch(gate.taskId, { status: "completed" });
       });
+      this.changed("merge-reconciled", { gateId }, gate.projectId);
+      this.tick();
       await this.repairReconciledEvidence(this.store.get(gateId));
+      return;
     } else if (info.state === "OPEN" && info.headRefOid === attempt.reviewedSha) {
       if (releaseOpenAttempt) {
         this.store.transaction(() => {

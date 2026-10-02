@@ -277,6 +277,7 @@ test("approved PR evidence survives restart replay without changing raw capture"
   const path = join(dir, "db");
   let store = new Store(path);
   try {
+    store.put("settings", { concurrency: 1 }, "settings");
     store.put("project", { github: "owner/repo", branch: "main" }, "p");
     store.put("task", { projectId: "p", status: "awaiting_human" }, "t");
     store.put("run", { projectId: "p", taskId: "t", role: "implementation", status: "completed" }, "r");
@@ -491,6 +492,7 @@ test("reconciled remote merge repairs exact run evidence after a derived-write c
   let store = new Store(path);
   const runtime = { close() {} } as unknown as Runtime;
   try {
+    store.put("settings", { concurrency: 1 }, "settings");
     store.put("project", { github: "owner/repo", branch: "main" }, "p");
     store.put("task", { projectId: "p", status: "awaiting_human" }, "t");
     let engine = new Engine(store, runtime, dir);

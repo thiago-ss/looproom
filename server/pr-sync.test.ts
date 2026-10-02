@@ -354,3 +354,38 @@ test("a formatting commit hook invalidates publication until its new source is v
     assert.equal(f.store.all("approval").length, 0);
   } finally { await f.close(); }
 });
+
+test("reconciling an uncertain merge immediately dispatches its ready dependent", async () => {
+  const f = await fixture("running");
+  let starts = 0;
+  try {
+    f.store.patch(f.gate.id, { mergeAttempt: { pr: url, number: 1, reviewedSha: head, requestedAt: "fixture" } });
+    const child = f.store.put("task", { projectId: f.project.id, status: "ready", dependencies: [f.task.id], title: "Dependent" });
+    f.engine.implement = async (_p, t) => { assert.equal(t.id, child.id); starts++; f.store.patch(t.id, { status: "running" }); };
+    await f.engine.syncProject(f.project.id);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(starts, 1);
+    assert.equal(f.store.get(f.task.id).status, "completed");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("a hook that changes commit parents while retaining reviewed files cannot publish", async () => {
+  const f = await fixture("running");
+  try {
+    const repo = await createRepo(join(f.dir, "parent-guard-repo"));
+    await writeFile(join(repo.path, "new.txt"), "checked source\n");
+    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", attempt: 1, title: "Source", checks: [], review: { verdict: "pass" } });
+    await f.engine.stageProduct(task);
+    const tree = await git(repo.path, ["write-tree"]);
+    task = f.store.patch(task.id, { reviewedSource: { sourceHash: await sourceFingerprint(repo.path), tree, head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" } });
+    await writeFile(join(repo.path, ".git/hooks/post-commit"), '#!/bin/sh\nguard_tree=$(git rev-parse "HEAD^{tree}")\nguard_commit=$(git -c user.name=Fixture -c user.email=fixture@localhost commit-tree "$guard_tree" -m rewritten-root)\ngit update-ref HEAD "$guard_commit"\n', { mode: 0o755 });
+    f.engine.githubRunner = async () => "fixture";
+    await f.engine.publish(f.project, task);
+    assert.equal(await git(repo.path, ["rev-parse", "HEAD^{tree}"]), tree);
+    assert.equal(await git(repo.path, ["show", "-s", "--format=%P", "HEAD"]), "");
+    assert.equal(f.store.get(task.id).status, "ready");
+    assert.equal(f.store.get(task.id).reviewedSource, null);
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
