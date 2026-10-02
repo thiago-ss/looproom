@@ -127,7 +127,7 @@ test("two approval submissions for one revision cause one merge request and one 
   const sha = "a".repeat(40);
   let mergeCalls = 0;
   try {
-    const project = store.put("project", { status: "running", github: "example/fixture" });
+    const project = store.put("project", { status: "running", github: "example/fixture", branch: "main" });
     const task = store.put("task", { projectId: project.id, status: "awaiting_human" });
     const gate = store.put("gate", {
       projectId: project.id, taskId: task.id, status: "open", type: "pr",
@@ -136,7 +136,7 @@ test("two approval submissions for one revision cause one merge request and one 
     engine.prInfo = async () => {
       signalInfo();
       await infoHeld;
-      return { number: 1, url: gate.pr, state: "OPEN", headRefOid: sha,
+      return { number: 1, url: gate.pr, baseRefName: "main", state: "OPEN", headRefOid: sha,
         statusCheckRollup: [], mergeable: "MERGEABLE" };
     };
     engine.mergeBroker = async () => { mergeCalls++; return JSON.stringify({ merged: true, sha: "b".repeat(40) }); };

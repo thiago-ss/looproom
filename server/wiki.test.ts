@@ -277,30 +277,30 @@ test("approved PR evidence survives restart replay without changing raw capture"
   const path = join(dir, "db");
   let store = new Store(path);
   try {
-    store.put("project", { github: "owner/repo" }, "p");
+    store.put("project", { github: "owner/repo", branch: "main" }, "p");
     store.put("task", { projectId: "p", status: "awaiting_human" }, "t");
     store.put("run", { projectId: "p", taskId: "t", role: "implementation", status: "completed" }, "r");
     let engine = new Engine(store, { close() {} } as unknown as Runtime, dir);
     await engine.document("p", "Result", "Merged outcome", ["source-a"], "r");
     await engine.recordRunEvidence("t", { prEvidence: {
-      url: "https://github.com/owner/repo/pull/1", headSha: "reviewed-sha", status: "awaiting_human",
+      url: "https://github.com/owner/repo/pull/1", headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "awaiting_human",
     } });
     store.put("gate", { projectId: "p", taskId: "t", type: "pr", status: "open",
-      pr: "https://github.com/owner/repo/pull/1", sha: "reviewed-sha" }, "g");
+      pr: "https://github.com/owner/repo/pull/1", sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "g");
     const rawPath = join(dir, "wiki", "p", "raw", "r.json");
     const raw = await readFile(rawPath);
     engine.github = async (args: string[]) => args[0] === "pr"
       ? JSON.stringify({ number: 1, url: "https://github.com/owner/repo/pull/1",
-        headRefOid: "reviewed-sha", statusCheckRollup: [], mergeable: "MERGEABLE", state: "OPEN" })
-      : JSON.stringify({ merged: true, sha: "merged-sha" });
-    await engine.approve("g", "reviewed-sha");
+        baseRefName: "main", headRefOid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", statusCheckRollup: [], mergeable: "MERGEABLE", state: "OPEN" })
+      : JSON.stringify({ merged: true, sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+    await engine.approve("g", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     assert.equal(store.get("wiki-ingest:r").pendingEvidence.prEvidence.status, "merged");
     assert.equal(store.get("g").mergeAttempt.prRunId, "r");
     // A later retry can have identical source bytes; it is still another run.
     store.put("run", { projectId: "p", taskId: "t", role: "implementation", status: "completed" }, "later");
     await engine.document("p", "Later retry", "Separate outcome", ["source-b"], "later");
     await engine.recordRunEvidence("t", { prEvidence: {
-      url: "https://github.com/owner/repo/pull/1", headSha: "reviewed-sha", status: "awaiting_human",
+      url: "https://github.com/owner/repo/pull/1", headSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", status: "awaiting_human",
     } }, "later");
     store.close();
     store = new Store(path);
@@ -308,17 +308,17 @@ test("approved PR evidence survives restart replay without changing raw capture"
     await engine.recoverWiki();
     const gate = store.get("g");
     assert.equal(gate.status, "approved");
-    assert.equal(gate.reviewedSha, "reviewed-sha");
-    assert.equal(gate.mergedSha, "merged-sha");
+    assert.equal(gate.reviewedSha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    assert.equal(gate.mergedSha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     assert.equal(store.all("approval", "p").length, 1);
-    assert.equal(store.all("approval", "p")[0].reviewedSha, "reviewed-sha");
+    assert.equal(store.all("approval", "p")[0].reviewedSha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     assert.equal(store.get("memory:r").prEvidence.status, "merged");
-    assert.equal(store.get("memory:r").prEvidence.mergedSha, "merged-sha");
+    assert.equal(store.get("memory:r").prEvidence.mergedSha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     assert.equal(store.get("later").prEvidence.status, "awaiting_human");
     assert.equal(store.get("wiki-ingest:later").pendingEvidence.prEvidence.status, "awaiting_human");
     assert.equal(store.get("memory:later").prEvidence.status, "awaiting_human");
     const folder = join(dir, "wiki", "p");
-    assert.match(await readFile(join(folder, "memory:r.md"), "utf8"), /PR outcome.*merged; head reviewed-sha; merged merged-sha/);
+    assert.match(await readFile(join(folder, "memory:r.md"), "utf8"), /PR outcome.*merged; head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; merged bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/);
     assert.deepEqual(await readFile(rawPath), raw);
     assert.equal((await readFile(join(folder, "index.md"), "utf8")).match(/memory:r.md/g)?.length, 1);
     assert.equal((await readFile(join(folder, "log.md"), "utf8")).match(/; page memory:r\./g)?.length, 1);
@@ -330,7 +330,7 @@ test("approved PR evidence survives restart replay without changing raw capture"
     await engine.recoverWiki();
     assert.equal(store.get("wiki-ingest:r").pendingEvidence.prEvidence.status, "merged");
     assert.equal(store.get("memory:r").prEvidence.status, "merged");
-    assert.match(await readFile(join(folder, "memory:r.md"), "utf8"), /PR outcome.*merged; head reviewed-sha/);
+    assert.match(await readFile(join(folder, "memory:r.md"), "utf8"), /PR outcome.*merged; head aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
   } finally { store.close(); await rm(dir, { recursive: true, force: true }).catch((error) => { if (error.code !== "EPERM") throw error; }); }
 });
 
@@ -491,7 +491,7 @@ test("reconciled remote merge repairs exact run evidence after a derived-write c
   let store = new Store(path);
   const runtime = { close() {} } as unknown as Runtime;
   try {
-    store.put("project", { github: "owner/repo" }, "p");
+    store.put("project", { github: "owner/repo", branch: "main" }, "p");
     store.put("task", { projectId: "p", status: "awaiting_human" }, "t");
     let engine = new Engine(store, runtime, dir);
     const pr = "https://github.com/owner/repo/pull/1";
@@ -508,7 +508,7 @@ test("reconciled remote merge repairs exact run evidence after a derived-write c
     let writes = 0;
     engine.mergeBroker = async (args: string[]) => {
       if (args[0] !== "pr") { writes++; throw new Error("Unexpected merge write"); }
-      return JSON.stringify({ number: 1, url: pr, state: "MERGED", headRefOid: head, mergeCommit: { oid: mergedSha } });
+      return JSON.stringify({ number: 1, url: pr, state: "MERGED", baseRefName: "main", mergedAt: new Date().toISOString(), headRefOid: head, mergeCommit: { oid: mergedSha } });
     };
     engine.writeIfChanged = async () => { throw new Error("Derived write interrupted"); };
     await engine.reconcileMerges();

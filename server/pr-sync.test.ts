@@ -189,3 +189,41 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
     assert.equal(f.store.all("approval").length, 0);
   } finally { await f.close(); }
 });
+
+test("retargeted approvals and incomplete interrupted merge facts fail closed without a merge PUT", async () => {
+  const f = await fixture("paused");
+  try {
+    f.setInfo({ state: "OPEN", baseRefName: "another-base", statusCheckRollup: [] });
+    await assert.rejects(f.engine.approve(f.gate.id, head), /base|identity/);
+    assert.equal(f.store.get(f.gate.id).mergeAttempt, undefined);
+    f.store.patch(f.gate.id, { status: "merging", mergeAttempt: { pr: url, number: 1, reviewedSha: head, requestedAt: "fixture" } });
+    for (const patch of [
+      { state: "MERGED", baseRefName: "another-base" },
+      { state: "MERGED", baseRefName: "main", mergeCommit: null },
+      { state: "MERGED", baseRefName: "main", mergeCommit: { oid: merged }, mergedAt: null },
+      { state: "MERGED", mergedAt: "invalid date" },
+    ]) {
+      f.setInfo(patch);
+      await assert.rejects(f.engine.reconcileMerge(f.gate.id), /base|identity|complete merge evidence/);
+      assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+      assert.equal(f.store.get(f.gate.id).status, "merging");
+    }
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("late interrupted merge reconciliation respects shutdown and the shared decision reservation", async () => {
+  const f = await fixture("paused");
+  let release!: () => void;
+  try {
+    f.store.patch(f.gate.id, { status: "merging", mergeAttempt: { pr: url, number: 1, reviewedSha: head, requestedAt: "fixture" } });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    f.engine.mergeBroker = async () => { await held; return JSON.stringify({ number: 1, url, baseRefName: "main", headRefOid: head, state: "MERGED", mergedAt: new Date().toISOString(), mergeCommit: { oid: merged } }); };
+    const pending = f.engine.reconcileMerge(f.gate.id);
+    await assert.rejects(f.engine.reconcileMerge(f.gate.id), /already being submitted/);
+    f.engine.close(); release(); await pending;
+    assert.equal(f.store.get(f.gate.id).status, "merging");
+    assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { release?.(); await f.close(); }
+});

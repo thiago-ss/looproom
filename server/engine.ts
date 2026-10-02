@@ -1028,6 +1028,7 @@ export class Engine extends EventEmitter {
       pr: url,
       sha,
       prRunId,
+      base: project.branch,
     });
     this.store.patch(task.id, { status: "awaiting_human" });
     this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
@@ -1079,10 +1080,10 @@ export class Engine extends EventEmitter {
         try {
           const gate = this.store.get(snapshot.id);
           if (!["open", "merging"].includes(gate.status)) continue;
-          if (gate.mergeAttempt) { await this.reconcileMerge(gate.id); continue; }
+          if (gate.mergeAttempt) { await this.reconcileMergeReserved(gate.id); continue; }
           const info = await this.prInfo(gate.id);
           if (this.closed) return;
-          this.mergeTarget(info.url, info.number);
+          this.validateRemotePr(gate, project, info);
           if (info.url !== gate.pr || !info.url.startsWith(`https://github.com/${project.github}/pull/`) ||
               info.baseRefName !== project.branch || !/^[a-f0-9]{40}$/.test(info.headRefOid ?? ""))
             throw new Error("Remote PR identity, base or head does not match this project.");
@@ -1234,13 +1235,31 @@ export class Engine extends EventEmitter {
       throw new Error("Pull request URL and number do not identify the same GitHub PR.");
     return `repos/${match[1]}/${match[2]}/pulls/${number}/merge`;
   }
+  validateRemotePr(gate: RecordData, project: RecordData, info: any) {
+    this.mergeTarget(info.url, info.number);
+    const base = gate.base ?? gate.mergeAttempt?.base ?? project.branch;
+    if (info.url !== gate.pr || !base || info.baseRefName !== base ||
+        !/^[a-f0-9]{40}$/.test(info.headRefOid ?? ""))
+      throw new Error("PR identity changed: URL, base or head mismatch; refresh before continuing.");
+    if (info.state === "MERGED" && (!/^[a-f0-9]{40}$/.test(info.mergeCommit?.oid ?? "") ||
+        !info.mergedAt || !Number.isFinite(Date.parse(info.mergedAt))))
+      throw new Error("GitHub has not supplied complete merge evidence.");
+  }
   async reconcileMerge(gateId: string, releaseOpenAttempt = false) {
+    if (this.prDecisionBusy.has(gateId)) throw new Error("A decision on this PR is already being submitted.");
+    this.prDecisionBusy.add(gateId);
+    try { await this.reconcileMergeReserved(gateId, releaseOpenAttempt); }
+    finally { this.prDecisionBusy.delete(gateId); }
+  }
+  async reconcileMergeReserved(gateId: string, releaseOpenAttempt = false) {
     const gate = this.store.get(gateId);
     if (gate.type !== "pr" || !gate.mergeAttempt || !["merging", "open"].includes(gate.status))
       throw new Error("No interrupted PR merge to reconcile.");
     const attempt = gate.mergeAttempt;
     this.mergeTarget(attempt.pr, attempt.number);
     const info = await this.prInfo(gateId);
+    if (this.closed) return;
+    this.validateRemotePr(gate, this.store.get(gate.projectId), info);
     if (info.url !== gate.pr || info.url !== attempt.pr || info.number !== attempt.number)
       throw new Error("PR identity changed; inspect GitHub before continuing.");
     if (info.state === "MERGED" && info.headRefOid === attempt.reviewedSha) {
@@ -1334,6 +1353,8 @@ export class Engine extends EventEmitter {
     if (info.state !== "OPEN") throw new Error("Pull request is not open.");
     if (info.url !== gate.pr || !Number.isInteger(info.number))
       throw new Error("Pull request identity changed. Refresh and review.");
+    if (this.closed) throw new Error("Coordinator closed during PR approval.");
+    this.validateRemotePr(gate, this.store.get(gate.projectId), info);
     const target = this.mergeTarget(gate.pr, info.number);
     checkApproval(
       reviewedSha,
@@ -1356,7 +1377,7 @@ export class Engine extends EventEmitter {
         throw new Error("This revision already has a merge attempt or is no longer open.");
       this.store.patch(gateId, {
         status: "merging",
-        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, prRunId: run?.id, requestedAt: new Date().toISOString() },
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, base: info.baseRefName, prRunId: run?.id, requestedAt: new Date().toISOString() },
       });
     });
     let result: any;
@@ -1379,7 +1400,8 @@ export class Engine extends EventEmitter {
       this.changed("merge-result-uncertain", { gateId }, project.id);
       throw error;
     }
-    if (!result.merged) {
+    if (this.closed) return;
+    if (!result.merged || !/^[a-f0-9]{40}$/.test(result.sha ?? "")) {
       if (this.store.get(gateId).status === "merging")
         this.store.patch(gateId, { status: "open", mergeRecovery: result.message ?? "GitHub did not merge this revision. Reconcile before another approval." });
       this.changed("merge-result-uncertain", { gateId }, project.id);

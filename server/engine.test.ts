@@ -201,7 +201,7 @@ test("judge-only YOLO restart pauses dispatch until human recovery", async () =>
 
 const reviewedSha = "a".repeat(40);
 function mergeFixture(store: Store) {
-  const project = store.put("project", { github: "example/repo", status: "running" });
+  const project = store.put("project", { github: "example/repo", branch: "main", status: "running" });
   const task = store.put("task", { projectId: project.id, status: "awaiting_human" });
   const gate = store.put("gate", {
     projectId: project.id, taskId: task.id, type: "pr", status: "open",
@@ -212,7 +212,7 @@ function mergeFixture(store: Store) {
 }
 function prState(overrides: Record<string, any> = {}) {
   return {
-    number: 7, url: "https://github.com/example/repo/pull/7",
+    number: 7, url: "https://github.com/example/repo/pull/7", baseRefName: "main",
     headRefOid: reviewedSha, state: "OPEN", mergeable: "MERGEABLE", mergedAt: null,
     statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }],
     ...overrides,
@@ -298,7 +298,7 @@ test("restart reconciles interrupted merge intent without replay or invented app
     const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
     let puts = 0;
     engine.mergeBroker = async (args) => {
-      if (args[0] === "pr") return JSON.stringify(prState({ state: remoteState, mergeCommit: { oid: "b".repeat(40) } }));
+      if (args[0] === "pr") return JSON.stringify(prState({ state: remoteState, mergedAt: remoteState === "MERGED" ? new Date().toISOString() : null, mergeCommit: { oid: "b".repeat(40) } }));
       puts++; return "";
     };
     try {
@@ -487,8 +487,8 @@ test("human recovery keeps intent when the PR read fails, identity changes or st
       prState({ state: "OPEN", headRefOid: null }),
     ]) {
       state = remote;
-      if (remote.number === 7 && remote.url !== gate.pr)
-        await assert.rejects(engine.reconcileMerge(gate.id, true), /identity changed/);
+      if ((remote.number === 7 && remote.url !== gate.pr) || !remote.headRefOid)
+        await assert.rejects(engine.reconcileMerge(gate.id, true), /identity changed|do not identify/);
       else await engine.reconcileMerge(gate.id, true);
       assert.equal(store.get(gate.id).mergeAttempt.reviewedSha, reviewedSha);
       assert.equal(store.all("approval").length, 0);
