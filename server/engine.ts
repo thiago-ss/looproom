@@ -74,8 +74,16 @@ export function validateDependencies(tasks: { dependencies: number[] }[]) {
 }
 const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
 
+function autonomyPolicy(project: RecordData) {
+  if (escalationMode(project) !== "yolo")
+    return `Autonomy mode: ${escalationMode(project)}. Preserve the configured human/draft submission rules.`;
+  return `Autonomy mode: YOLO. The judge owns routine decisions within the user's goal, including selecting alternatives and authorizing another bounded experiment round. Planner-created candidate and retry limits bound each round; exhausting them is not a request for human permission. Preserve the exhausted round's measurements and discard decisions, record a distinct next round with a concrete hypothesis and unchanged measurement/runtime budget, and send the originating agent a specific retry instruction. Never relabel a failed candidate as successful. Explicit user limits and exclusions remain binding; do not weaken acceptance thresholds, change a frozen evaluator, invent capabilities or expand credentials/sandbox access. Only PR merges require human approval of the exact revision. A real unavailable prerequisite can remain a machine blocker while independent work continues. Workers escalate routine decisions to the judge, not the human.`;
+}
+
 export class Engine extends EventEmitter {
   busy = new Set<string>();
+  prDecisionBusy = new Set<string>();
+  githubRunner = gh;
   documentation = new Map<string, Promise<void>>();
   timer?: ReturnType<typeof setInterval>;
   verificationRunner = runVerification;
@@ -147,6 +155,7 @@ export class Engine extends EventEmitter {
     task?: RecordData,
     write = false,
   ) {
+    if (task?.worktree) await this.handoffBaselineEvidence(project, task);
     const settings = this.settings(),
       profile =
         role === "orchestrator"
@@ -189,7 +198,7 @@ export class Engine extends EventEmitter {
         effort: profile.effort,
         cwd: task?.worktree ?? project.path,
         write,
-        prompt: WORKFLOW + "\n\n" + prompt,
+        prompt: WORKFLOW + "\n\n" + autonomyPolicy(project) + "\n\n" + prompt,
         schema: z.toJSONSchema(schema),
         onThread: (threadId, metadata) =>
           this.store.patch(run.id, { threadId, runtime: metadata }),
@@ -278,6 +287,41 @@ export class Engine extends EventEmitter {
         );
       throw error;
     }
+  }
+  async handoffBaselineEvidence(project: RecordData, task: RecordData) {
+    const baseline = this.store.get(project.id, "project").refreshBaseline;
+    if (!task.worktree || baseline?.phase !== "frozen" || !baseline.reportId ||
+        baseline.ownerTaskId === task.id) return;
+    if (!/^[a-f0-9-]{36}$/.test(baseline.reportId))
+      throw new Error("Invalid baseline report identity.");
+    const owner = this.store.get(baseline.ownerTaskId, "task");
+    if (owner.projectId !== project.id || task.projectId !== project.id)
+      throw new Error("Baseline evidence must belong to the same project.");
+    const source = join(this.dataDir, "verification", baseline.reportId + ".json");
+    const canonical = await realpath(source).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!canonical)
+      throw new Error("Frozen baseline report is missing from coordinator storage. Restore the recorded report before comparing candidates; do not invent or replace its measurements.");
+    if (canonical !== join(await realpath(this.dataDir), "verification", baseline.reportId + ".json"))
+      throw new Error("Baseline report must not be a symlink.");
+    const bytes = await readFile(source, "utf8"), report = JSON.parse(bytes);
+    if (report.id !== baseline.reportId || report.sourceHash !== baseline.measurementSourceHash ||
+        report.sourceUnchanged !== true || !report.results?.some((result: any) =>
+          result.command === "node --import tsx scripts/measure-refresh.ts" && result.code === 0 && !result.timedOut))
+      throw new Error("Baseline report does not match the frozen measurement evidence.");
+    const directory = join(task.worktree, ".looproom-verification");
+    await mkdir(directory, { recursive: true });
+    if (await realpath(directory) !== join(await realpath(task.worktree), ".looproom-verification"))
+      throw new Error("Verification evidence directory must not be a symlink.");
+    const target = join(directory, report.id + ".json");
+    await writeFile(target, bytes, { flag: "wx" }).catch(async (error) => {
+      if (error.code !== "EEXIST") throw error;
+      if (await realpath(target) !== join(await realpath(directory), report.id + ".json") ||
+          await readFile(target, "utf8") !== bytes)
+        throw new Error("Existing baseline report differs from the coordinator evidence.");
+    });
   }
   async document(
     projectId: string,
@@ -672,7 +716,19 @@ export class Engine extends EventEmitter {
         bodyPath,
         `${task.summary}\n\n## Verification\n${task.checks.map((c: any) => "- " + c.command + ": exit " + c.code).join("\n")}\n\n## Independent review\n${task.review.summary}\n\nHuman approval is required in Looproom for commit ${sha}.\n`,
       );
-      url = await gh([
+      url = await this.createPrOrReuse(project, task, sha, bodyPath);
+    }
+    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha });
+    this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
+      pr: url,
+      sha,
+    });
+    this.store.patch(task.id, { status: "awaiting_human" });
+    this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
+  }
+  async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
+    try {
+      return await this.githubRunner([
         "pr",
         "create",
         "--repo",
@@ -686,17 +742,24 @@ export class Engine extends EventEmitter {
         "--body-file",
         bodyPath,
       ]);
+    } catch (creationError) {
+      let existing: any;
+      try {
+        existing = JSON.parse(await this.githubRunner([
+          "pr", "view", task.branch, "--repo", project.github,
+          "--json", "url,headRefOid,baseRefName,state",
+        ]));
+      } catch {
+        throw creationError;
+      }
+      if (existing.state !== "OPEN" || existing.headRefOid !== sha ||
+          existing.baseRefName !== project.branch || typeof existing.url !== "string")
+        throw new Error("An existing PR does not match this task revision and base. Review it before retrying publication.");
+      return existing.url;
     }
-    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha });
-    this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
-      pr: url,
-      sha,
-    });
-    this.store.patch(task.id, { status: "awaiting_human" });
-    this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
   }
   async prInfo(gateId: string) {
-    const gate = this.store.get(gateId);
+    const gate = this.store.get(gateId, "gate");
     if (gate.type !== "pr") throw new Error("This gate is not a pull request.");
     return JSON.parse(
       await gh([
@@ -708,65 +771,118 @@ export class Engine extends EventEmitter {
       ]),
     );
   }
-  async approve(gateId: string, reviewedSha: string) {
-    const gate = this.store.get(gateId);
-    if (gate.status !== "open" || gate.type !== "pr")
-      throw new Error("This PR approval is no longer open.");
-    const info = await this.prInfo(gateId);
-    if (reviewedSha !== gate.sha)
-      throw new Error(
-        "Review the currently displayed revision before approving.",
-      );
-    if (info.state !== "OPEN") throw new Error("Pull request is not open.");
-    checkApproval(
-      reviewedSha,
-      info.headRefOid,
-      info.statusCheckRollup ?? [],
-      info.mergeable,
-    );
-    const project = this.store.get(gate.projectId);
-    const result = JSON.parse(
+  async mergePr(repository: string, number: number, sha: string) {
+    return JSON.parse(
       await gh([
         "api",
         "--method",
         "PUT",
-        `repos/${project.github}/pulls/${info.number}/merge`,
+        `repos/${repository}/pulls/${number}/merge`,
         "-f",
-        "sha=" + reviewedSha,
+        "sha=" + sha,
         "-f",
         "merge_method=squash",
       ]),
     );
-    if (!result.merged)
-      throw new Error(result.message ?? "GitHub did not merge this revision.");
-    this.store.transaction(() => {
-      this.store.patch(gateId, {
-        status: "approved",
+  }
+  async approve(gateId: string, reviewedSha: string) {
+    if (this.prDecisionBusy.has(gateId))
+      throw new Error("A decision on this PR is already being submitted.");
+    this.prDecisionBusy.add(gateId);
+    try {
+      const gate = this.store.get(gateId, "gate");
+      if (gate.status !== "open" || gate.type !== "pr")
+        throw new Error("This PR approval is no longer open.");
+      const project = this.store.get(gate.projectId, "project");
+      const task = this.store.get(gate.taskId, "task");
+      if (task.projectId !== project.id || task.status !== "awaiting_human")
+        throw new Error("This PR task is no longer awaiting human review.");
+      const info = await this.prInfo(gateId);
+      if (reviewedSha !== gate.sha)
+        throw new Error(
+          "Review the currently displayed revision before approving.",
+        );
+      if (info.state !== "OPEN") throw new Error("Pull request is not open.");
+      checkApproval(
         reviewedSha,
-        mergedSha: result.sha,
-        resolvedAt: new Date().toISOString(),
-      });
-      this.store.patch(gate.taskId, { status: "completed" });
-      this.store.recordGateResponse(
-        gate,
-        `Approved and merged revision ${reviewedSha}.`,
-        "human",
-        new Date().toISOString(),
+        info.headRefOid,
+        info.statusCheckRollup ?? [],
+        info.mergeable,
       );
-      this.store.put("approval", {
-        projectId: project.id,
-        gateId,
-        taskId: gate.taskId,
-        reviewedSha,
-        mergedSha: result.sha,
-        createdAt: new Date().toISOString(),
+      const result = await this.mergePr(project.github, info.number, reviewedSha);
+      if (!result.merged)
+        throw new Error(result.message ?? "GitHub did not merge this revision.");
+      this.store.transaction(() => {
+        this.store.patch(gateId, {
+          status: "approved",
+          reviewedSha,
+          mergedSha: result.sha,
+          resolvedAt: new Date().toISOString(),
+        });
+        this.store.patch(gate.taskId, { status: "completed" });
+        this.store.recordGateResponse(
+          gate,
+          `Approved and merged revision ${reviewedSha}.`,
+          "human",
+          new Date().toISOString(),
+        );
+        this.store.put("approval", {
+          projectId: project.id,
+          gateId,
+          taskId: gate.taskId,
+          reviewedSha,
+          mergedSha: result.sha,
+          createdAt: new Date().toISOString(),
+        });
       });
-    });
-    this.changed(
-      "pr-merged",
-      { gateId, reviewedSha, mergedSha: result.sha },
-      project.id,
-    );
+      this.changed(
+        "pr-merged",
+        { gateId, reviewedSha, mergedSha: result.sha },
+        project.id,
+      );
+    } finally {
+      this.prDecisionBusy.delete(gateId);
+    }
+  }
+  async requestChanges(gateId: string, reviewedSha: string, answer: string) {
+    if (this.prDecisionBusy.has(gateId))
+      throw new Error("A decision on this PR is already being submitted.");
+    this.prDecisionBusy.add(gateId);
+    try {
+      const gate = this.store.get(gateId, "gate");
+      if (gate.status !== "open" || gate.type !== "pr")
+        throw new Error("This PR review is no longer open.");
+      const project = this.store.get(gate.projectId, "project");
+      const task = this.store.get(gate.taskId, "task");
+      if (task.projectId !== project.id || task.status !== "awaiting_human")
+        throw new Error("This PR task is no longer awaiting human review.");
+      if (reviewedSha !== gate.sha)
+        throw new Error("Review the currently displayed revision before requesting changes.");
+      const info = await this.prInfo(gateId);
+      if (info.state !== "OPEN") throw new Error("Pull request is not open.");
+      if (info.headRefOid !== reviewedSha)
+        throw new Error("PR revision changed. Refresh and review the new commit.");
+      const resolvedAt = new Date().toISOString();
+      this.store.transaction(() => {
+        const current = this.store.get(gateId, "gate");
+        const currentTask = this.store.get(gate.taskId, "task");
+        if (current.status !== "open" || currentTask.status !== "awaiting_human")
+          throw new Error("This PR review is no longer open.");
+        this.store.patch(gateId, {
+          status: "resolved", answer, resolvedBy: "human", resolvedAt,
+          reviewedSha,
+        });
+        this.store.recordGateResponse(gate, answer, "human", resolvedAt);
+        this.store.patch(task.id, {
+          status: "ready", attempt: 0, judgeRetries: 0,
+          feedback: `Human requested changes to revision ${reviewedSha}: ${answer}`,
+        });
+        this.store.patch(project.id, { status: "running" });
+      });
+      this.changed("pr-changes-requested", { gateId, reviewedSha }, project.id);
+    } finally {
+      this.prDecisionBusy.delete(gateId);
+    }
   }
   async resolve(
     gateId: string,
@@ -775,10 +891,10 @@ export class Engine extends EventEmitter {
     actor: "human" | "judge" = "human",
     runId?: string,
   ) {
-    const gate = this.store.get(gateId);
+    const gate = this.store.get(gateId, "gate");
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
-    if (actor === "judge" && gate.type === "pr")
-      throw new Error("Every PR merge requires human approval.");
+    if (gate.type === "pr")
+      throw new Error("PR gates require human approval of the exact revision through Approve & merge.");
     if (gate.type === "github")
       this.store.patch(
         gate.projectId,

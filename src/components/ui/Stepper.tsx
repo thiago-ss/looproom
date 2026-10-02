@@ -96,7 +96,7 @@ export default function Stepper({
             current={currentStep - 1}
             compact
             label="Project setup progress"
-            steps={["Project", "Goal", "Boundaries", "Ready"].map(
+            steps={["Project", "Runtime", "Goal", "Ready"].map(
               (label, index) => ({ id: String(index), label }),
             )}
           />

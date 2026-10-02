@@ -1,0 +1,23 @@
+{
+  "benchmark": "Vite built asset sizes measured with Node gzip",
+  "baselineRevision": "8ca5f69",
+  "initial": "JS and CSS referenced directly by dist/index.html; excludes fonts and lazy chunks",
+  "records": [
+    {
+      "source": "bundle-before.json",
+      "variant": "original",
+      "initialBytes": 853160,
+      "initialGzipBytes": 240143,
+      "allJsBytes": 880734,
+      "allJsGzipBytes": 283164
+    },
+    {
+      "source": "bundle-after.json",
+      "variant": "modified",
+      "initialBytes": 816433,
+      "initialGzipBytes": 231526,
+      "allJsBytes": 883652,
+      "allJsGzipBytes": 286709
+    }
+  ]
+}

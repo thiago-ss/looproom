@@ -23,6 +23,31 @@ async function fixture() {
     store.close(); await rm(dir, { recursive: true, force: true });
   } };
 }
+test("candidate handoff receives the frozen baseline report without overwriting its latest checks", async () => {
+  const f = await fixture();
+  try {
+    const reportId = "11111111-1111-4111-8111-111111111111";
+    const report = JSON.stringify({ id: reportId, sourceHash: "baseline-source", sourceUnchanged: true,
+      results: [{ command: "node --import tsx scripts/measure-refresh.ts", code: 0, timedOut: false, output: "original measurements" }] });
+    await mkdir(join(f.dir, "verification"));
+    await writeFile(join(f.dir, "verification", reportId + ".json"), report);
+    const candidate = f.store.put("task", { projectId: f.project.id, worktree: f.dir, status: "ready" });
+    const project = f.store.patch(f.project.id, { refreshBaseline: { phase: "frozen", ownerTaskId: f.task.id,
+      reportId, measurementSourceHash: "baseline-source" } });
+    await mkdir(join(f.dir, ".looproom-verification"));
+    await writeFile(join(f.dir, ".looproom-verification", "latest.json"), "candidate checks");
+    await f.engine.handoffBaselineEvidence(project, candidate);
+    await f.engine.handoffBaselineEvidence(project, candidate);
+    assert.equal(await readFile(join(f.dir, ".looproom-verification", reportId + ".json"), "utf8"), report);
+    assert.equal(await readFile(join(f.dir, ".looproom-verification", "latest.json"), "utf8"), "candidate checks");
+    await writeFile(join(f.dir, ".looproom-verification", reportId + ".json"), "tampered");
+    await assert.rejects(f.engine.handoffBaselineEvidence(project, candidate), /differs from the coordinator evidence/);
+    assert.equal(await readFile(join(f.dir, ".looproom-verification", reportId + ".json"), "utf8"), "tampered");
+    await assert.rejects(f.engine.handoffBaselineEvidence(project, { ...candidate, projectId: "another-project" }), /same project/);
+    f.store.patch(f.project.id, { refreshBaseline: { ...project.refreshBaseline, reportId: "22222222-2222-4222-8222-222222222222" } });
+    await assert.rejects(f.engine.handoffBaselineEvidence(project, candidate), /missing from coordinator storage/);
+  } finally { await f.close(); }
+});
 test("baseline setup repairs require independent review and fresh results before freezing; candidates cannot change the evaluator", async () => {
   const f = await fixture();
   try {
