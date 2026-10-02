@@ -1,6 +1,6 @@
 import { EmptyState } from "./arc/empty-state/empty-state";
 import { Alert } from "./arc/alert/alert";
-import { useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import Markdown from "react-markdown";
 import {
   Search,
@@ -19,6 +19,8 @@ import { CopyButton } from "./arc/copy-button/copy-button";
 import { Tabs, TabsList, TabsTrigger } from "./ui/tabs";
 import { Tooltip } from "./ui/tooltip";
 import { api } from "../lib/api";
+import { MemorySearchSession } from "../lib/memory-search";
+import { DotmSquare3 } from "./ui/dotm-square-3";
 function excerpt(content: string) {
   return content
     .replace(/[#*`>[\]]/g, "")
@@ -35,6 +37,12 @@ function sourceName(source: string) {
   } catch {
     return target.split("/").filter(Boolean).at(-1) ?? target;
   }
+}
+function claimSource(source: string, key: string) {
+  const target = sourceTarget(source);
+  return /^https?:\/\//.test(target)
+    ? <a key={key} href={target} target="_blank" rel="noreferrer">{source}</a>
+    : <span key={key}>{source}</span>;
 }
 function headline(page: any) {
   if (
@@ -70,13 +78,19 @@ function date(value: string) {
 }
 export default function Memory({ project, pages }: any) {
   const [query, setQuery] = useState(""),
-    [results, setResults] = useState<any[] | null>(null),
     [selected, setSelected] = useState(""),
     [view, setView] = useState("library"),
-    [error, setError] = useState(""),
-    [pending, setPending] = useState(false),
     [sourceFilter, setSourceFilter] = useState("");
-  const request = useRef(0);
+  const [searchSession] = useState(() => new MemorySearchSession<any>(project.id));
+  const [storedSearch, setStoredSearch] = useState(searchSession.state);
+  const search = storedSearch.projectId === project.id
+    ? storedSearch
+    : { projectId: project.id, status: "idle" as const };
+  useEffect(() => {
+    searchSession.switchProject(project.id);
+    if (searchSession.state.projectId === project.id) setStoredSearch(searchSession.state);
+    return () => searchSession.dispose();
+  }, [project.id, searchSession]);
   const all = useMemo(
     () => [...pages].sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [pages],
@@ -93,7 +107,8 @@ export default function Memory({ project, pages }: any) {
       }
     return [...groups].sort((a, b) => b[1].length - a[1].length);
   }, [all]);
-  const visible = (results ?? all).filter(
+  const results = search.status === "success" ? search.results : null;
+  const visible = (search.status === "idle" ? all : results ?? []).filter(
     (page) =>
       !sourceFilter ||
       page.sources?.some(
@@ -101,47 +116,40 @@ export default function Memory({ project, pages }: any) {
       ),
   );
   const page = visible.find((page) => page.id === selected) ?? visible[0];
-  async function search(event: FormEvent) {
-    event.preventDefault();
-    const version = ++request.current;
+  function runSearch() {
     if (!query.trim()) {
-      setResults(null);
-      setError("");
+      setStoredSearch(searchSession.clear());
       return;
     }
-    setPending(true);
     setSourceFilter("");
-    try {
-      const next = await api(
-        "/projects/" + project.id + "/memory?q=" + encodeURIComponent(query),
-      );
-      if (version === request.current) {
-        setResults(next);
-        setSelected("");
-        setError("");
-      }
-    } catch (e) {
-      if (version === request.current) setError((e as Error).message);
-    } finally {
-      if (version === request.current) setPending(false);
-    }
+    setSelected("");
+    void searchSession.search(
+      project.id,
+      query.trim(),
+      (projectId, term) => api(
+        "/projects/" + projectId + "/memory?q=" + encodeURIComponent(term),
+      ),
+      setStoredSearch,
+    );
+  }
+  function submitSearch(event: FormEvent) {
+    event.preventDefault();
+    runSearch();
   }
   return (
     <section className="page memory-page">
       <h1 className="sr-only">Memory</h1>
 
       <div className="memory-toolbar">
-        <form onSubmit={search} className="memory-search-field">
+        <form onSubmit={submitSearch} className="memory-search-field" aria-busy={search.status === "pending"}>
           <SearchField
             label="Search project memory"
             placeholder="Find a decision, source, or outcome…"
             value={query}
             onValueChange={(value) => {
               setQuery(value);
-              if (!value) {
-                ++request.current;
-                setResults(null);
-                setPending(false);
+              if (value !== query) {
+                setStoredSearch(searchSession.clear());
               }
             }}
           />
@@ -149,9 +157,8 @@ export default function Memory({ project, pages }: any) {
             variant="secondary"
             size="sm"
             type="submit"
-            disabled={pending}
           >
-            {pending ? "Searching…" : "Search"}
+            {search.status === "pending" ? "Searching…" : "Search"}
           </Button>
         </form>
         <Tabs value={view} onValueChange={setView}>
@@ -167,10 +174,17 @@ export default function Memory({ project, pages }: any) {
           </TabsList>
         </Tabs>
       </div>
-      {error ? (
-        <p role="alert" className="field-error">
-          {error}
+      {search.status === "pending" ? (
+        <p className="pending" role="status">
+          <DotmSquare3 size={18} dotSize={3} color="var(--lr-signal)" />
+          <span>Searching {project.name} memory…</span>
         </p>
+      ) : null}
+      {search.status === "error" ? (
+        <div className="memory-search-error" role="alert">
+          <p>Search failed: {search.message}</p>
+          <Button variant="outline" onClick={runSearch}>Retry search</Button>
+        </div>
       ) : null}
       <div className="memory-summary">
         <span>
@@ -192,7 +206,7 @@ export default function Memory({ project, pages }: any) {
               className="source-atlas-card"
               onClick={() => {
                 setSourceFilter(source);
-                setResults(null);
+                setStoredSearch(searchSession.clear());
                 setQuery("");
                 setView("library");
                 setSelected(records[0].id);
@@ -236,14 +250,14 @@ export default function Memory({ project, pages }: any) {
               </Button>
             </div>
           ) : null}
-          {visible.length ? (
+          {search.status === "pending" || search.status === "error" ? null : visible.length ? (
             <div
               className={`memory-library ${selected ? "has-selection" : ""}`}
             >
               <div className="memory-shelf" aria-label="Recorded outcomes">
                 <div className="shelf-heading">
                   <span>
-                    {results
+                    {search.status === "success"
                       ? "Search results"
                       : sourceFilter
                         ? "Related outcomes"
@@ -345,6 +359,31 @@ export default function Memory({ project, pages }: any) {
                     {page.content}
                   </Markdown>
                 </div>
+                {page.claimRevisions?.length ? (
+                  <section className="reader-sources" aria-label="Claim revisions">
+                    <h3>Claim revisions</h3>
+                    {page.claimRevisions.map((claim: any, i: number) => (
+                      <div className="reader-source" key={i}>
+                        <span><strong>{claim.status}{claim.relation === "supersedes" ? "; proposed supersession" : claim.relation === "contradicts" ? "; proposed contradiction" : ""}: {claim.key}</strong><br />{claim.statement}
+                          <small>Sources: {claim.sources.map((source: string, index: number) =>
+                            <span key={index}>{index ? ", " : ""}{claimSource(source, `${i}-${index}`)}</span>)}</small>
+                          {claim.related.map((item: any) => (
+                            <small key={`${item.pageId}:${item.claimIndex}`}>Conflicts with {item.pageId} claim {item.claimIndex + 1}: {item.statement} (sources: {item.sources.map((source: string, index: number) =>
+                              <span key={index}>{index ? ", " : ""}{claimSource(source, `${item.pageId}-${item.claimIndex}-${index}`)}</span>)})</small>
+                          ))}
+                        </span>
+                      </div>
+                    ))}
+                  </section>
+                ) : null}
+                {(page.checkEvidenceHistory?.length || page.checkEvidence || page.prEvidence) ? (
+                    <section className="reader-sources" aria-label="Independent evidence">
+                      <h3>Separate evidence</h3>
+                      {(page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : [])).map((report: any) =>
+                        <p key={report.reportId}>Check report <a href={`/api/verification/${report.reportId}`} target="_blank" rel="noreferrer">{report.reportId}</a>: {report.results?.every((check: any) => check.code === 0) && report.sourceUnchanged ? "passed" : "failed or stale"}. Source hash {report.sourceHash}.</p>)}
+                      {page.prEvidence ? <p>PR outcome: <a href={page.prEvidence.url} target="_blank" rel="noreferrer">{page.prEvidence.url}</a> ({page.prEvidence.status}; head {page.prEvidence.headSha}{page.prEvidence.mergedSha ? `; merged ${page.prEvidence.mergedSha}` : ""})</p> : null}
+                    </section>
+                ) : null}
 
                 <div className="reader-sources">
                   <h3>
@@ -386,22 +425,22 @@ export default function Memory({ project, pages }: any) {
             <EmptyState
               className="memory-empty"
               title={
-                results
+                search.status === "success"
                   ? "No matches yet"
                   : "A library that grows with the work"
               }
               description={
-                results
+                search.status === "success"
                   ? "Try a different term, or browse all outcomes."
                   : "Agent outcomes and their sources will appear here."
               }
               icon={<BookOpen size={30} />}
               action={
-                results ? (
+                search.status === "success" ? (
                   <Button
                     variant="outline"
                     onClick={() => {
-                      setResults(null);
+                      setStoredSearch(searchSession.clear());
                       setQuery("");
                     }}
                   >

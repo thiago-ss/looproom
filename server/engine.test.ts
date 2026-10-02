@@ -48,6 +48,456 @@ class FixtureRuntime extends EventEmitter {
   close() {}
 }
 
+test("interruption waits for a human even after another decision is answered", async () => {
+  const dir = await testFixture("looproom-human-restart-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  try {
+    const project = store.put("project", { status: "running" });
+    const task = store.put("task", { projectId: project.id, status: "running", worktree: "/preserved/worktree" });
+    const decision = store.put("gate", { projectId: project.id, taskId: task.id, status: "open", type: "decision" });
+    store.recover();
+    const interruption = store.all("gate", project.id).find((gate) => gate.type === "interrupted")!;
+    await assert.rejects(engine.resolve(interruption.id, "retry", true, "judge"), /human resolution/);
+    await engine.resolve(decision.id, "Continue after recovery", true);
+    assert.equal(store.get(project.id).status, "paused");
+    await engine.resolve(interruption.id, "I reviewed the preserved worktree; retry", true);
+    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+  } finally {
+    engine.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("YOLO cannot recover a preserved worktree while an interruption gate is open", async () => {
+  const dir = await testFixture("looproom-interruption-judge-");
+  const store = new Store(join(dir, "db"));
+  const runtime = new FixtureRuntime();
+  const engine = new Engine(store, runtime as unknown as Runtime, dir);
+  try {
+    store.put("settings", { concurrency: 1, subagent: { model: "gpt-6-sol", effort: "medium" } }, "settings");
+    const project = store.put("project", { status: "running", escalationMode: "yolo", planned: true });
+    const task = store.put("task", { projectId: project.id, status: "blocked", worktree: dir });
+    const decision = store.put("gate", { projectId: project.id, taskId: task.id, type: "decision", status: "open" });
+    store.put("gate", { projectId: project.id, taskId: task.id, type: "interrupted", status: "open" });
+    engine.tick();
+    assert.equal(runtime.profiles.length, 0);
+    await engine.judge(project, decision);
+    assert.equal(runtime.profiles.length, 0);
+    const assessment = { action: "wait" as const, answer: "Wait", summary: "Wait", sources: [], verificationRequests: [] };
+    const result = await engine.recoverEscalation(project, decision, task, assessment);
+    assert.equal(result, assessment);
+    assert.equal(runtime.profiles.length, 0);
+  } finally {
+    engine.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restart gates interrupted YOLO worktree recovery until a human resolves it", async () => {
+  const dir = await testFixture("looproom-yolo-restart-");
+  const path = join(dir, "db");
+  let store = new Store(path);
+  let engine: Engine | undefined;
+  try {
+    store.put("settings", { concurrency: 1, subagent: { model: "gpt-6-sol", effort: "medium" } }, "settings");
+    const project = store.put("project", { status: "running", escalationMode: "yolo", planned: true });
+    const task = store.put("task", { projectId: project.id, status: "blocked", worktree: "/preserved/worktree" });
+    const decision = store.put("gate", {
+      projectId: project.id, taskId: task.id, type: "decision", status: "open",
+      judgeStatus: "running", judgeRecoveryStatus: "running",
+    });
+    const judgeRun = store.put("run", {
+      projectId: project.id, taskId: task.id, role: "judge", status: "running",
+    });
+    store.close();
+    store = new Store(path);
+    store.recover();
+    store.close();
+    store = new Store(path);
+    store.recover();
+    const interruptions = store.all("gate", project.id).filter((gate) => gate.type === "interrupted");
+    assert.equal(interruptions.length, 1);
+    assert.equal(store.get(project.id).status, "paused");
+    assert.equal(store.get(task.id).status, "blocked");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+    assert.equal(store.get(judgeRun.id).status, "interrupted");
+    assert.equal(store.get(decision.id).judgeRecoveryStatus, "interrupted");
+    const runtime = new FixtureRuntime();
+    engine = new Engine(store, runtime as unknown as Runtime, dir);
+    engine.tick();
+    await engine.judge(store.get(project.id), store.get(decision.id));
+    const assessment = { action: "wait" as const, answer: "Wait", summary: "Wait", sources: [], verificationRequests: [] };
+    assert.equal(await engine.recoverEscalation(store.get(project.id), store.get(decision.id), store.get(task.id), assessment), assessment);
+    assert.equal(runtime.profiles.length, 0);
+    await engine.resolve(decision.id, "Continue after review", true);
+    assert.equal(store.get(project.id).status, "paused");
+    await assert.rejects(engine.resolve(interruptions[0].id, "retry", true, "judge"), /human resolution/);
+    assert.equal(runtime.profiles.length, 0);
+    await engine.resolve(interruptions[0].id, "I reviewed the preserved worktree; stop this task", false);
+    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(task.id).status, "cancelled");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+    assert.equal(runtime.profiles.length, 0);
+  } finally {
+    engine?.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("judge-only YOLO restart pauses dispatch until human recovery", async () => {
+  const dir = await testFixture("looproom-yolo-judge-only-restart-");
+  const path = join(dir, "db");
+  let store = new Store(path);
+  let engine: Engine | undefined;
+  try {
+    store.put("settings", { concurrency: 1, subagent: { model: "gpt-6-sol", effort: "medium" } }, "settings");
+    const project = store.put("project", { status: "running", escalationMode: "yolo", planned: true });
+    const task = store.put("task", { projectId: project.id, status: "blocked", worktree: "/preserved/worktree" });
+    const decision = store.put("gate", {
+      projectId: project.id, taskId: task.id, type: "decision", status: "open",
+      judgeStatus: "running",
+    });
+    const judgeRun = store.put("run", {
+      projectId: project.id, taskId: task.id, role: "judge", status: "running",
+    });
+    store.close();
+    store = new Store(path);
+    store.recover();
+    store.close();
+    store = new Store(path);
+    store.recover();
+    const interruptions = store.all("gate", project.id).filter((gate) => gate.type === "interrupted");
+    assert.equal(interruptions.length, 1);
+    assert.equal(store.get(judgeRun.id).status, "interrupted");
+    assert.equal(store.get(project.id).status, "paused");
+    assert.equal(store.get(task.id).status, "blocked");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+    const runtime = new FixtureRuntime();
+    engine = new Engine(store, runtime as unknown as Runtime, dir);
+    engine.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(runtime.profiles.length, 0);
+    await engine.resolve(decision.id, "Review this decision after restart", true);
+    engine.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(store.get(project.id).status, "paused");
+    assert.equal(runtime.profiles.length, 0);
+    await assert.rejects(engine.resolve(interruptions[0].id, "retry", true, "judge"), /human resolution/);
+    await engine.resolve(interruptions[0].id, "I reviewed the preserved worktree; stop this task", false);
+    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(task.id).status, "cancelled");
+    assert.equal(store.get(task.id).worktree, "/preserved/worktree");
+  } finally {
+    engine?.close();
+    store.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const reviewedSha = "a".repeat(40);
+function mergeFixture(store: Store) {
+  const project = store.put("project", { github: "example/repo", status: "running" });
+  const task = store.put("task", { projectId: project.id, status: "awaiting_human" });
+  const gate = store.put("gate", {
+    projectId: project.id, taskId: task.id, type: "pr", status: "open",
+    pr: "https://github.com/example/repo/pull/7", sha: reviewedSha,
+    title: "Review pull request", detail: "Review revision", createdAt: new Date().toISOString(),
+  });
+  return { project, task, gate };
+}
+function prState(overrides: Record<string, any> = {}) {
+  return {
+    number: 7, url: "https://github.com/example/repo/pull/7",
+    headRefOid: reviewedSha, state: "OPEN", mergeable: "MERGEABLE", mergedAt: null,
+    statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }],
+    ...overrides,
+  };
+}
+
+test("broker boundary rejects missing approval, stale head, closed PR, conflicts and checks", async () => {
+  const dir = await testFixture("looproom-merge-preflight-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate } = mergeFixture(store);
+  let state = prState();
+  let puts = 0;
+  engine.mergeBroker = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(state);
+    puts++;
+    return JSON.stringify({ merged: true, sha: "b".repeat(40) });
+  };
+  try {
+    await assert.rejects(engine.approve(gate.id, "b".repeat(40)), /displayed revision/);
+    for (const [patch, pattern] of [
+      [{ headRefOid: "b".repeat(40) }, /revision changed/],
+      [{ state: "CLOSED" }, /not open/],
+      [{ mergeable: "CONFLICTING" }, /conflicts/],
+      [{ statusCheckRollup: [{ __typename: "CheckRun", status: "IN_PROGRESS" }] }, /pending/],
+      [{ statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "FAILURE" }] }, /failing/],
+    ] as const) {
+      state = prState(patch);
+      await assert.rejects(engine.approve(gate.id, reviewedSha), pattern);
+    }
+    assert.equal(puts, 0);
+    assert.equal(store.all("approval").length, 0);
+    assert.equal(store.get(gate.id).mergeAttempt, undefined);
+  } finally {
+    engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent and replayed approvals submit only the reviewed SHA once", async () => {
+  const dir = await testFixture("looproom-merge-race-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate, task } = mergeFixture(store);
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => { release = resolve; });
+  let puts = 0;
+  engine.mergeBroker = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(prState());
+    puts++;
+    assert.equal(args[3], "repos/example/repo/pulls/7/merge");
+    assert.deepEqual(args.slice(-4), ["-f", "sha=" + reviewedSha, "-f", "merge_method=squash"]);
+    await pending;
+    return JSON.stringify({ merged: true, sha: "b".repeat(40) });
+  };
+  try {
+    const first = engine.approve(gate.id, reviewedSha);
+    // Both preflights may finish; only one can reserve the durable intent.
+    await assert.rejects(engine.approve(gate.id, reviewedSha), /no longer open|already has a merge attempt|already being submitted/);
+    release();
+    await first;
+    await assert.rejects(engine.approve(gate.id, reviewedSha), /no longer open/);
+    assert.equal(puts, 1);
+    assert.equal(store.get(task.id).status, "completed");
+    assert.equal(store.all("approval").length, 1);
+    assert.equal(store.all("approval")[0].reviewedSha, reviewedSha);
+  } finally {
+    release(); engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("restart reconciles interrupted merge intent without replay or invented approval", async () => {
+  for (const remoteState of ["OPEN", "MERGED", "CLOSED"]) {
+    const dir = await testFixture("looproom-merge-restart-");
+    let store = new Store(join(dir, "db"));
+    const { gate, task } = mergeFixture(store);
+    store.patch(gate.id, {
+      status: "merging",
+      mergeAttempt: { reviewedSha, pr: gate.pr, number: 7, requestedAt: new Date().toISOString() },
+    });
+    store.close();
+    store = new Store(join(dir, "db"));
+    store.recover();
+    const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+    let puts = 0;
+    engine.mergeBroker = async (args) => {
+      if (args[0] === "pr") return JSON.stringify(prState({ state: remoteState, mergeCommit: { oid: "b".repeat(40) } }));
+      puts++; return "";
+    };
+    try {
+      await engine.reconcileMerges();
+      const recovered = store.get(gate.id);
+      assert.equal(recovered.mergeAttempt.reviewedSha, reviewedSha);
+      assert.equal(recovered.status, remoteState === "MERGED" ? "reconciled" : "open");
+      assert.equal(store.get(task.id).status, remoteState === "MERGED" ? "completed" : "awaiting_human");
+      assert.equal(store.all("approval").length, 0);
+      await assert.rejects(engine.approve(gate.id, reviewedSha), /no longer open|manual reconciliation/);
+      assert.equal(puts, 0);
+    } finally {
+      engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("lost broker response keeps durable intent and does not permit a second merge", async () => {
+  const dir = await testFixture("looproom-merge-uncertain-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate } = mergeFixture(store);
+  let puts = 0;
+  engine.mergeBroker = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(prState());
+    puts++;
+    throw new Error("connection lost after PUT");
+  };
+  try {
+    await assert.rejects(engine.approve(gate.id, reviewedSha), /connection lost/);
+    assert.equal(store.get(gate.id).status, "open");
+    assert.equal(store.get(gate.id).mergeAttempt.reviewedSha, reviewedSha);
+    await assert.rejects(engine.approve(gate.id, reviewedSha), /manual reconciliation/);
+    assert.equal(puts, 1);
+    assert.equal(store.all("approval").length, 0);
+  } finally {
+    engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("request changes cannot release a PR gate with an uncertain merge attempt", async () => {
+  const dir = await testFixture("looproom-merge-request-changes-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate, task } = mergeFixture(store);
+  let puts = 0;
+  engine.mergeBroker = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(prState());
+    puts++;
+    throw new Error("merge response lost");
+  };
+  try {
+    await assert.rejects(engine.approve(gate.id, reviewedSha), /merge response lost/);
+    for (const retry of [true, false]) {
+      await assert.rejects(
+        engine.resolve(gate.id, "Request changes before merging", retry),
+        /Reconcile the outstanding merge attempt/,
+      );
+    }
+    assert.equal(store.get(gate.id).status, "open");
+    assert.equal(store.get(gate.id).mergeAttempt.reviewedSha, reviewedSha);
+    assert.equal(store.get(task.id).status, "awaiting_human");
+    assert.equal(store.all("approval").length, 0);
+    assert.equal(puts, 1);
+  } finally {
+    engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("merge target stays bound to reviewed PR when project origin changes", async () => {
+  const dir = await testFixture("looproom-merge-origin-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate, project } = mergeFixture(store);
+  store.patch(project.id, { github: "other/repo" });
+  const targets: string[] = [];
+  engine.mergeBroker = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(prState());
+    targets.push(args[3]);
+    return JSON.stringify({ merged: true, sha: "b".repeat(40) });
+  };
+  try {
+    await engine.approve(gate.id, reviewedSha);
+    assert.deepEqual(targets, ["repos/example/repo/pulls/7/merge"]);
+  } finally {
+    engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("human recovery archives changed-head and closed-unmerged attempts for Request changes", async () => {
+  for (const [remote, recoveryText] of [
+    [prState({ headRefOid: "c".repeat(40) }), /different PR head/],
+    [prState({ state: "CLOSED", mergeCommit: null }), /closed without a merge/],
+  ] as const) {
+    const dir = await testFixture("looproom-merge-manual-recovery-");
+    const store = new Store(join(dir, "db"));
+    const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+    const { gate, task } = mergeFixture(store);
+    let state = prState();
+    let puts = 0;
+    engine.mergeBroker = async (args) => {
+      if (args[0] === "pr") return JSON.stringify(state);
+      puts++;
+      throw new Error("response lost");
+    };
+    try {
+      await assert.rejects(engine.approve(gate.id, reviewedSha), /response lost/);
+      const attempt = store.get(gate.id).mergeAttempt;
+      state = remote;
+      await engine.reconcileMerge(gate.id, true);
+      const recovered = store.get(gate.id);
+      assert.equal(recovered.status, "open");
+      assert.equal(recovered.mergeAttempt, null);
+      assert.deepEqual(recovered.mergeAttempts, [attempt]);
+      assert.match(recovered.mergeRecovery, recoveryText);
+      assert.equal(store.get(task.id).status, "awaiting_human");
+      assert.equal(store.all("approval").length, 0);
+      assert.equal(puts, 1);
+      await assert.rejects(engine.reconcileMerge(gate.id, true), /No interrupted PR merge/);
+      assert.equal(store.all("approval").length, 0);
+      assert.equal(puts, 1);
+      await assert.rejects(
+        engine.approve(gate.id, remote.headRefOid),
+        /displayed revision|not open/,
+      );
+      assert.equal(puts, 1);
+      await assert.rejects(engine.resolve(gate.id, "Review the changed PR before retrying.", true), /PR gates require human approval/);
+      assert.equal(store.get(task.id).status, "awaiting_human");
+      assert.deepEqual(store.get(gate.id).mergeAttempts, [attempt]);
+      assert.equal(store.all("approval").length, 0);
+      assert.equal(puts, 1);
+    } finally {
+      engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("human recovery of the same open head retains history before a fresh approval", async () => {
+  const dir = await testFixture("looproom-merge-same-head-recovery-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate } = mergeFixture(store);
+  let puts = 0;
+  engine.mergeBroker = async (args) => {
+    if (args[0] === "pr") return JSON.stringify(prState());
+    puts++;
+    if (puts === 1) throw new Error("response lost");
+    assert.deepEqual(args.slice(-4), ["-f", "sha=" + reviewedSha, "-f", "merge_method=squash"]);
+    return JSON.stringify({ merged: true, sha: "b".repeat(40) });
+  };
+  try {
+    await assert.rejects(engine.approve(gate.id, reviewedSha), /response lost/);
+    const attempt = store.get(gate.id).mergeAttempt;
+    await engine.reconcileMerge(gate.id, true);
+    assert.equal(store.get(gate.id).mergeAttempt, null);
+    assert.deepEqual(store.get(gate.id).mergeAttempts, [attempt]);
+    assert.equal(store.get(gate.id).status, "open");
+    assert.equal(store.all("approval").length, 0);
+    assert.equal(puts, 1);
+    await engine.approve(gate.id, reviewedSha);
+    assert.equal(puts, 2);
+    assert.equal(store.all("approval")[0].reviewedSha, reviewedSha);
+  } finally {
+    engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("human recovery keeps intent when the PR read fails, identity changes or state is ambiguous", async () => {
+  const dir = await testFixture("looproom-merge-ambiguous-recovery-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, new FixtureRuntime() as unknown as Runtime, dir);
+  const { gate } = mergeFixture(store);
+  store.patch(gate.id, {
+    mergeAttempt: { reviewedSha, pr: gate.pr, number: 7, requestedAt: new Date().toISOString() },
+  });
+  let state: Record<string, any> | null = null;
+  engine.mergeBroker = async () => {
+    if (!state) throw new Error("read failed");
+    return JSON.stringify(state);
+  };
+  try {
+    await assert.rejects(engine.reconcileMerge(gate.id, true), /read failed/);
+    for (const remote of [
+      prState({ url: "https://github.com/example/repo/pull/8" }),
+      prState({ state: "CLOSED", mergedAt: undefined }),
+      prState({ state: "OPEN", headRefOid: null }),
+    ]) {
+      state = remote;
+      if (remote.number === 7 && remote.url !== gate.pr)
+        await assert.rejects(engine.reconcileMerge(gate.id, true), /identity changed/);
+      else await engine.reconcileMerge(gate.id, true);
+      assert.equal(store.get(gate.id).mergeAttempt.reviewedSha, reviewedSha);
+      assert.equal(store.all("approval").length, 0);
+    }
+  } finally {
+    engine.close(); store.close(); await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("planner → isolated worker → check → reviewer preserves artifacts and gates a missing GitHub remote", async () => {
   const dir = await testFixture("looproom-engine-");
   const store = new Store(join(dir, "db"));

@@ -110,6 +110,7 @@ export type VerificationResult = {
 };
 export type VerificationReport = {
   id: string;
+  runId?: string;
   sourceHash: string;
   sourceUnchanged: boolean;
   results: VerificationResult[];
@@ -134,6 +135,7 @@ export async function cleanupTestFixtures(cwd: string) {
 export async function runVerification(options: {
   cwd: string;
   commands: string[];
+  runId?: string;
   dataDir: string;
   codexBinary: string;
   protectedPorts?: number[];
@@ -360,6 +362,7 @@ export async function runVerification(options: {
     const sourceUnchanged = sourceHash === (await sourceFingerprint(cwd));
     const report = {
       id,
+      ...(options.runId ? { runId: options.runId } : {}),
       sourceHash,
       sourceUnchanged,
       results,

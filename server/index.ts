@@ -1,10 +1,12 @@
 import { escalationMode } from "../src/lib/autonomy.ts";
 import express from "express";
 import { randomBytes } from "node:crypto";
+import { createServer } from "node:http";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { access, mkdir, realpath, stat, readFile } from "node:fs/promises";
+import { access, mkdir, realpath, stat, readFile, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { chooseFolder, droppedFolder } from "./folders.ts";
 import { Store } from "./store.ts";
@@ -16,8 +18,33 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataDir =
   process.env.LOOPROOM_DATA_DIR ??
   join(homedir(), "Library", "Application Support", "Looproom");
+const port = Number(process.env.PORT ?? 4319);
+if (!Number.isInteger(port) || port < 0 || port > 65535)
+  throw new Error("PORT must be a number from 0 to 65535.");
 await mkdir(dataDir, { recursive: true, mode: 0o700 });
-const store = new Store(join(dataDir, "looproom.sqlite"));
+const canonicalDataDir = await realpath(dataDir);
+// Own the coordinator port before opening SQLite or running crash recovery.
+const server = createServer((_req, res) => {
+  res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "1" });
+  res.end(JSON.stringify({ app: "looproom", status: "starting", root: appRoot, dataDir: canonicalDataDir }));
+});
+await new Promise<void>((done, fail) => {
+  server.once("error", fail);
+  server.listen(port, "127.0.0.1", () => {
+    server.off("error", fail);
+    done();
+  });
+});
+const ownership = new DatabaseSync(join(canonicalDataDir, "coordinator-owner.sqlite"));
+try {
+  ownership.exec("BEGIN IMMEDIATE");
+} catch (error) {
+  ownership.close();
+  server.close();
+  throw new Error(`Another Looproom coordinator owns ${canonicalDataDir}. Open its existing window or stop that coordinator before restarting on another port. ${error instanceof Error ? error.message : String(error)}`);
+}
+await writeFile(join(canonicalDataDir, "coordinator-owner.json"), JSON.stringify({ root: appRoot, dataDir: canonicalDataDir, port: (server.address() as any).port }) + "\n", { mode: 0o600 });
+const store = new Store(join(canonicalDataDir, "looproom.sqlite"));
 const defaults = JSON.parse(
   await readFile(join(appRoot, "config", "model-profiles.json"), "utf8"),
 );
@@ -45,12 +72,12 @@ store.recover();
 store.syncConversation();
 const runtime = new Runtime(
   process.env.CODEX_BINARY ?? "codex",
-  join(dataDir, "codex"),
+  join(canonicalDataDir, "codex"),
 );
-const engine = new Engine(store, runtime, dataDir);
+const engine = new Engine(store, runtime, canonicalDataDir);
+await engine.recoverWiki();
 const app = express();
 const session = randomBytes(32).toString("hex");
-const port = Number(process.env.PORT ?? 4319);
 app.disable("x-powered-by");
 app.use((req, res, next) => {
   const host = req.headers.host?.split(":")[0];
@@ -140,7 +167,7 @@ runtime.on("disconnected", (error) => {
   engine.emit("change");
 });
 app.get("/api/health", (_req, res) =>
-  res.json({ app: "looproom", status: "ok" }),
+  res.json({ app: "looproom", status: "ok", root: appRoot, dataDir: canonicalDataDir }),
 );
 let stateCache:
   | { storeRevision: number; runtimeRevision: number; json: string }
@@ -317,6 +344,8 @@ app.post(
     const id = String(req.params.id),
       project = store.get(id, "project");
     if (action === "start") {
+      if (store.hasOpenInterruption(id))
+        throw new Error("Review and resolve the interrupted work in Review before starting this project.");
       const repo = await inspectRepo(project.path);
       store.patch(id, {
         ...repo,
@@ -362,7 +391,7 @@ app.post(
     const body = z
       .object({ initial: z.string().max(4096).optional() })
       .parse(req.body);
-    res.json({ path: await chooseFolder(appRoot, dataDir, body.initial) });
+    res.json({ path: await chooseFolder(appRoot, canonicalDataDir, body.initial) });
   }),
 );
 app.post(
@@ -375,7 +404,7 @@ app.post(
       })
       .parse(req.body);
     res.json({
-      path: await droppedFolder(appRoot, dataDir, body.names, body.uri),
+      path: await droppedFolder(appRoot, canonicalDataDir, body.names, body.uri),
     });
   }),
 );
@@ -471,6 +500,13 @@ app.post(
   }),
 );
 app.post(
+  "/api/gates/:id/reconcile-merge",
+  route(async (req, res) => {
+    await engine.reconcileMerge(String(req.params.id), true);
+    res.json({ ok: true });
+  }),
+);
+app.post(
   "/api/gates/:id/resolve",
   route(async (req, res) => {
     const body = z
@@ -508,6 +544,18 @@ app.get("/api/projects/:id/memory", (req, res) => {
   store.get(projectId, "project");
   res.json(store.search(projectId, String(req.query.q ?? "")));
 });
+app.get("/api/verification/:id", route(async (req, res) => {
+  const id = String(req.params.id);
+  if (!/^[0-9a-f-]{36}$/i.test(id) ||
+      !store.all("memory").some((page) =>
+        (page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : []))
+          .some((check: { reportId: string }) => check.reportId === id))) {
+    res.status(404).json({ error: "Check report not found." });
+    return;
+  }
+  const report = await readFile(join(dataDir, "verification", id + ".json"), "utf8");
+  res.type("json").send(report);
+}));
 app.get(
   "/api/tasks/:id/diff",
   route(async (req, res) => {
@@ -546,18 +594,16 @@ app.use(
     });
   },
 );
-const server = app.listen(port, "127.0.0.1");
-server.once("listening", () => {
-  console.log(
-    `Looproom coordinator: http://127.0.0.1:${(server.address() as any).port}`,
-  );
-  void refreshRuntime();
-  engine.start();
-});
+server.removeAllListeners("request");
+server.on("request", app);
+console.log(`Looproom coordinator: http://127.0.0.1:${(server.address() as any).port}`);
+void refreshRuntime();
+engine.start();
 server.on("error", (error) => {
   console.error("Looproom could not start: " + error.message);
   engine.close();
   store.close();
+  ownership.close();
   process.exit(1);
 });
 let shuttingDown = false;
@@ -574,6 +620,7 @@ function shutdown() {
   server.close(() => {
     clearTimeout(forceConnections);
     store.close();
+    ownership.close();
     process.exit(0);
   });
 }

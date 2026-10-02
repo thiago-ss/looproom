@@ -99,20 +99,28 @@ export class Store {
       .all(projectId ?? null, projectId ?? null) as any[];
     return rows.map((row) => ({ ...row, data: JSON.parse(row.data) }));
   }
-  memory(projectId: string, title: string, content: string, sources: string[]) {
+  memory(projectId: string, title: string, content: string, sources: string[], runId?: string, claims: any[] = [], taskId?: string) {
+    const id = runId ? "memory:" + runId : randomUUID();
+    const existing = runId ? this.db.prepare("SELECT data FROM records WHERE id=?").get(id) as { data: string } | undefined : undefined;
+    if (existing) return JSON.parse(existing.data) as RecordData;
+    return this.transaction(() => {
     const record = this.put("memory", {
       projectId,
       title,
       content,
       sources,
+      runId,
+      taskId,
+      claims,
       createdAt: new Date().toISOString(),
-    });
+    }, id);
     this.db
       .prepare(
         "INSERT INTO memory_search(id,project_id,title,content) VALUES(?,?,?,?)",
       )
       .run(record.id, projectId, title, content);
     return record;
+    });
   }
   search(projectId: string, query: string) {
     const terms = query
@@ -234,6 +242,10 @@ export class Store {
         Number(b.kind === "escalation") - Number(a.kind === "escalation"),
     );
   }
+  hasOpenInterruption(projectId: string) {
+    return this.all("gate", projectId).some((gate) =>
+      gate.status === "open" && gate.type === "interrupted");
+  }
   recover() {
     this.transaction(() => {
       const interrupted = this.all("run").filter(
@@ -245,6 +257,22 @@ export class Store {
           projectId: run.projectId,
           taskId: run.taskId,
         }));
+      const openGates = this.all("gate").filter((gate) => gate.status === "open");
+      // A YOLO judgment may submit a reply or start worktree recovery. Its
+      // interrupted run needs a human gate even when the task was blocked.
+      for (const run of interrupted.filter((run) => run.role === "judge" && run.taskId)) {
+        if (escalationMode(this.get(run.projectId)) !== "yolo") continue;
+        if (openGates.some((gate) =>
+          gate.projectId === run.projectId && gate.taskId === run.taskId &&
+          gate.type !== "pr" && gate.judgeStatus === "running"))
+          recovery.push({ projectId: run.projectId, taskId: run.taskId });
+      }
+      const activeRecoveryGates = openGates.filter(
+        (gate) => gate.taskId &&
+          ["running", "verifying"].includes(gate.judgeRecoveryStatus),
+      );
+      for (const gate of activeRecoveryGates)
+        recovery.push({ projectId: gate.projectId, taskId: gate.taskId });
       for (const run of interrupted)
         this.patch(run.id, {
           status: "interrupted",
@@ -252,15 +280,20 @@ export class Store {
           finishedAt: new Date().toISOString(),
         });
       for (const gate of this.all("gate").filter(
-        (gate) => gate.status === "open" && gate.judgeStatus === "running",
+        (gate) => gate.status === "open" &&
+          (gate.judgeStatus === "running" || activeRecoveryGates.some((active) => active.id === gate.id)),
       ))
         this.patch(gate.id, {
           judgeStatus:
-            escalationMode(this.get(gate.projectId)) === "yolo" &&
-            (gate.judgeFailures ?? 0) < 3
-              ? "pending"
-              : "failed",
-          judgeError: "Coordinator restarted during judgment.",
+            gate.judgeStatus === "running"
+              ? escalationMode(this.get(gate.projectId)) === "yolo" &&
+                  (gate.judgeFailures ?? 0) < 3
+                ? "pending"
+                : "failed"
+              : gate.judgeStatus,
+          judgeError: gate.judgeStatus === "running"
+            ? "Coordinator restarted during judgment."
+            : gate.judgeError,
           judgeRecoveryStatus:
             ["running", "verifying"].includes(gate.judgeRecoveryStatus)
               ? "interrupted"
@@ -277,11 +310,9 @@ export class Store {
         seen.add(key);
         if (item.taskId) this.patch(item.taskId, { status: "blocked" });
         this.patch(item.projectId, { status: "paused" });
-        if (
-          this.all("gate", item.projectId).some(
-            (gate) => gate.status === "open" && gate.taskId === item.taskId,
-          )
-        )
+        if (this.all("gate", item.projectId).some(
+          (gate) => gate.status === "open" && gate.type === "interrupted" && gate.taskId === item.taskId,
+        ))
           continue;
         this.put("gate", {
           ...item,

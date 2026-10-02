@@ -100,7 +100,7 @@ test("restart preserves interrupted task and judge gate without redispatch", asy
     assert.equal(store.get(project.id).status, "paused");
     assert.equal(store.get(gate.id).judgeStatus, "pending");
     assert.equal(store.get(gate.id).judgeRecoveryStatus, "interrupted");
-    assert.equal(store.all("gate", project.id).length, 1);
+    assert.equal(store.all("gate", project.id).filter(g => g.type === "interrupted").length, 1);
     const runtime = Object.assign(new EventEmitter(), { close() {} }) as Runtime;
     const engine = new Engine(store, runtime, dir);
     let dispatches = 0;
@@ -136,10 +136,10 @@ test("two approval submissions for one revision cause one merge request and one 
     engine.prInfo = async () => {
       signalInfo();
       await infoHeld;
-      return { number: 1, state: "OPEN", headRefOid: sha,
+      return { number: 1, url: gate.pr, state: "OPEN", headRefOid: sha,
         statusCheckRollup: [], mergeable: "MERGEABLE" };
     };
-    engine.mergePr = async () => { mergeCalls++; return { merged: true, sha: "b".repeat(40) }; };
+    engine.mergeBroker = async () => { mergeCalls++; return JSON.stringify({ merged: true, sha: "b".repeat(40) }); };
     const first = engine.approve(gate.id, sha);
     await infoStarted;
     await assert.rejects(engine.approve(gate.id, sha), /already being submitted/);
@@ -154,7 +154,7 @@ test("two approval submissions for one revision cause one merge request and one 
     const malformed = store.put("gate", {
       projectId: project.id, taskId: project.id, status: "open", type: "pr", sha,
     });
-    await assert.rejects(engine.approve(malformed.id, sha), /Record not found/);
+    await assert.rejects(engine.approve(malformed.id, sha), /identity changed|Record not found/);
     assert.equal(mergeCalls, 1);
   } finally {
     engine.close();
@@ -225,7 +225,7 @@ test("request changes binds the current PR revision, preserves human feedback an
       return { number: 1, state: "OPEN", headRefOid: head,
         statusCheckRollup: [], mergeable: "MERGEABLE" };
     };
-    engine.mergePr = async () => { merges++; return { merged: true, sha: otherSha }; };
+    engine.mergeBroker = async () => { merges++; return JSON.stringify({ merged: true, sha: otherSha }); };
     await assert.rejects(engine.requestChanges(gate.id, otherSha, "Fix this"),
       /displayed revision/);
     assert.equal(store.get(gate.id).status, "open");
