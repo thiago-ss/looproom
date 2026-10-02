@@ -453,9 +453,9 @@ export class Engine extends EventEmitter {
     return run;
   }
   async repairReconciledEvidence(gate: RecordData) {
-    const attempt = gate.mergeAttempt ?? (gate.remoteObservation && {
+    const attempt = gate.remoteObservation ? {
       pr: gate.remoteObservation.url, reviewedSha: gate.remoteObservation.headSha,
-    });
+    } : gate.mergeAttempt;
     if (gate.type !== "pr" || gate.status !== "reconciled" || !attempt ||
         gate.pr !== attempt.pr || !gate.mergedSha) return;
     // A reconciled remote fact is not a human approval. Attribute only records
@@ -1262,12 +1262,14 @@ export class Engine extends EventEmitter {
     this.validateRemotePr(gate, this.store.get(gate.projectId), info);
     if (info.url !== gate.pr || info.url !== attempt.pr || info.number !== attempt.number)
       throw new Error("PR identity changed; inspect GitHub before continuing.");
-    if (info.state === "MERGED" && info.headRefOid === attempt.reviewedSha) {
+    if (info.state === "MERGED") {
       this.store.transaction(() => {
         const current = this.store.get(gateId);
         if (current.mergeAttempt?.requestedAt !== attempt.requestedAt || !["merging", "open"].includes(current.status))
           throw new Error("Merge attempt changed during reconciliation.");
-        this.store.patch(gateId, { status: "reconciled", mergeRecovery: "Remote PR merged at the reviewed head; merge actor unverified.", mergedSha: info.mergeCommit.oid, resolvedAt: new Date().toISOString(),
+        this.store.patch(gateId, { status: "reconciled", mergeRecovery: info.headRefOid === attempt.reviewedSha
+            ? "Remote PR merged at the reviewed head; merge actor unverified."
+            : "Merged externally at a different head; the earlier review does not authorize that revision.", mergedSha: info.mergeCommit.oid, resolvedAt: new Date().toISOString(),
           remoteObservation: { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable, mergedSha: info.mergeCommit.oid, mergedAt: info.mergedAt, observedAt: new Date().toISOString() } });
         this.store.patch(gate.taskId, { status: "completed" });
       });

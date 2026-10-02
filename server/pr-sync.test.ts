@@ -259,3 +259,30 @@ test("a late request-changes reply cannot resolve a review after shutdown", asyn
     assert.equal(f.store.all("message").length, 0);
   } finally { release?.(); await f.close(); }
 });
+
+test("a different final merged head releases an uncertain attempt without borrowing its approval or wiki review", async () => {
+  const f = await fixture("paused");
+  try {
+    const run = f.store.put("run", { projectId: f.project.id, taskId: f.task.id, role: "implementation", status: "completed", prEvidence: { url, headSha: head, status: "awaiting_human" } });
+    await f.engine.document(f.project.id, "Attempted revision", "Old head outcome", [url], run.id);
+    await f.engine.recordRunEvidence(f.task.id, { prEvidence: { url, headSha: head, status: "awaiting_human" } }, run.id);
+    const rawPath = join(f.dir, "wiki", f.project.id, "raw", run.id + ".json");
+    const raw = await readFile(rawPath);
+    const attempt = { pr: url, number: 1, reviewedSha: head, prRunId: run.id, requestedAt: "fixture" };
+    f.store.patch(f.gate.id, { status: "open", mergeAttempt: attempt });
+    const finalHead = "c".repeat(40);
+    f.setInfo({ headRefOid: finalHead });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.gate.id).status, "reconciled");
+    assert.equal(f.store.get(f.task.id).status, "completed");
+    assert.deepEqual(f.store.get(f.gate.id).mergeAttempt, attempt);
+    assert.equal(f.store.get(f.gate.id).remoteObservation.headSha, finalHead);
+    assert.match(f.store.get(f.gate.id).mergeRecovery, /earlier review does not authorize/);
+    await f.engine.recoverWiki();
+    assert.equal(f.store.get(run.id).prEvidence.status, "awaiting_human");
+    assert.equal(f.store.get("memory:" + run.id).prEvidence.status, "awaiting_human");
+    assert.deepEqual(await readFile(rawPath), raw);
+    assert.equal(f.store.all("approval").length, 0);
+    await assert.rejects(f.engine.approve(f.gate.id, finalHead), /no longer open/);
+  } finally { await f.close(); }
+});
