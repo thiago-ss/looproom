@@ -1,13 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, writeFile, realpath, rename, rm, link } from "node:fs/promises";
+import { mkdir, readFile, writeFile, realpath, rename, rm, link, lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
 import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
-import { runVerification } from "./verification.ts";
+import { runVerification, sourceFingerprint } from "./verification.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
 const TaskPlan = z.object({
@@ -830,7 +830,11 @@ export class Engine extends EventEmitter {
       return;
     }
     if (task.prRepair) await this.stagePrConflicts(task);
-    this.store.patch(task.id, { status: "verifying", summary: result.summary });
+    await this.stageProduct(task);
+    const checkedSource = { sourceHash: await sourceFingerprint(task.worktree),
+      tree: await git(task.worktree, ["write-tree"]), head: await git(task.worktree, ["rev-parse", "HEAD"]),
+      mergeHead: await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "") };
+    this.store.patch(task.id, { status: "verifying", summary: result.summary, reviewedSource: null });
     const report = project.checks.length
       ? await this.verify(project, task, project.checks, false, this.store.get(task.id).implementationRunId)
       : undefined;
@@ -900,6 +904,13 @@ export class Engine extends EventEmitter {
       );
       return;
     }
+    if (await sourceFingerprint(task.worktree) !== checkedSource.sourceHash ||
+        await git(task.worktree, ["write-tree"]) !== checkedSource.tree) {
+      this.repairOrGate(project, task, "Source changed after verification or review",
+        "Repeat checks and independent review against the current source.", "check");
+      return;
+    }
+    this.store.patch(task.id, { reviewedSource: checkedSource });
     await this.freezeBaseline(project, this.store.get(task.id));
     await this.publish(project, this.store.get(task.id));
   }
@@ -929,6 +940,26 @@ export class Engine extends EventEmitter {
         type,
         task.id,
       );
+  }
+  async stageProduct(task: RecordData) {
+    const paths = ["--", ".", ":(top,exclude).looproom-verification"];
+    const changed = (await git(task.worktree, ["diff", "HEAD", "--name-only", "-z", ...paths])).split("\0").filter(Boolean);
+    const untracked = (await git(task.worktree, ["ls-files", "--others", "--exclude-standard", "-z", ...paths])).split("\0").filter(Boolean);
+    const unsafe = [...new Set([...changed, ...untracked])].filter(path =>
+      /(^|\/)(node_modules|dist|auth\.json|\.npmrc|\.netrc|\.codex|\.ssh|\.aws|\.gnupg|\.env(?:\.[^/]*)?|\.looproom-test-fixtures)(\/|$)/.test(path) || /\.(pem|key)$/i.test(path));
+    if (unsafe.length) throw new Error("Exclude protected or generated files before review: " + unsafe.slice(0, 8).join(", "));
+    await git(task.worktree, ["add", "--all", ...paths]);
+  }
+  async reviewedSourceMatches(task: RecordData) {
+    const evidence = task.reviewedSource;
+    if (!evidence || await sourceFingerprint(task.worktree) !== evidence.sourceHash ||
+        await git(task.worktree, ["write-tree"]) !== evidence.tree ||
+        await git(task.worktree, ["rev-parse", "HEAD"]) !== evidence.head ||
+        (await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "")) !== evidence.mergeHead)
+      return false;
+    const paths = ["--", ".", ":(top,exclude).looproom-verification"];
+    return !(await git(task.worktree, ["diff", "--name-only", ...paths])) &&
+      !(await git(task.worktree, ["ls-files", "--others", "--exclude-standard", "-z", ...paths]));
   }
   async publish(project: RecordData, task: RecordData) {
     if (this.store.get(project.id).status !== "running") {
@@ -964,31 +995,10 @@ export class Engine extends EventEmitter {
     const merging = !!(await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => ""));
     const productPaths = ["--", ".", ":(top,exclude).looproom-verification"];
     const diff = await git(task.worktree, ["status", "--porcelain", ...productPaths]);
-    const untracked = (
-      await git(task.worktree, [
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        ...productPaths,
-      ])
-    )
-      .split("\0")
-      .filter(Boolean);
-    const unsafe = untracked.filter(
-      (path) =>
-        /(^|\/)(node_modules|auth\.json|\.env(?:\.[^/]*)?)(\/|$)/.test(path) ||
-        /\.(pem|key)$/.test(path),
-    );
-    if (unsafe.length) {
-      this.gate(
-        project.id,
-        "Check files before publishing",
-        "These untracked paths need exclusion or review: " +
-          unsafe.slice(0, 8).join(", "),
-        "publication",
-        task.id,
-      );
+    if (!(await this.reviewedSourceMatches(task))) {
+      this.store.patch(task.id, { reviewedSource: null });
+      this.repairOrGate(project, task, "Source changed after independent review",
+        "Repeat checks and review before publishing the changed source or Git tree.", "check");
       return;
     }
     if (!diff && !task.pr) {
@@ -1000,7 +1010,6 @@ export class Engine extends EventEmitter {
       return;
     }
     if (diff || merging) {
-      await git(task.worktree, ["add", "--all", ...productPaths]);
       await git(task.worktree, [
         "-c",
         "user.name=Looproom agent",
@@ -1207,6 +1216,7 @@ export class Engine extends EventEmitter {
     const files = (await this.gitRunner(task.worktree, ["diff", "--name-only", "--diff-filter=U", "-z"]))
       .split("\0").filter(Boolean);
     for (const file of files) {
+      if ((await lstat(join(task.worktree, file)).catch(() => null))?.isSymbolicLink()) continue;
       const content = await readFile(join(task.worktree, file), "utf8").catch((error) => {
         if (error.code === "ENOENT") return ""; // A reviewed deletion can resolve a conflict.
         throw error;

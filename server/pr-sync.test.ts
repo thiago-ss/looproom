@@ -7,6 +7,7 @@ import { Engine } from "./engine.ts";
 import { Store } from "./store.ts";
 import type { Runtime } from "./runtime.ts";
 import { createRepo, createWorktree, git } from "./git.ts";
+import { sourceFingerprint } from "./verification.ts";
 import { testFixture } from "./test-fixtures.ts";
 
 const head = "a".repeat(40), merged = "b".repeat(40), url = "https://github.com/example/repo/pull/1";
@@ -167,10 +168,14 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
     assert.match(await git(tree.path, ["diff", "HEAD"]), /task change/);
     f.store.patch(project.id, { status: "running" });
     f.engine.run = (async (_p: any, role: string, prompt: string) => {
-      if (role === "implementation") return { summary: "Integrated", sources: ["shared.txt"], humanQuestion: "", claims: [] };
+      if (role === "implementation") {
+        await writeFile(join(tree.path, "new-source.txt"), "new implementation file\n");
+        return { summary: "Integrated", sources: ["shared.txt"], humanQuestion: "", claims: [] };
+      }
       assert.equal(role, "review");
       assert.ok(prompt.includes("git diff " + baseSha));
       assert.match(await git(tree.path, ["diff", "HEAD"]), /merged change/);
+      assert.match(await git(tree.path, ["diff", "HEAD"]), /new-source.txt/);
       return { verdict: "pass", summary: "Fixture independent review", sources: ["shared.txt"], claims: [] };
     }) as Engine["run"];
     f.engine.verify = async (_p, t) => {
@@ -183,6 +188,12 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
     const published = f.store.get(task.id);
     assert.equal(published.status, "awaiting_human");
     assert.notEqual(published.sha, taskHead);
+    assert.equal(await git(tree.path, ["show", "HEAD:new-source.txt"]), "new implementation file");
+    const committedEvidence = { ...published, reviewedSource: { ...published.reviewedSource, head: published.sha, mergeHead: "" } };
+    assert.equal(await f.engine.reviewedSourceMatches(committedEvidence), true);
+    await writeFile(join(tree.path, "new-source.txt"), "changed after review\n");
+    assert.equal(await f.engine.reviewedSourceMatches(committedEvidence), false);
+    await writeFile(join(tree.path, "new-source.txt"), "new implementation file\n");
     assert.equal(await git(tree.path, ["rev-parse", "HEAD^2"]), baseSha);
     assert.equal(await git(tree.path, ["rev-parse", "origin/" + tree.branch]), published.sha);
     assert.equal(await readFile(join(repo.path, "shared.txt"), "utf8"), "user unsaved work\n");
@@ -284,5 +295,32 @@ test("a different final merged head releases an uncertain attempt without borrow
     assert.deepEqual(await readFile(rawPath), raw);
     assert.equal(f.store.all("approval").length, 0);
     await assert.rejects(f.engine.approve(f.gate.id, finalHead), /no longer open/);
+  } finally { await f.close(); }
+});
+
+test("publication rejects added source or index changes after review instead of staging and pushing them", async () => {
+  const f = await fixture("running");
+  try {
+    const repo = await createRepo(join(f.dir, "review-guard-repo"));
+    await writeFile(join(repo.path, "new.txt"), "reviewed contents\n");
+    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", attempt: 1, checks: [], review: { verdict: "pass" } });
+    await f.engine.stageProduct(task);
+    const source = { sourceHash: await sourceFingerprint(repo.path), tree: await git(repo.path, ["write-tree"]), head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" };
+    task = f.store.patch(task.id, { reviewedSource: source });
+    assert.equal(await f.engine.reviewedSourceMatches(task), true);
+    await git(repo.path, ["read-tree", "HEAD"]);
+    assert.equal(await f.engine.reviewedSourceMatches(task), false);
+    await f.engine.stageProduct(task);
+    assert.equal(await f.engine.reviewedSourceMatches(task), true);
+    await writeFile(join(repo.path, "after-review.txt"), "unreviewed addition\n");
+    f.engine.githubRunner = async args => { assert.equal(args[0], "auth"); return "fixture"; };
+    await f.engine.publish(f.project, task);
+    assert.equal(f.store.get(task.id).status, "ready");
+    assert.equal(f.store.get(task.id).reviewedSource, null);
+    assert.equal(await git(repo.path, ["rev-parse", "HEAD"]), source.head);
+    assert.equal(f.store.all("approval").length, 0);
+    await writeFile(join(repo.path, "auth.json"), "fixture secret\n");
+    await assert.rejects(f.engine.stageProduct(task), /protected or generated files/);
+    assert.equal(await git(repo.path, ["ls-files", "auth.json"]), "");
   } finally { await f.close(); }
 });
