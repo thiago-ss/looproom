@@ -473,3 +473,55 @@ test("replay refuses changed historical raw evidence", async () => {
     assert.equal(store.all("memory", "p").length, 1);
   } finally { store.close(); await rm(dir, { recursive: true, force: true }).catch((error) => { if (error.code !== "EPERM") throw error; }); }
 });
+
+
+test("reconciled remote merge repairs exact run evidence after a derived-write crash without approval", async () => {
+  const dir = await testFixture("looproom-reconciled-wiki-");
+  const path = join(dir, "db");
+  let store = new Store(path);
+  const runtime = { close() {} } as unknown as Runtime;
+  try {
+    store.put("project", { github: "owner/repo" }, "p");
+    store.put("task", { projectId: "p", status: "awaiting_human" }, "t");
+    let engine = new Engine(store, runtime, dir);
+    const pr = "https://github.com/owner/repo/pull/1";
+    const head = "a".repeat(40), mergedSha = "b".repeat(40);
+    for (const [id, sha] of [["origin", head], ["newer", "c".repeat(40)]]) {
+      store.put("run", { projectId: "p", taskId: "t", role: "implementation", status: "completed" }, id);
+      await engine.document("p", id, "Outcome " + id, ["source-a"], id);
+      await engine.recordRunEvidence("t", { prEvidence: { url: pr, headSha: sha, status: "awaiting_human" } }, id);
+    }
+    const rawPath = join(dir, "wiki", "p", "raw", "origin.json");
+    const raw = await readFile(rawPath);
+    store.put("gate", { projectId: "p", taskId: "t", type: "pr", status: "merging", pr,
+      sha: head, mergeAttempt: { pr, number: 1, reviewedSha: head, requestedAt: "attempt" } }, "g");
+    let writes = 0;
+    engine.mergeBroker = async (args: string[]) => {
+      if (args[0] !== "pr") { writes++; throw new Error("Unexpected merge write"); }
+      return JSON.stringify({ number: 1, url: pr, state: "MERGED", headRefOid: head, mergeCommit: { oid: mergedSha } });
+    };
+    engine.writeIfChanged = async () => { throw new Error("Derived write interrupted"); };
+    await assert.rejects(engine.reconcileMerge("g"), /Derived write interrupted/);
+    assert.equal(store.get("g").status, "reconciled");
+    assert.equal(store.get("t").status, "completed");
+    // Simulate evidence writes lost before replay; the remote fact remains durable.
+    for (const id of ["origin", "memory:origin"]) store.patch(id, { prEvidence: { url: pr, headSha: head, status: "awaiting_human" } });
+    store.patch("wiki-ingest:origin", { pendingEvidence: { prEvidence: { url: pr, headSha: head, status: "awaiting_human" } } });
+    store.close(); store = new Store(path);
+    engine = new Engine(store, runtime, dir);
+    await engine.recoverWiki();
+    await engine.recoverWiki();
+    for (const id of ["origin", "memory:origin"]) {
+      assert.equal(store.get(id).prEvidence.status, "merged");
+      assert.equal(store.get(id).prEvidence.mergedSha, mergedSha);
+      assert.equal(store.get(id).prEvidence.mergeActor, "unverified");
+    }
+    assert.equal(store.get("wiki-ingest:origin").pendingEvidence.prEvidence.status, "merged");
+    for (const id of ["newer", "memory:newer"]) assert.equal(store.get(id).prEvidence.status, "awaiting_human");
+    assert.equal(store.get("wiki-ingest:newer").pendingEvidence.prEvidence.status, "awaiting_human");
+    assert.match(await readFile(join(dir, "wiki", "p", "memory:origin.md"), "utf8"), /merge actor unverified/);
+    assert.deepEqual(await readFile(rawPath), raw);
+    assert.equal(store.all("approval").length, 0);
+    assert.equal(writes, 0);
+  } finally { store.close(); await rm(dir, { recursive: true, force: true }).catch((error) => { if (error.code !== "EPERM") throw error; }); }
+});

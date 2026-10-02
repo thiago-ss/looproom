@@ -392,7 +392,35 @@ export class Engine extends EventEmitter {
     }
     return intent;
   }
+  async repairReconciledEvidence(gate: RecordData) {
+    const attempt = gate.mergeAttempt;
+    if (gate.type !== "pr" || gate.status !== "reconciled" || !attempt ||
+        gate.pr !== attempt.pr || !gate.mergedSha) return;
+    // A reconciled remote fact is not a human approval. Attribute only records
+    // already tied to this exact PR/head, never the task's newest retry.
+    const matches = (pr: any) => pr?.url === attempt.pr && pr.headSha === attempt.reviewedSha;
+    for (const run of this.store.all("run", gate.projectId).filter((run) =>
+      run.taskId === gate.taskId && run.role === "implementation")) {
+      const intent = this.store.all("wiki-ingest", gate.projectId).find((item) => item.runId === run.id);
+      const page = this.store.all("memory", gate.projectId).find((item) => item.runId === run.id);
+      const evidence = [run.prEvidence, intent?.pendingEvidence?.prEvidence, page?.prEvidence].find(matches);
+      if (!evidence) continue;
+      const prEvidence = { ...evidence, status: "merged", mergedSha: gate.mergedSha,
+        mergeActor: "unverified", reconciledAt: gate.resolvedAt };
+      this.store.transaction(() => {
+        if (!run.prEvidence || matches(run.prEvidence)) this.store.patch(run.id, { prEvidence });
+        if (intent && (!intent.pendingEvidence?.prEvidence || matches(intent.pendingEvidence.prEvidence)))
+          this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence } });
+        if (page && (!page.prEvidence || matches(page.prEvidence))) this.store.patch(page.id, { prEvidence });
+      });
+      if (page && (!page.prEvidence || matches(page.prEvidence)))
+        await this.writeIfChanged(join(this.dataDir, "wiki", gate.projectId, page.id + ".md"),
+          this.pageMarkdown(this.store.get(page.id)));
+    }
+  }
   async recoverWiki() {
+    // The durable reconciled gate also repairs a crash before derived writes.
+    for (const gate of this.store.all("gate")) await this.repairReconciledEvidence(gate);
     // Repair approvals written before merged PR evidence was stored on intents.
     // Approval and gate records are authoritative for this derived evidence.
     for (const approval of this.store.all("approval")) {
@@ -569,7 +597,8 @@ export class Engine extends EventEmitter {
         (page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : [])).map((check: any) =>
           "\n- [Check report](/api/verification/" + check.reportId + ") (source hash " + check.sourceHash + ")").join("") + "\n" +
         (page.prEvidence ? "\n- [PR outcome](" + page.prEvidence.url + "): " + page.prEvidence.status + "; head " + page.prEvidence.headSha +
-          (page.prEvidence.mergedSha ? "; merged " + page.prEvidence.mergedSha : "") + "\n" : "") : "");
+          (page.prEvidence.mergedSha ? "; merged " + page.prEvidence.mergedSha : "") +
+          (page.prEvidence.mergeActor === "unverified" ? "; merge actor unverified" : "") + "\n" : "") : "");
   }
   async recordRunEvidence(taskId: string, evidence: Record<string, any>, runId?: string) {
     const task = this.store.get(taskId);
@@ -973,6 +1002,7 @@ export class Engine extends EventEmitter {
         this.store.patch(gateId, { status: "reconciled", mergeRecovery: "Remote PR merged at the reviewed head; merge actor unverified.", mergedSha: info.mergeCommit?.oid, resolvedAt: new Date().toISOString() });
         this.store.patch(gate.taskId, { status: "completed" });
       });
+      await this.repairReconciledEvidence(this.store.get(gateId));
     } else if (info.state === "OPEN" && info.headRefOid === attempt.reviewedSha) {
       if (releaseOpenAttempt) {
         this.store.transaction(() => {
