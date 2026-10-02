@@ -389,3 +389,23 @@ test("a hook that changes commit parents while retaining reviewed files cannot p
     assert.equal(f.store.all("approval").length, 0);
   } finally { await f.close(); }
 });
+
+test("durable external merges wake dependents before stalled derived wiki writes", async () => {
+  const f = await fixture("running");
+  let release!: () => void;
+  let pending: Promise<void> | undefined;
+  let starts = 0;
+  try {
+    const child = f.store.put("task", { projectId: f.project.id, status: "ready", dependencies: [f.task.id], title: "Dependent" });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    f.engine.repairReconciledEvidence = async () => { await held; };
+    f.engine.implement = async (_p, t) => { assert.equal(t.id, child.id); starts++; f.store.patch(t.id, { status: "running" }); };
+    pending = f.engine.syncProject(f.project.id);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(starts, 1);
+    assert.equal(f.store.get(f.task.id).status, "completed");
+    assert.equal(f.store.get(f.gate.id).status, "reconciled");
+    assert.equal(f.store.all("approval").length, 0);
+    release(); await pending;
+  } finally { release?.(); await pending; await f.close(); }
+});

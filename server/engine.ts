@@ -1136,9 +1136,9 @@ export class Engine extends EventEmitter {
                 createdAt: observedAt });
               this.store.event("pr-merged-externally", { gateId: gate.id, ...observation, mergeActor: "unverified" }, projectId);
             });
-            await this.repairReconciledEvidence(this.store.get(gate.id));
             this.emit("change");
             this.tick();
+            await this.repairReconciledEvidence(this.store.get(gate.id));
           } else if (info.state === "OPEN" && (info.mergeable === "CONFLICTING" || info.headRefOid !== gate.sha)) {
             this.store.transaction(() => {
               const current = this.store.get(gate.id);
