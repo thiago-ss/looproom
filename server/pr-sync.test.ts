@@ -324,3 +324,33 @@ test("publication rejects added source or index changes after review instead of 
     assert.equal(await git(repo.path, ["ls-files", "auth.json"]), "");
   } finally { await f.close(); }
 });
+
+test("request changes validates the same remote identity and base as synchronization", async () => {
+  const f = await fixture("paused");
+  try {
+    f.setInfo({ state: "OPEN", baseRefName: "retargeted", statusCheckRollup: [] });
+    await assert.rejects(f.engine.requestChanges(f.gate.id, head, "Fix the implementation"), /identity changed/);
+    assert.equal(f.store.get(f.gate.id).status, "open");
+    assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+    assert.equal(f.store.all("message").length, 0);
+  } finally { await f.close(); }
+});
+
+test("a formatting commit hook invalidates publication until its new source is verified and reviewed", async () => {
+  const f = await fixture("running");
+  try {
+    const repo = await createRepo(join(f.dir, "hook-guard-repo"));
+    await writeFile(join(repo.path, "new.txt"), "checked source\n");
+    let task = f.store.patch(f.task.id, { worktree: repo.path, branch: "main", status: "verifying", attempt: 1, title: "Source", checks: [], review: { verdict: "pass" } });
+    await f.engine.stageProduct(task);
+    task = f.store.patch(task.id, { reviewedSource: { sourceHash: await sourceFingerprint(repo.path), tree: await git(repo.path, ["write-tree"]), head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" } });
+    await writeFile(join(repo.path, ".git/hooks/pre-commit"), '#!/bin/sh\nprintf "formatted after review\\n" > new.txt\ngit add new.txt\n', { mode: 0o755 });
+    f.engine.githubRunner = async args => { assert.equal(args[0], "auth"); return "fixture"; };
+    await f.engine.publish(f.project, task);
+    assert.equal(f.store.get(task.id).status, "ready");
+    assert.equal(f.store.get(task.id).reviewedSource, null);
+    assert.match(f.store.get(task.id).feedback, /Commit changed the reviewed source/);
+    assert.equal(await git(repo.path, ["show", "HEAD:new.txt"]), "formatted after review");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});

@@ -776,6 +776,7 @@ export class Engine extends EventEmitter {
       task = this.store.patch(task.id, {
         worktree: tree.path,
         branch: tree.branch,
+        baseSha: await git(tree.path, ["rev-parse", "HEAD"]),
       });
     }
     if (await prepareDependencies(project.path, task.worktree))
@@ -875,10 +876,12 @@ export class Engine extends EventEmitter {
       );
       return;
     }
+    const reviewBase = task.prRepair?.baseSha ?? task.baseSha ??
+      await git(task.worktree, ["merge-base", "HEAD", project.branch]).catch(() => "");
     const review = await this.run(
       project,
       "review",
-      `Independently inspect ${task.prRepair?.baseSha ? "git diff " + task.prRepair.baseSha + " (the full task diff against the integrated base), and git diff HEAD" : "git diff HEAD"} (including staged merge resolutions) in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
+      `Independently inspect ${reviewBase ? "git diff " + reviewBase + " (the full task diff against its base), and git diff HEAD" : "git diff HEAD"} (including staged merge resolutions) in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
       Review,
       task,
     );
@@ -1019,6 +1022,14 @@ export class Engine extends EventEmitter {
         "-m",
         task.title,
       ]);
+    }
+    if (await git(task.worktree, ["rev-parse", "HEAD^{tree}"]) !== task.reviewedSource.tree ||
+        await sourceFingerprint(task.worktree) !== task.reviewedSource.sourceHash ||
+        await git(task.worktree, ["branch", "--show-current"]) !== task.branch) {
+      this.store.patch(task.id, { reviewedSource: null });
+      this.repairOrGate(project, task, "Commit changed the reviewed source",
+        "A commit hook or concurrent edit changed checked source. Repeat verification and full task review before pushing.", "check");
+      return;
     }
     await git(task.worktree, ["push", "origin", task.branch]);
     const sha = await git(task.worktree, ["rev-parse", "HEAD"]);
@@ -1480,6 +1491,7 @@ export class Engine extends EventEmitter {
         throw new Error("Review the currently displayed revision before requesting changes.");
       const info = await this.prInfo(gateId);
       if (this.closed) return;
+      this.validateRemotePr(gate, project, info);
       if (info.state !== "OPEN") throw new Error("Pull request is not open.");
       if (info.headRefOid !== reviewedSha)
         throw new Error("PR revision changed. Refresh and review the new commit.");

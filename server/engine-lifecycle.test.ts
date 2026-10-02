@@ -213,16 +213,16 @@ test("request changes binds the current PR revision, preserves human feedback an
   const infoHeld = new Promise<void>((resolve) => { releaseInfo = resolve; });
   let merges = 0;
   try {
-    const project = store.put("project", { status: "paused", github: "example/fixture" });
+    const project = store.put("project", { status: "paused", github: "example/fixture", branch: "main" });
     const task = store.put("task", {
       projectId: project.id, status: "awaiting_human", attempt: 2, judgeRetries: 2,
     });
     const gate = store.put("gate", {
-      projectId: project.id, taskId: task.id, status: "open", type: "pr", sha,
+      projectId: project.id, taskId: task.id, status: "open", type: "pr", sha, pr: "https://github.com/example/fixture/pull/1",
     });
     engine.prInfo = async () => {
       if (holdInfo) { signalInfo(); await infoHeld; }
-      return { number: 1, state: "OPEN", headRefOid: head,
+      return { number: 1, url: gate.pr, baseRefName: "main", state: "OPEN", headRefOid: head,
         statusCheckRollup: [], mergeable: "MERGEABLE" };
     };
     engine.mergeBroker = async () => { merges++; return JSON.stringify({ merged: true, sha: otherSha }); };

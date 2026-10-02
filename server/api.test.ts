@@ -21,7 +21,7 @@ test("local API requires a session, rejects foreign origins and keeps projects a
   );
   await writeFile(githubFixture,
     `#!/usr/bin/env node
-process.stdout.write(JSON.stringify({number:1,state:'OPEN',headRefOid:'${"a".repeat(40)}',statusCheckRollup:[],mergeable:'MERGEABLE'})+'\\n');`,
+process.stdout.write(JSON.stringify({number:1,url:'https://github.com/example/fixture/pull/1',baseRefName:'main',state:'OPEN',headRefOid:'${"a".repeat(40)}',statusCheckRollup:[],mergeable:'MERGEABLE'})+'\\n');`,
     { mode: 0o755 });
   let child: ReturnType<typeof spawn>;
   let childOutput = "";
