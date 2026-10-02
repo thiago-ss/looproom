@@ -874,7 +874,7 @@ export class Engine extends EventEmitter {
     const review = await this.run(
       project,
       "review",
-      `Independently inspect git diff HEAD (including staged merge resolutions) in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
+      `Independently inspect ${task.prRepair?.baseSha ? "git diff " + task.prRepair.baseSha + " (the full task diff against the integrated base), and git diff HEAD" : "git diff HEAD"} (including staged merge resolutions) in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
       Review,
       task,
     );
@@ -1267,7 +1267,8 @@ export class Engine extends EventEmitter {
         const current = this.store.get(gateId);
         if (current.mergeAttempt?.requestedAt !== attempt.requestedAt || !["merging", "open"].includes(current.status))
           throw new Error("Merge attempt changed during reconciliation.");
-        this.store.patch(gateId, { status: "reconciled", mergeRecovery: "Remote PR merged at the reviewed head; merge actor unverified.", mergedSha: info.mergeCommit?.oid, resolvedAt: new Date().toISOString() });
+        this.store.patch(gateId, { status: "reconciled", mergeRecovery: "Remote PR merged at the reviewed head; merge actor unverified.", mergedSha: info.mergeCommit.oid, resolvedAt: new Date().toISOString(),
+          remoteObservation: { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable, mergedSha: info.mergeCommit.oid, mergedAt: info.mergedAt, observedAt: new Date().toISOString() } });
         this.store.patch(gate.taskId, { status: "completed" });
       });
       await this.repairReconciledEvidence(this.store.get(gateId));
@@ -1315,6 +1316,7 @@ export class Engine extends EventEmitter {
     for (const gate of this.store.all("gate").filter((gate) => gate.type === "pr" && gate.mergeAttempt && gate.status === "merging")) {
       try {
         await this.reconcileMerge(gate.id);
+        if (this.closed) return;
         if (this.store.get(gate.id).status === "merging") {
           this.store.patch(gate.id, { status: "open", mergeRecovery: "Merge result uncertain. Reconcile the remote PR before another approval." });
           this.changed("merge-reconciled", { gateId: gate.id }, gate.projectId);
@@ -1394,6 +1396,7 @@ export class Engine extends EventEmitter {
         "merge_method=squash",
       ]));
     } catch (error) {
+      if (this.closed) throw error;
       // A timeout or lost response can follow remote success. Never submit a second PUT.
       if (this.store.get(gateId).status === "merging")
         this.store.patch(gateId, { status: "open", mergeRecovery: `Merge result uncertain: ${String(error)}. Reconcile the remote PR before another approval.` });
@@ -1464,6 +1467,7 @@ export class Engine extends EventEmitter {
       if (reviewedSha !== gate.sha)
         throw new Error("Review the currently displayed revision before requesting changes.");
       const info = await this.prInfo(gateId);
+      if (this.closed) return;
       if (info.state !== "OPEN") throw new Error("Pull request is not open.");
       if (info.headRefOid !== reviewedSha)
         throw new Error("PR revision changed. Refresh and review the new commit.");

@@ -166,9 +166,10 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
     assert.equal(await git(tree.path, ["diff", "--name-only", "--diff-filter=U"]), "");
     assert.match(await git(tree.path, ["diff", "HEAD"]), /task change/);
     f.store.patch(project.id, { status: "running" });
-    f.engine.run = (async (_p: any, role: string) => {
+    f.engine.run = (async (_p: any, role: string, prompt: string) => {
       if (role === "implementation") return { summary: "Integrated", sources: ["shared.txt"], humanQuestion: "", claims: [] };
       assert.equal(role, "review");
+      assert.ok(prompt.includes("git diff " + baseSha));
       assert.match(await git(tree.path, ["diff", "HEAD"]), /merged change/);
       return { verdict: "pass", summary: "Fixture independent review", sources: ["shared.txt"], claims: [] };
     }) as Engine["run"];
@@ -225,5 +226,36 @@ test("late interrupted merge reconciliation respects shutdown and the shared dec
     assert.equal(f.store.get(f.gate.id).status, "merging");
     assert.equal(f.store.get(f.task.id).status, "awaiting_human");
     assert.equal(f.store.all("approval").length, 0);
+  } finally { release?.(); await f.close(); }
+});
+
+test("interrupted merge reconciliation persists the complete validated GitHub observation", async () => {
+  const f = await fixture("paused");
+  try {
+    f.store.patch(f.gate.id, { status: "merging", mergeAttempt: { pr: url, number: 1, reviewedSha: head, requestedAt: "fixture" } });
+    await f.engine.reconcileMerge(f.gate.id);
+    const gate = f.store.get(f.gate.id);
+    assert.equal(gate.status, "reconciled");
+    assert.equal(gate.remoteObservation.url, url);
+    assert.equal(gate.remoteObservation.number, 1);
+    assert.equal(gate.remoteObservation.base, "main");
+    assert.equal(gate.remoteObservation.headSha, head);
+    assert.equal(gate.remoteObservation.mergedSha, merged);
+    assert.ok(Number.isFinite(Date.parse(gate.remoteObservation.mergedAt)));
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("a late request-changes reply cannot resolve a review after shutdown", async () => {
+  const f = await fixture("paused");
+  let release!: () => void;
+  try {
+    const held = new Promise<void>(resolve => { release = resolve; });
+    f.engine.prInfo = async () => { await held; return { state: "OPEN", headRefOid: head }; };
+    const pending = f.engine.requestChanges(f.gate.id, head, "Make a revision");
+    f.engine.close(); release(); await pending;
+    assert.equal(f.store.get(f.gate.id).status, "open");
+    assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+    assert.equal(f.store.all("message").length, 0);
   } finally { release?.(); await f.close(); }
 });
