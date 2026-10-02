@@ -830,8 +830,8 @@ export class Engine extends EventEmitter {
       this.changed("task-completed", { taskId: task.id }, project.id);
       return;
     }
-    if (task.prRepair) await this.stagePrConflicts(task);
     await this.stageProduct(task);
+    if (task.prRepair) await this.stagePrConflicts(task);
     const checkedSource = { sourceHash: await sourceFingerprint(task.worktree),
       tree: await git(task.worktree, ["write-tree"]), head: await git(task.worktree, ["rev-parse", "HEAD"]),
       mergeHead: await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "") };
@@ -1230,7 +1230,8 @@ export class Engine extends EventEmitter {
   async stagePrConflicts(task: RecordData) {
     const files = (await this.gitRunner(task.worktree, ["diff", "--name-only", "--diff-filter=U", "-z"]))
       .split("\0").filter(Boolean);
-    for (const file of files) {
+    const changed = (await this.gitRunner(task.worktree, ["diff", task.prRepair?.baseSha ?? "HEAD", "--name-only", "-z", "--", ".", ":(top,exclude).looproom-verification"])).split("\0").filter(Boolean);
+    for (const file of new Set([...files, ...changed])) {
       if ((await lstat(join(task.worktree, file)).catch(() => null))?.isSymbolicLink()) continue;
       const content = await readFile(join(task.worktree, file), "utf8").catch((error) => {
         if (error.code === "ENOENT") return ""; // A reviewed deletion can resolve a conflict.
@@ -1517,7 +1518,7 @@ export class Engine extends EventEmitter {
           status: "ready", attempt: 0, judgeRetries: 0,
           feedback: `Human requested changes to revision ${reviewedSha}: ${answer}`,
         });
-        this.store.patch(project.id, { status: "running" });
+
       });
       this.changed("pr-changes-requested", { gateId, reviewedSha }, project.id);
     } finally {

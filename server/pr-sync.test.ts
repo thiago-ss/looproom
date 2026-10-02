@@ -162,6 +162,9 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
     task = await f.engine.preparePrRepair(project, task);
     assert.equal(task.prRepair.baseSha, baseSha);
     await assert.rejects(f.engine.stagePrConflicts(task), /Unresolved conflict markers/);
+    await git(tree.path, ["add", "shared.txt"]);
+    assert.equal(await git(tree.path, ["diff", "--name-only", "--diff-filter=U"]), "");
+    await assert.rejects(f.engine.stagePrConflicts(task), /Unresolved conflict markers/);
     await writeFile(join(tree.path, "shared.txt"), "merged change\ntask change\n");
     await f.engine.stagePrConflicts(task);
     assert.equal(await git(tree.path, ["diff", "--name-only", "--diff-filter=U"]), "");
@@ -408,4 +411,22 @@ test("durable external merges wake dependents before stalled derived wiki writes
     assert.equal(f.store.all("approval").length, 0);
     release(); await pending;
   } finally { release?.(); await pending; await f.close(); }
+});
+
+test("request changes on a paused project queues the task without resuming its agents", async () => {
+  const f = await fixture("paused");
+  let starts = 0;
+  try {
+    f.setInfo({ state: "OPEN", statusCheckRollup: [] });
+    f.engine.implement = async (_p, t) => { starts++; f.store.patch(t.id, { status: "running" }); };
+    await f.engine.requestChanges(f.gate.id, head, "Revise this task");
+    f.engine.tick(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.store.get(f.project.id).status, "paused");
+    assert.equal(f.store.get(f.task.id).status, "ready");
+    assert.equal(starts, 0);
+    f.store.patch(f.project.id, { status: "running" });
+    f.engine.tick(); await new Promise(resolve => setImmediate(resolve));
+    assert.equal(starts, 1);
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
 });

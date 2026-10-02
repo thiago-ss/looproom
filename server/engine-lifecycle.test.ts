@@ -246,7 +246,7 @@ test("request changes binds the current PR revision, preserves human feedback an
     assert.equal(store.get(task.id).status, "ready");
     assert.match(store.get(task.id).feedback, /Add a regression test/);
     assert.equal(store.get(task.id).attempt, 0);
-    assert.equal(store.get(project.id).status, "running");
+    assert.equal(store.get(project.id).status, "paused");
     assert.equal(store.all("approval", project.id).length, 0);
     await assert.rejects(engine.requestChanges(gate.id, sha, "Again"), /no longer open/);
     await assert.rejects(engine.requestChanges(task.id, sha, "Wrong kind"), /Record not found/);
