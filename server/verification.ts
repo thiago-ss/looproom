@@ -117,7 +117,55 @@ export type VerificationReport = {
   reportPath: string;
   createdAt: string;
   fixtureCleanup?: { path: string; removed: boolean };
+  buildArtifact?: { directory: string; hash: string };
 };
+
+// Only a successful fixed build may leave the disposable verifier. Never
+// follow generated links: task build scripts run as untrusted source.
+async function retainBrowserBuild(workspace: string, destination: string, dataDir: string) {
+  const base = await realpath(dataDir);
+  const relativePath = relative(base, resolve(destination));
+  if (!/^browser-audit\/[0-9a-f-]{36}\/dist$/.test(relativePath))
+    throw new Error("Browser build artifacts require a reserved audit directory.");
+  const parent = dirname(destination);
+  await mkdir(parent, { recursive: true, mode: 0o700 });
+  if (await realpath(parent) !== resolve(parent))
+    throw new Error("Browser build directory must not be a symlink.");
+  if (await lstat(destination).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  })) throw new Error("Browser build artifact already exists.");
+  const source = join(workspace, "dist");
+  const hash = createHash("sha256");
+  let total = 0;
+  async function copyDirectory(from: string, to: string) {
+    const meta = await lstat(from);
+    if (!meta.isDirectory() || meta.isSymbolicLink())
+      throw new Error("Browser build must contain regular files and directories.");
+    await mkdir(to, { mode: 0o700 });
+    for (const item of (await readdir(from, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      const path = join(from, item.name), target = join(to, item.name), file = await lstat(path);
+      if (file.isSymbolicLink()) throw new Error("Browser build links are refused.");
+      if (file.isDirectory()) await copyDirectory(path, target);
+      else if (file.isFile()) {
+        total += file.size;
+        if (total > 50 * 1024 * 1024) throw new Error("Browser build exceeds the artifact budget.");
+        const bytes = await readFile(path);
+        hash.update(JSON.stringify(relative(source, path))).update(bytes);
+        await writeFile(target, bytes, { flag: "wx", mode: 0o600 });
+      } else throw new Error("Browser build contains a non-regular file.");
+    }
+  }
+  try {
+    await copyDirectory(source, destination);
+    if (!(await lstat(join(destination, "index.html"))).isFile())
+      throw new Error("Browser build requires a regular index.html entry.");
+    return { directory: destination, hash: hash.digest("hex") };
+  } catch (error) {
+    await rm(destination, { recursive: true, force: true });
+    throw error;
+  }
+}
 // Coordinator housekeeping for the reserved, ignored test scratch directory.
 // Never follow its root or nested symlinks into project/source directories.
 export async function cleanupTestFixtures(cwd: string) {
@@ -141,6 +189,7 @@ export async function runVerification(options: {
   protectedPorts?: number[];
   timeoutMs?: number;
   cleanupFixtures?: boolean;
+  buildArtifactDir?: string;
 }): Promise<VerificationReport> {
   if (process.platform !== "darwin")
     throw new Error("Isolated verification currently requires macOS.");
@@ -150,6 +199,8 @@ export async function runVerification(options: {
     options.commands.some((c) => !c.trim() || c.length > 500)
   )
     throw new Error("Choose 1–8 configured verification commands.");
+  if (options.buildArtifactDir && (options.commands.length !== 1 || options.commands[0] !== "npm run build"))
+    throw new Error("Browser artifact export requires the fixed build recipe.");
   const cwd = await realpath(options.cwd),
     id = randomUUID();
   const sourceHash = await sourceFingerprint(cwd);
@@ -360,6 +411,11 @@ export async function runVerification(options: {
       );
     }
     const sourceUnchanged = sourceHash === (await sourceFingerprint(cwd));
+    if (options.buildArtifactDir && sourceHash !== await sourceFingerprint(workspace))
+      throw new Error("Audited source changed inside the isolated build.");
+    const buildArtifact = options.buildArtifactDir && sourceUnchanged &&
+      results.every((result) => result.code === 0 && !result.timedOut)
+      ? await retainBrowserBuild(workspace, options.buildArtifactDir, options.dataDir) : undefined;
     const report = {
       id,
       ...(options.runId ? { runId: options.runId } : {}),
@@ -369,6 +425,7 @@ export async function runVerification(options: {
       reportPath,
       createdAt: new Date().toISOString(),
       ...(fixtureCleanup ? { fixtureCleanup } : {}),
+      ...(buildArtifact ? { buildArtifact } : {}),
     };
     await writeFile(reportPath, JSON.stringify(report, null, 2), {
       mode: 0o600,

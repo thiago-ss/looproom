@@ -110,3 +110,10 @@ The v0 runner uses macOS `sandbox-exec`, which is deprecated. Native sandbox den
 YOLO may explicitly request `cleanup-test-fixtures` to remove only the reserved `.looproom-test-fixtures` scratch directory in the assigned worktree, then run configured checks. The coordinator rejects a symlinked root and does not follow nested links. This recorded housekeeping action is separate from test process permissions. Earlier reports remain readable by ID when later checks run.
 
 Baseline setup repairs require independent source comparison and fresh coordinator measurements. Original evaluator bytes and hash revisions are retained; missing or modified snapshots fail closed. Once accepted, the baseline freezes for subsequent candidates. Refused verification recipes enter YOLO recovery with the actual error instead of the model transport cooldown. This does not grant worker capabilities, bypass review, or authorize a PR merge.
+
+
+### Read-only browser evidence
+
+YOLO judges can request the fixed `browser-baseline` coordinator recipe. It captures a consistent, project-only snapshot of actual SQLite records and audits an isolated application build in private Google Chrome. Live account files, the user's browser session and application write/merge APIs stay outside the viewer. Install locked dependencies and Google Chrome; no browser is silently downloaded or substituted.
+
+See [the browser recipe](docs/browser-audit.md) for protocol/provenance, unavailable observations, private artifact handling and comparison boundaries. A complete measurement is evidence, not approval of an optimization or a PR. All merges remain human-only.

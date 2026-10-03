@@ -1,0 +1,258 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { request } from "node:http";
+import { connect } from "node:net";
+import { chmod, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { Store } from "./store.ts";
+import { testFixture } from "./test-fixtures.ts";
+import { captureBrowserSnapshot, loadBrowserSnapshot, startBrowserViewer } from "./browser-snapshot.ts";
+
+test("freezes only revision-matched selected-project PR review and never forwards viewer reads", async () => {
+  const dir = await testFixture("browser-pr-review-");
+  const databasePath = join(dir, "live.sqlite"), directory = join(dir, "snapshots"), dist = join(dir, "dist");
+  await mkdir(dist);
+  await writeFile(join(dist, "index.html"), "<!doctype html><title>Review</title>");
+  const store = new Store(databasePath);
+  try {
+    const project = store.put("project", { name: "Review goal", github: "example/project", branch: "main" });
+    const other = store.put("project", { name: "Other", github: "example/other", branch: "main" });
+    const sha = "a".repeat(40), pr = "https://github.com/example/project/pull/9";
+    const gate = store.put("gate", { projectId: project.id, type: "pr", status: "open", pr, sha });
+    const foreign = store.put("gate", { projectId: project.id, type: "pr", status: "open", pr: "https://github.com/example/private/pull/5", sha });
+    const wrongBase = store.put("gate", { projectId: project.id, type: "pr", status: "open", pr: "https://github.com/example/project/pull/6", sha, base: "release" });
+    store.put("gate", { projectId: other.id, type: "pr", status: "open", pr: "https://github.com/example/other/pull/4", sha: "b".repeat(40) });
+    let calls = 0;
+    const snapshot = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory, capturePrReview: async binding => {
+      calls++;
+      assert.deepEqual(binding, { gateId: gate.id, projectId: project.id, pr, sha, base: "main" });
+      return { info: { number: 9, url: pr, headRefOid: sha, baseRefName: "main", baseRefOid: "b".repeat(40), state: "OPEN", title: "Actual PR" }, diff: "diff --git a/a b/a\n+actual change\n" };
+    } });
+    assert.equal(calls, 1);
+    assert.equal(snapshot.review?.[gate.id].info.title, "Actual PR");
+    assert.equal(snapshot.review?.[foreign.id], undefined);
+    assert.equal(snapshot.review?.[wrongBase.id], undefined);
+    assert.deepEqual(await loadBrowserSnapshot(directory, snapshot.id, project.id), snapshot);
+    store.patch(gate.id, { sha: "c".repeat(40) });
+    const viewer = await startBrowserViewer({ snapshot, distDir: dist });
+    try {
+      const base = new URL(viewer.url).origin;
+      const entry = await fetch(viewer.url, { redirect: "manual" });
+      const cookie = entry.headers.get("set-cookie")!.split(";")[0];
+      const get = (path: string) => fetch(base + path, { headers: { cookie } });
+      assert.equal((await fetch(base + `/api/gates/${gate.id}/pr`)).status, 403);
+      const info = await get(`/api/gates/${gate.id}/pr`);
+      assert.equal(info.status, 200);
+      assert.equal(info.headers.get("cache-control"), "no-store");
+      assert.equal((await info.json()).headRefOid, sha);
+      assert.deepEqual(await (await get(`/api/gates/${gate.id}/diff`)).json(), { diff: "diff --git a/a b/a\n+actual change\n" });
+      assert.equal((await get("/api/gates/unknown/pr")).status, 404);
+      assert.equal((await get("/api/gates/unknown/diff")).status, 404);
+      assert.equal((await get(`/api/gates/${foreign.id}/pr`)).status, 404);
+      assert.equal((await get(`/api/gates/${wrongBase.id}/diff`)).status, 404);
+      assert.equal((await fetch(base + `/api/gates/${gate.id}/pr`, { method: "POST", headers: { cookie } })).status, 405);
+      assert.equal(calls, 1, "viewer must use frozen bytes, never call the capture source");
+    } finally { await viewer.close(); }
+    const invalid = async (change: Record<string, unknown>) => {
+      await assert.rejects(() => captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
+        capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main", ...change }, diff: "diff" }) }), /does not match/);
+    };
+    await invalid({ url: "https://github.com/example/other/pull/4" });
+    await invalid({ headRefOid: sha });
+    await invalid({ baseRefName: "other" });
+    await invalid({ number: 8 });
+    await invalid({ state: "CLOSED" });
+    await assert.rejects(() => captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
+      capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main" }, diff: "" }) }), /does not match/);
+    const file = join(directory, snapshot.id + ".json");
+    const tampered = JSON.parse(await readFile(file, "utf8"));
+    tampered.review[gate.id].sha = "c".repeat(40);
+    const { hash: _oldHash, ...body } = tampered;
+    tampered.hash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    await chmod(file, 0o600);
+    await writeFile(file, JSON.stringify(tampered));
+    await assert.rejects(() => loadBrowserSnapshot(directory, snapshot.id, project.id), /PR review does not match/);
+  } finally { store.close(); }
+});
+
+test("captures one actual WAL project and serves only immutable read-only state", async () => {
+  const dir = await testFixture("browser-snapshot-");
+  const databasePath = join(dir, "live.sqlite");
+  const snapshots = join(dir, "snapshots");
+  const dist = join(dir, "dist");
+  await mkdir(dist);
+  await writeFile(join(dist, "index.html"), "<!doctype html><title>Audited app</title>");
+  await mkdir(join(dist, "assets"));
+  await writeFile(join(dist, "assets", "app-123.js"), "export const app = true;");
+  const store = new Store(databasePath);
+  try {
+    const project = store.put("project", { name: "Real goal", goal: "Ship this app", path: join(dir, "repo") });
+    const other = store.put("project", { name: "Other" });
+    store.put("settings", { orchestrator: { model: "fixture" }, account: { token: "private" } }, "settings");
+    store.put("task", { projectId: project.id, title: "Actual task", status: "running" });
+    store.put("gate", { projectId: project.id, title: "Actual review", type: "pr", status: "open" });
+    store.put("message", { projectId: project.id, text: "Actual user text", role: "human", createdAt: "2026-10-03T00:00:00Z" });
+    store.put("run", { projectId: project.id, role: "research", output: "secret raw output", status: "complete" });
+    store.memory(project.id, "Alpha evidence", "Goal outcome plum", ["source-a"]);
+    store.memory(project.id, "Beta evidence", "Work outcome citron", ["source-b"]);
+    store.memory(other.id, "Other evidence", "plum outsider", ["source-c"]);
+    store.event("changed", { projectId: project.id }, project.id);
+    store.event("changed", { projectId: other.id }, other.id);
+    const expectedSearch = store.search(project.id, "plum citron").map((page) => page.id);
+    const before = store.db.prepare("SELECT count(*) AS n FROM records").get() as { n: number };
+    const snapshot = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory: snapshots });
+    assert.equal(snapshot.state.projects[0].goal, "Ship this app");
+    assert.equal(snapshot.state.tasks[0].title, "Actual task");
+    assert.equal(snapshot.state.gates[0].title, "Actual review");
+    assert.equal(snapshot.state.messages[0].text, "Actual user text");
+    assert.equal(snapshot.state.memory.length, 2);
+    assert.equal(snapshot.counts.memory, 2);
+    assert.equal(snapshot.counts.indexedProjects, 2);
+    assert.equal(snapshot.counts.indexedMemoryRows, 3);
+    assert.equal(snapshot.state.runs[0].output, undefined);
+    assert.equal(snapshot.state.settings.account, undefined);
+    assert.equal(snapshot.state.events.length, 1);
+    assert.equal(snapshot.eventSequence, 1);
+    assert.equal((store.db.prepare("SELECT count(*) AS n FROM records").get() as { n: number }).n, before.n);
+    assert.deepEqual(await loadBrowserSnapshot(snapshots, snapshot.id, project.id), snapshot);
+    await assert.rejects(() => loadBrowserSnapshot(snapshots, snapshot.id, other.id), /mismatch/);
+    const viewer = await startBrowserViewer({ snapshot, distDir: dist });
+    try {
+      const base = new URL(viewer.url).origin;
+      assert.equal((await fetch(base + "/api/state")).status, 403);
+      assert.equal((await fetch(base + "/api/projects/" + project.id + "/memory")).status, 403);
+      const entry = await fetch(viewer.url, { redirect: "manual" });
+      assert.equal(entry.status, 302);
+      assert.equal(entry.headers.get("location"), "/");
+      const cookie = entry.headers.get("set-cookie")!.split(";")[0];
+      assert.match(cookie, /^audit_snapshot=[0-9a-f]{64}$/);
+      assert.equal((await fetch(base + "/api/state", { headers: { cookie: "audit_snapshot=" + "0".repeat(64) } })).status, 403);
+      const get = (path: string) => fetch(base + path, { headers: { cookie } });
+      const state = await get("/api/state");
+      assert.equal(state.status, 200);
+      assert.equal(state.headers.get("set-cookie"), null);
+      assert.match(state.headers.get("content-security-policy") ?? "", /connect-src 'self'/);
+      assert.equal((await state.json()).events.length, 0);
+      assert.equal(state.headers.get("cache-control"), "no-store");
+      const withEvents = await get("/api/state?events=1");
+      assert.equal((await withEvents.json()).events.length, 1);
+      const search = await get(`/api/projects/${project.id}/memory?q=plum%20citron`);
+      assert.deepEqual((await search.json()).map((page: any) => page.id).sort(), expectedSearch.sort());
+      assert.equal((await get(`/api/projects/${other.id}/memory`)).status, 404);
+      for (const path of ["/api/projects", `/api/gates/${snapshot.state.gates[0].id}/approve`, "/api/settings"]) {
+        const response = await fetch(base + path, { method: "POST", headers: { cookie: cookie + "; looproom_session=forged", "x-looproom-client": "ui" }, body: "{}" });
+        assert.equal(response.status, 405);
+      }
+      assert.equal((await get("/api/unknown")).status, 404);
+      assert.equal((await get("/api%2Funknown")).status, 404);
+      assert.equal((await get("/api/gates/anything/pr")).status, 404);
+      assert.equal((await get("/")).status, 200);
+      assert.equal((await get("/assets/app-123.js")).headers.get("cache-control"), "private, max-age=3600, immutable");
+      assert.equal((await get("/snapshots/" + snapshot.id + ".json")).status, 404);
+      const port = Number(new URL(base).port);
+      const localProxyStatus = await new Promise<number>((resolve, reject) => {
+        const proxy = request({ host: "127.0.0.1", port, method: "GET", path: base + "/api/state", headers: { host: new URL(base).host, cookie } }, (response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        });
+        proxy.on("error", reject);
+        proxy.end();
+      });
+      assert.equal(localProxyStatus, 200);
+      const foreignStatus = await new Promise<number>((resolve, reject) => {
+        const proxy = request({ host: "127.0.0.1", port, method: "GET", path: "http://example.invalid/private", headers: { host: "example.invalid" } }, (response) => {
+          response.resume();
+          resolve(response.statusCode ?? 0);
+        });
+        proxy.on("error", reject);
+        proxy.end();
+      });
+      assert.equal(foreignStatus, 403);
+      const tunnelReply = await new Promise<string>((resolve, reject) => {
+        const socket = connect(port, "127.0.0.1", () => socket.write("CONNECT example.invalid:443 HTTP/1.1\r\nHost: example.invalid:443\r\n\r\n"));
+        let reply = "";
+        socket.on("data", (chunk) => { reply += chunk; });
+        socket.on("end", () => resolve(reply));
+        socket.on("error", reject);
+      });
+      assert.match(tunnelReply, /^HTTP\/1\.1 403 Forbidden/);
+      assert.equal((store.db.prepare("SELECT count(*) AS n FROM records").get() as { n: number }).n, before.n);
+    } finally { await viewer.close(); }
+  } finally { store.close(); }
+});
+
+test("snapshot load rejects changed bytes and symlinks", async () => {
+  const dir = await testFixture("browser-snapshot-integrity-");
+  const databasePath = join(dir, "live.sqlite");
+  const store = new Store(databasePath);
+  try {
+    const project = store.put("project", { name: "Only project" });
+    const directory = join(dir, "snapshots");
+    const snapshot = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory });
+    const file = join(directory, snapshot.id + ".json");
+    await symlink(file, join(directory, "00000000-0000-0000-0000-000000000000.json"));
+    await assert.rejects(() => loadBrowserSnapshot(directory, "00000000-0000-0000-0000-000000000000", project.id), /real file/);
+    const linkedDirectory = join(dir, "linked");
+    await symlink(directory, linkedDirectory);
+    await assert.rejects(() => loadBrowserSnapshot(linkedDirectory, snapshot.id, project.id), /real directory/);
+    const changed = JSON.parse(await readFile(file, "utf8"));
+    changed.state.projects[0].name = "tampered";
+    await chmod(file, 0o600);
+    await writeFile(file, JSON.stringify(changed));
+    await assert.rejects(() => loadBrowserSnapshot(directory, snapshot.id, project.id), /hash mismatch/);
+  } finally { store.close(); }
+});
+
+test("snapshot keeps message and event tables consistent while WAL commits continue", async () => {
+  const dir = await testFixture("browser-snapshot-concurrent-");
+  const databasePath = join(dir, "live.sqlite");
+  const store = new Store(databasePath);
+  const project = store.put("project", { name: "Concurrent real records" });
+  const source = `
+    const { DatabaseSync } = require('node:sqlite');
+    const db = new DatabaseSync(${JSON.stringify(databasePath)}, { timeout: 5000 });
+    const projectId = ${JSON.stringify(project.id)};
+    process.send('ready');
+    (async () => {
+      for (let i = 1; i <= 100; i++) {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const id = 'message:' + i;
+          db.prepare('INSERT INTO records(id,kind,data) VALUES(?,?,?)').run(id, 'message', JSON.stringify({ id, projectId, text: 'Committed ' + i, createdAt: new Date().toISOString() }));
+          db.prepare('INSERT INTO events(project_id,type,data,created_at) VALUES(?,?,?,?)').run(projectId, 'message-added', JSON.stringify({ id }), new Date().toISOString());
+          db.exec('COMMIT');
+        } catch (error) { db.exec('ROLLBACK'); throw error; }
+        await new Promise(resolve => setTimeout(resolve, 2));
+      }
+      db.close();
+    })().catch(error => { console.error(error); process.exitCode = 1; });
+  `;
+  const child = spawn(process.execPath, ["-e", source], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+  let childError = "";
+  child.stderr?.on("data", (chunk) => { childError += String(chunk); });
+  const completed = new Promise<void>((resolve, reject) => child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Writer exited ${code}: ${childError}`))));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once("message", () => resolve());
+      child.once("error", reject);
+    });
+    let observedPartial = false;
+    for (let i = 0; i < 60; i++) {
+      const snapshot = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory: join(dir, "snapshots") });
+      assert.equal(snapshot.counts.message, snapshot.eventSequence, `mixed record/event commit at capture ${i}`);
+      if (snapshot.counts.message > 0 && snapshot.counts.message < 100) observedPartial = true;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    await completed;
+    assert.equal(observedPartial, true, "test must observe at least one in-progress WAL state");
+    const final = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory: join(dir, "snapshots") });
+    assert.equal(final.counts.message, 100);
+    assert.equal(final.eventSequence, 100);
+  } finally {
+    if (child.exitCode === null) child.kill();
+    store.close();
+  }
+});

@@ -8,6 +8,8 @@ import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
 import { runVerification, sourceFingerprint } from "./verification.ts";
+import { runBrowserBaseline, validateBrowserReport, type BrowserAuditReport } from "./browser-audit.ts";
+import { loadBrowserSnapshot } from "./browser-snapshot.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
 const TaskPlan = z.object({
@@ -55,8 +57,8 @@ const Judgment = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   verificationRequests: z
-    .array(z.enum(["configured-checks", "refresh-baseline", "cleanup-test-fixtures"]))
-    .max(3)
+    .array(z.enum(["configured-checks", "refresh-baseline", "cleanup-test-fixtures", "browser-baseline"]))
+    .max(4)
     .default([]),
 });
 type WikiLogEntry = { runId: string; pageId: string; capturedAt: string; text: string };
@@ -119,6 +121,7 @@ export class Engine extends EventEmitter {
   nextRemoteSync = new Map<string, number>();
   gitRunner = git;
   verificationRunner = runVerification;
+  browserAuditRunner = runBrowserBaseline;
   mergeBroker = gh;
   get github() { return this.mergeBroker; }
   set github(broker: typeof gh) { this.mergeBroker = broker; }
@@ -195,7 +198,10 @@ export class Engine extends EventEmitter {
     task?: RecordData,
     write = false,
   ) {
-    if (task?.worktree) await this.handoffBaselineEvidence(project, task);
+    if (task?.worktree) {
+      await this.handoffBaselineEvidence(project, task);
+      await this.handoffBrowserBaselineEvidence(project, task);
+    }
     const settings = this.settings(),
       profile =
         role === "orchestrator"
@@ -382,6 +388,62 @@ export class Engine extends EventEmitter {
           await readFile(target, "utf8") !== bytes)
         throw new Error("Existing baseline report differs from the coordinator evidence.");
     });
+  }
+  async handoffBrowserBaselineEvidence(project: RecordData, task: RecordData) {
+    const baseline = this.store.get(project.id, "project").browserBaseline;
+    if (!task.worktree || !baseline?.reportId || baseline.ownerTaskId === task.id) return;
+    if (task.projectId !== project.id ||
+        this.store.get(baseline.ownerTaskId, "task").projectId !== project.id ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(baseline.reportId))
+      throw new Error("Frozen browser baseline belongs to another project or has an invalid identity.");
+    const expected = join(await realpath(this.dataDir), "browser-audit", baseline.reportId + ".json");
+    if (await realpath(expected).catch(() => null) !== expected ||
+        !(await lstat(expected).catch(() => ({ isFile: () => false }))).isFile())
+      throw new Error("Frozen browser baseline report is missing or not a regular coordinator file.");
+    const bytes = await readFile(expected);
+    if (createHash("sha256").update(bytes).digest("hex") !== baseline.reportHash)
+      throw new Error("Frozen browser baseline report differs from its pinned hash.");
+    const report = JSON.parse(bytes.toString("utf8"));
+    if (report.id !== baseline.reportId || report.kind !== "browser-baseline" ||
+        report.projectId !== project.id || report.status !== "complete" ||
+        report.sourceUnchanged !== true || !report.sourceSha ||
+        report.snapshotId !== baseline.snapshotId || report.snapshotHash !== baseline.snapshotHash ||
+        report.protocolHash !== baseline.protocolHash || report.evaluatorHash !== baseline.evaluatorHash ||
+        validateBrowserReport(report).length)
+      throw new Error("Frozen browser baseline report does not match accepted measurement evidence.");
+    await this.verifyBrowserArtifacts(report);
+    const snapshot = await loadBrowserSnapshot(
+      join(this.dataDir, "browser-snapshots"), baseline.snapshotId, project.id);
+    if (snapshot.hash !== baseline.snapshotHash)
+      throw new Error("Frozen browser baseline snapshot differs from the pinned evidence.");
+    const directory = join(task.worktree, ".looproom-verification");
+    await mkdir(directory, { recursive: true });
+    if (await realpath(directory) !== join(await realpath(task.worktree), ".looproom-verification"))
+      throw new Error("Verification evidence directory must not be a symlink.");
+    for (const name of [report.id + ".json", "baseline-browser.json"]) {
+      const target = join(directory, name);
+      await writeFile(target, bytes, { flag: "wx" }).catch(async (error) => {
+        if (error.code !== "EEXIST") throw error;
+        if (await realpath(target) !== join(await realpath(directory), name) ||
+            createHash("sha256").update(await readFile(target)).digest("hex") !== baseline.reportHash)
+          throw new Error("Existing browser baseline handoff differs from the coordinator evidence.");
+      });
+    }
+  }
+  async verifyBrowserArtifacts(report: BrowserAuditReport) {
+    const directory = join(await realpath(this.dataDir), "browser-audit", report.id);
+    if (await realpath(directory).catch(() => null) !== directory ||
+        !(await lstat(directory).catch(() => ({ isDirectory: () => false }))).isDirectory())
+      throw new Error("Browser artifacts must remain in their real coordinator audit directory.");
+    for (const artifact of report.artifacts) {
+      if (typeof artifact !== "string" || !artifact.startsWith(directory + "/") ||
+          await realpath(artifact).catch(() => null) !== artifact ||
+          !(await lstat(artifact).catch(() => ({ isFile: () => false }))).isFile())
+        throw new Error("Browser artifact is missing, linked, or outside its audit directory.");
+      const actualHash = createHash("sha256").update(await readFile(artifact)).digest("hex");
+      if (actualHash !== report.artifactHashes[artifact])
+        throw new Error("Browser artifact differs from the recorded SHA-256 evidence.");
+    }
   }
   async document(
     projectId: string,
@@ -797,7 +859,7 @@ export class Engine extends EventEmitter {
       .slice(-6)
       .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nFrozen browser baseline: ${JSON.stringify(this.store.get(project.id).browserBaseline ?? null)}. If present for a candidate task, read .looproom-verification/baseline-browser.json and its matching by-ID report before comparing results.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. Browser baseline reports, when requested by the judge, are separate: read .looproom-verification/browser-latest.json and its matching <report-id>.json. An unavailable browser report is diagnostic evidence, never a measured baseline or passing result. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     const result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
@@ -1777,6 +1839,113 @@ export class Engine extends EventEmitter {
     }
     return report;
   }
+  async verifyBrowserBaseline(project: RecordData, task: RecordData, gate?: RecordData) {
+    if (!task.worktree || task.projectId !== project.id)
+      throw new Error("Browser baseline needs the assigned task worktree.");
+    if (gate && (this.store.get(gate.id).status !== "open" ||
+        this.store.get(project.id).status !== "running" ||
+        escalationMode(this.store.get(project.id)) !== "yolo" ||
+        this.store.hasOpenInterruption(project.id)))
+      throw new Error("Browser baseline gate is no longer eligible for automatic verification.");
+    const pinned = this.store.get(project.id).browserBaseline;
+    const report = await this.browserAuditRunner({
+      cwd: task.worktree,
+      dataDir: this.dataDir,
+      projectId: project.id,
+      databasePath: join(this.dataDir, "looproom.sqlite"),
+      codexBinary: this.runtime.binary,
+      runId: this.store.get(task.id).implementationRunId,
+      ...(pinned ? { snapshotId: pinned.snapshotId } : {}),
+      timeoutMs: 30 * 60_000,
+    });
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(report.id) || report.projectId !== project.id ||
+        report.kind !== "browser-baseline" || !["complete", "unavailable"].includes(report.status))
+      throw new Error("Browser baseline runner returned an invalid report identity or status.");
+    const expectedReportPath = join(await realpath(this.dataDir), "browser-audit", report.id + ".json");
+    if (report.reportPath !== expectedReportPath ||
+        (await realpath(report.reportPath)) !== expectedReportPath ||
+        !(await lstat(report.reportPath)).isFile())
+      throw new Error("Browser baseline report is not the coordinator's immutable report file.");
+    const reportBytes = await readFile(report.reportPath);
+    if (JSON.stringify(JSON.parse(reportBytes.toString("utf8"))) !== JSON.stringify(report))
+      throw new Error("Browser baseline report bytes differ from the runner result.");
+    if (!report.sourceUnchanged || report.sourceHash !== await sourceFingerprint(task.worktree))
+      throw new Error("Browser baseline source changed during measurement; retain the coordinator report and remeasure.");
+    const currentTask = this.store.get(task.id);
+    if (currentTask.projectId !== project.id || currentTask.worktree !== task.worktree)
+      throw new Error("Browser baseline task ownership changed during measurement.");
+    if (report.status === "complete" && (!report.sourceSha ||
+        report.unavailable.length || validateBrowserReport(report).length))
+      throw new Error("Browser baseline runner claimed complete without required measured evidence.");
+    if (report.snapshotId && report.snapshotHash) {
+      const snapshot = await loadBrowserSnapshot(
+        join(this.dataDir, "browser-snapshots"), report.snapshotId, project.id);
+      if (snapshot.hash !== report.snapshotHash)
+        throw new Error("Browser baseline report does not match its immutable project snapshot.");
+    } else if (report.status === "complete")
+      throw new Error("Complete browser baseline has no immutable project snapshot.");
+    if (report.status === "complete") await this.verifyBrowserArtifacts(report);
+    if (pinned && (report.snapshotId !== pinned.snapshotId ||
+        report.snapshotHash !== pinned.snapshotHash || report.protocolHash !== pinned.protocolHash ||
+        report.evaluatorHash !== pinned.evaluatorHash))
+      throw new Error("Browser baseline candidate did not use the pinned snapshot and evaluator.");
+    if (gate && (this.store.get(gate.id).status !== "open" ||
+        this.store.get(project.id).status !== "running" ||
+        escalationMode(this.store.get(project.id)) !== "yolo" ||
+        this.store.hasOpenInterruption(project.id)))
+      throw new Error("Browser baseline completed after the gate or project changed; report retained by coordinator without automatic handoff.");
+    const summary = {
+      id: report.id,
+      kind: report.kind,
+      status: report.status,
+      unavailable: report.unavailable.slice(0, 20),
+      unavailableCount: report.unavailable.length,
+      sourceHash: report.sourceHash,
+      sourceSha: report.sourceSha,
+      sourceUnchanged: report.sourceUnchanged,
+      snapshotId: report.snapshotId,
+      snapshotHash: report.snapshotHash,
+      protocolHash: report.protocolHash,
+      evaluatorHash: report.evaluatorHash,
+      reportPath: report.reportPath,
+      reportHash: createHash("sha256").update(reportBytes).digest("hex"),
+      createdAt: report.createdAt,
+    };
+    const evidenceDir = join(task.worktree, ".looproom-verification");
+    await mkdir(evidenceDir, { recursive: true });
+    if ((await realpath(evidenceDir)) !==
+        join(await realpath(task.worktree), ".looproom-verification"))
+      throw new Error("Verification evidence directory must not be a symlink.");
+    await writeFile(join(evidenceDir, report.id + ".json"), reportBytes, { flag: "wx" });
+    const temporary = join(evidenceDir, report.id + ".tmp");
+    await writeFile(temporary, reportBytes, { flag: "wx" });
+    await rename(temporary, join(evidenceDir, "browser-latest.json"));
+    if (gate && (this.store.get(gate.id).status !== "open" ||
+        this.store.get(project.id).status !== "running" ||
+        escalationMode(this.store.get(project.id)) !== "yolo" ||
+        this.store.hasOpenInterruption(project.id)))
+      throw new Error("Browser baseline gate changed before report handoff; coordinator evidence remains available by ID.");
+    this.store.patch(task.id, {
+      browserVerification: summary,
+      ...(report.status === "complete" ? { judgeRetries: 0 } : {}),
+    });
+    if (!pinned && report.status === "complete" && report.sourceUnchanged &&
+        report.unavailable.length === 0) {
+      this.store.patch(project.id, { browserBaseline: {
+        ownerTaskId: task.id,
+        reportId: report.id,
+        snapshotId: report.snapshotId,
+        snapshotHash: report.snapshotHash,
+        protocolHash: report.protocolHash,
+        evaluatorHash: report.evaluatorHash,
+        reportHash: createHash("sha256").update(reportBytes).digest("hex"),
+      } });
+    }
+    this.changed("browser-verification-completed", {
+      taskId: task.id, reportId: report.id, status: report.status,
+    }, project.id);
+    return report;
+  }
   async freezeBaseline(project: RecordData, task: RecordData) {
     const baseline = this.store.get(project.id).refreshBaseline;
     if (!baseline || baseline.ownerTaskId !== task.id || baseline.phase === "frozen") return;
@@ -1962,6 +2131,7 @@ export class Engine extends EventEmitter {
               feedback: t.feedback,
               checks: t.checks,
               verification: t.verification,
+              browserVerification: t.browserVerification,
               baselineVerification: t.baselineVerification,
               verificationEvaluatorHash: t.verificationEvaluatorHash,
               judgeRetries: t.judgeRetries,
@@ -1978,13 +2148,14 @@ export class Engine extends EventEmitter {
       let result = await this.run(
         project,
         "judge",
-        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request coordinator verification using verificationRequests: ["configured-checks"] and/or ["refresh-baseline"]. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs a disposable isolated snapshot with child execution, fixture cleanup and test loopback; the worker permissions stay unchanged. If recorded evidence is missing for the available verification runner, request the appropriate recipe instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
+        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request fixed coordinator recipes via verificationRequests: "configured-checks", "refresh-baseline", or "browser-baseline". Request "browser-baseline" only when actual read-only project records and controlled browser measurements are needed; the coordinator snapshots records, runs a private browser against a separate viewer, and returns an immutable report. An unavailable report is diagnostic, not a measured baseline. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs disposable isolated verification; the worker permissions stay unchanged. If recorded evidence is missing for an available recipe, request it instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
 Goal: ${project.goal}
 Scope/exclusions: ${project.constraints}
 Repository: ${project.path}
 Authorized checks: ${JSON.stringify(project.checks ?? [])}
 Escalation: ${JSON.stringify({ id: gate.id, title: gate.title, detail: gate.detail, type: gate.type, scope: gate.scope, authorRole: gate.authorRole, lastVerificationError: gate.judgeRecoveryError ?? gate.judgeError })}
 Refresh baseline state: ${JSON.stringify(this.store.get(project.id).refreshBaseline ?? null)}. During initial setup, a revised evaluator needs independent review of unchanged measurement rules and a fresh baseline. Once reviewed and frozen, candidate evaluator edits are refused. Scores from different evaluator versions are never comparable.
+Browser baseline state: ${JSON.stringify(this.store.get(project.id).browserBaseline ?? null)}. Browser evidence must identify the actual snapshot, frozen protocol and raw observations; source or fixture reports cannot substitute for it.
 Task and dependency frontier: ${JSON.stringify(relatedTasks)}
 Originating run: ${JSON.stringify(origin ? { role: origin.role, output: String(origin.output ?? "").slice(-16000), error: origin.error } : null)}
 Relevant conversation, including earlier responses: ${JSON.stringify(context)}
@@ -1994,6 +2165,7 @@ Action retry: your specific decision permits continuing within existing capabili
         task,
         false,
       );
+      let browserMeasurementIncomplete = result.verificationRequests.includes("browser-baseline");
       if (
         result.verificationRequests.length &&
         task?.worktree &&
@@ -2002,25 +2174,38 @@ Action retry: your specific decision permits continuing within existing capabili
         this.store.get(project.id).status === "running" &&
         this.store.get(gate.id).status === "open"
       ) {
-        let report;
+        const reports: unknown[] = [];
         try {
           const commands = await this.verificationCommands(project, this.store.get(task.id), result.verificationRequests);
           if (commands.length) {
             this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
             this.changed("judge-verification-started", { gateId: gate.id, taskId: task.id }, project.id);
-            report = await this.verify(project, task, commands,
+            reports.push(await this.verify(project, task, commands,
               result.verificationRequests.includes("cleanup-test-fixtures"),
-              this.store.get(task.id).implementationRunId);
+              this.store.get(task.id).implementationRunId));
+          }
+          if (result.verificationRequests.includes("browser-baseline") &&
+              this.store.get(gate.id).status === "open" &&
+              this.store.get(project.id).status === "running" &&
+              escalationMode(this.store.get(project.id)) === "yolo") {
+            this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
+            this.changed("judge-browser-verification-started", { gateId: gate.id, taskId: task.id }, project.id);
+            const browserReport = await this.verifyBrowserBaseline(
+              this.store.get(project.id), this.store.get(task.id), gate);
+            reports.push(this.store.get(task.id).browserVerification);
+            browserMeasurementIncomplete = browserReport.status !== "complete" ||
+              !browserReport.sourceUnchanged || browserReport.unavailable.length > 0;
           }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
+          if (this.store.get(gate.id).status !== "open") return;
           this.store.patch(gate.id, { judgeRecoveryStatus: "failed", judgeRecoveryError: detail });
           this.changed("judge-verification-failed", { gateId: gate.id, taskId: task.id, error: detail }, project.id);
           result = { ...result, action: "wait", verificationRequests: [],
             answer: (result.answer.slice(0, 4200) + "\nThe coordinator verification request failed: " + detail.slice(0, 1200) +
               "\nRepair this specific source or setup condition within existing capabilities before retrying; no passing result was produced.").slice(0, 6000) };
         }
-        if (report) {
+        if (reports.length && this.store.get(gate.id).judgeRecoveryStatus !== "failed") {
           if (this.store.get(gate.id).status !== "open") return;
           if (this.store.get(project.id).status !== "running" ||
               escalationMode(this.store.get(project.id)) !== "yolo") {
@@ -2030,20 +2215,27 @@ Action retry: your specific decision permits continuing within existing capabili
           result = await this.run(
             this.store.get(project.id),
             "judge",
-            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator snapshot report: ${JSON.stringify(report)}\nThe report has real command outputs/exit status, original-source hash and a sourceUnchanged flag. It ran in a disposable isolated copy, not the worker shell. If checks failed, return retry with a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Do not claim checks passed when their exit code is nonzero. The worker can read .looproom-verification/latest.json and .looproom-verification/<report-id>.json; the coordinator runs configured checks after implementation. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
+            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator reports: ${JSON.stringify(reports)}\nCheck reports contain actual command outputs/exit status and source identity from a disposable copy. Browser-baseline reports contain actual read-only project snapshot and controlled browser observations, or an explicit unavailable status. Read the exact immutable browser report by ID in .looproom-verification/<report-id>.json; browser-latest.json points only to the latest browser batch, while latest.json is reserved for configured checks. An unavailable browser observation cannot establish the baseline or justify candidate promotion or capability-success retry; give specific documentation or repair steps while keeping the measurement gate blocked. If checks failed, return a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
             Judgment,
             task,
             false,
           );
           this.store.patch(gate.id, { judgeRecoveryStatus: "verified" });
         }
+        if (browserMeasurementIncomplete)
+          result = { ...result, action: "wait", verificationRequests: [],
+            answer: (result.answer + "\nThe browser report remains incomplete. Preserve its diagnostics and recheck after the missing observation is available; do not claim a measured baseline or promote a candidate.").slice(0, 6000) };
       }
       if (
         result.action === "wait" &&
         gate.type !== "pr" &&
+        !browserMeasurementIncomplete &&
         escalationMode(this.store.get(project.id)) === "yolo"
       )
         result = await this.recoverEscalation(project, gate, task, result);
+      if (browserMeasurementIncomplete && result.action !== "wait")
+        result = { ...result, action: "wait", verificationRequests: [],
+          answer: (result.answer + "\nThe actual browser baseline remains incomplete; the measurement gate stays open until a complete report is recorded.").slice(0, 6000) };
       const run = this.store
         .all("run", project.id)
         .filter((run) => run.role === "judge")
