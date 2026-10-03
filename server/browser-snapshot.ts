@@ -15,7 +15,7 @@ export type BrowserSnapshot = {
   review?: Record<string, FrozenPrReview>;
 };
 
-export type PrReviewBinding = { gateId: string; projectId: string; pr: string; sha: string; base: string };
+export type PrReviewBinding = { gateId: string; projectId: string; pr: string; sha: string; base: string; baseSha?: string };
 export type FrozenPrReview = PrReviewBinding & { info: any; diff: string };
 
 const kinds = ["project", "task", "gate", "agent", "message", "run", "memory"] as const;
@@ -42,16 +42,21 @@ function reviewBinding(gate: any, project: any): PrReviewBinding | null {
   if (gate?.type !== "pr" || gate?.status !== "open" || gate?.projectId !== project.id ||
       typeof gate.id !== "string" || !repository || !pr || pr[1] !== repository[1] || pr[2] !== repository[2] ||
       !/^[a-f0-9]{40}$/.test(gate.sha ?? "") || typeof project.branch !== "string" ||
-      !project.branch || project.branch.length > 256 || (gate.base != null && gate.base !== project.branch)) return null;
-  return { gateId: gate.id, projectId: project.id, pr: gate.pr, sha: gate.sha, base: project.branch };
+      !project.branch || project.branch.length > 256 || (gate.base != null && gate.base !== project.branch) ||
+      (gate.importedFromGitHub && !/^[a-f0-9]{40}$/.test(gate.baseSha ?? ""))) return null;
+  return { gateId: gate.id, projectId: project.id, pr: gate.pr, sha: gate.sha, base: project.branch,
+    ...(gate.importedFromGitHub ? { baseSha: gate.baseSha } : {}) };
 }
 function validReview(binding: PrReviewBinding, review: FrozenPrReview) {
   const number = Number(/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/([1-9]\d*)$/.exec(binding.pr)?.[1]);
   return review && review.gateId === binding.gateId && review.projectId === binding.projectId &&
     review.pr === binding.pr && review.sha === binding.sha && review.base === binding.base &&
+    review.baseSha === binding.baseSha &&
     review.info?.url === binding.pr && review.info?.headRefOid === binding.sha &&
     review.info?.baseRefName === binding.base && review.info?.number === number && review.info?.state === "OPEN" &&
-    /^[a-f0-9]{40}$/.test(review.info?.baseRefOid ?? "") && typeof review.diff === "string" && !!review.diff.trim() &&
+    /^[a-f0-9]{40}$/.test(review.info?.baseRefOid ?? "") &&
+    (binding.baseSha == null || review.info.baseRefOid === binding.baseSha) &&
+    typeof review.diff === "string" && !!review.diff.trim() &&
     Buffer.byteLength(review.diff, "utf8") <= 2_000_000 &&
     Buffer.byteLength(JSON.stringify(review.info), "utf8") <= 500_000;
 }

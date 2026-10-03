@@ -97,6 +97,39 @@ test("freezes only revision-matched selected-project PR review and never forward
   } finally { store.close(); }
 });
 
+test("imported PR snapshot binds the gate's exact base commit while native gates keep their schema", async () => {
+  const dir = await testFixture("browser-imported-pr-base-");
+  const databasePath = join(dir, "live.sqlite"), directory = join(dir, "snapshots");
+  const store = new Store(databasePath);
+  try {
+    const project = store.put("project", { github: "example/project", branch: "main" });
+    const sha = "a".repeat(40), baseSha = "b".repeat(40);
+    const pr = "https://github.com/example/project/pull/10";
+    const gate = store.put("gate", { projectId: project.id, type: "pr", status: "open",
+      importedFromGitHub: true, pr, sha, base: "main", baseSha });
+    const capture = (remoteBase: string) => captureBrowserSnapshot({ databasePath, projectId: project.id,
+      directory, capturePrReview: async binding => {
+        assert.deepEqual(binding, { gateId: gate.id, projectId: project.id, pr, sha, base: "main", baseSha });
+        return { info: { number: 10, url: pr, headRefOid: sha, baseRefName: "main",
+          baseRefOid: remoteBase, state: "OPEN" }, diff: "diff --git a/a b/a\n+external change\n" };
+      } });
+    const advancedBase = await capture("c".repeat(40));
+    assert.equal(advancedBase.review?.[gate.id], undefined,
+      "an imported gate must not freeze a newer base revision at the same head");
+    const matched = await capture(baseSha);
+    assert.equal(matched.review?.[gate.id].baseSha, baseSha);
+    assert.deepEqual(await loadBrowserSnapshot(directory, matched.id, project.id), matched);
+    const file = join(directory, matched.id + ".json");
+    const tampered = JSON.parse(await readFile(file, "utf8"));
+    tampered.review[gate.id].info.baseRefOid = "c".repeat(40);
+    const { hash: _hash, ...body } = tampered;
+    tampered.hash = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    await chmod(file, 0o600);
+    await writeFile(file, JSON.stringify(tampered));
+    await assert.rejects(() => loadBrowserSnapshot(directory, matched.id, project.id), /PR review does not match/);
+  } finally { store.close(); }
+});
+
 test("one PR read failure leaves other actual project records and bound PR review available", async () => {
   const dir = await testFixture("browser-pr-read-failure-");
   const databasePath = join(dir, "live.sqlite"), directory = join(dir, "snapshots"), dist = join(dir, "dist");
