@@ -276,7 +276,18 @@ export async function runBrowserSample(page: Page, sample: BrowserSample, snapsh
     const region = page.getByRole("region", { name: "Goal conversation" });
     if (await keyboardReach(page, region, "Goal conversation", sample)) { await page.evaluate(() => performance.mark("looproom-activation")); await page.keyboard.press("Home"); }
     else { await page.evaluate(() => performance.mark("looproom-activation")); await region.evaluate((e: HTMLElement) => { e.scrollTop = 0; }); }
-  }, async () => { await page.getByRole("button", { name: "Latest messages" }).waitFor(); });
+  }, async () => {
+    await page.getByRole("button", { name: "Latest messages" }).waitFor();
+    await page.waitForFunction(() => {
+      const viewport = document.querySelector<HTMLElement>('.conversation-scroll .messages');
+      if (!viewport || viewport.scrollTop > 1) { (window as any).__looproomGoalTop = null; return false; }
+      const now = performance.now();
+      const observation = (window as any).__looproomGoalTop as { since: number; frames: number } | null;
+      if (!observation) { (window as any).__looproomGoalTop = { since: now, frames: 1 }; return false; }
+      observation.frames++;
+      return observation.frames >= 3 && now - observation.since >= 32;
+    }, null, { polling: 'raf', timeout: 5000 });
+  });
   const latestButton = page.locator('.conversation .latest-message');
   try {
     await measure(page, sample, "goal.latest", () => activate(page, latestButton, "Latest messages", sample), async () => { await latestButton.waitFor({ state: "hidden", timeout: 1500 }); });
