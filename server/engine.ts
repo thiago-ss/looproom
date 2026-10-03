@@ -214,6 +214,7 @@ export class Engine extends EventEmitter {
     schema: any,
     task?: RecordData,
     write = false,
+    purpose?: "pr-repair" | "merged-pr-followup",
   ) {
     if (task) task = this.store.get(task.id, "task");
     if (task?.worktree) await this.handoffBaselineEvidence(project, task);
@@ -235,6 +236,38 @@ export class Engine extends EventEmitter {
       });
     const run = this.store.transaction(() => {
       if (task) task = this.store.get(task.id, "task");
+      if (role === "implementation" && task?.experimentRoundId) {
+        const round = this.store.get(task.experimentRoundId, "experiment-round");
+        if (purpose === "merged-pr-followup") {
+          const followup = task.followupPr;
+          const gate = followup?.gateId && this.store.get(followup.gateId, "gate");
+          if (round.status !== "kept" || round.taskId !== task.id || round.projectId !== project.id ||
+              !followup || followup.state !== "MERGED" || !followup.mergedAt ||
+              followup.base !== project.branch ||
+              !/^[a-f0-9]{40}$/.test(followup.headSha ?? "") ||
+              !/^[a-f0-9]{40}$/.test(followup.mergedSha ?? "") ||
+              followup.worktree !== task.worktree || followup.branch !== task.branch ||
+              task.pr || task.prRepair || !task.worktree || !task.branch ||
+              gate?.status !== "reconciled" || gate.taskId !== task.id ||
+              gate.projectId !== project.id || gate.pr !== followup.url ||
+              gate.remoteObservation?.state !== "MERGED" ||
+              gate.remoteObservation?.headSha !== followup.headSha ||
+              gate.remoteObservation?.mergedSha !== followup.mergedSha ||
+              gate.remoteObservation?.mergedAt !== followup.mergedAt)
+            throw new Error("Kept experiment round requires a validated merged PR follow-up.");
+        } else if (purpose === "pr-repair") {
+          const repair = task.prRepair;
+          const gate = repair && this.store.get(repair.gateId, "gate");
+          if (round.status !== "kept" || round.taskId !== task.id || round.projectId !== project.id ||
+              repair?.stage !== "prepared" || !task.worktree || !task.branch ||
+              repair.pr !== task.pr || repair.base !== project.branch ||
+              gate?.status !== "superseded" || gate.taskId !== task.id ||
+              gate.pr !== repair.pr)
+            throw new Error("Kept experiment round requires a prepared repair of its existing PR.");
+        } else if (round.status !== "active")
+          throw new Error("Experiment round is not active.");
+      } else if (purpose)
+        throw new Error("PR follow-up run requires a kept experiment round.");
       const created = this.store.put("run", {
         agentId: agent.id,
         projectId: project.id,
@@ -251,7 +284,7 @@ export class Engine extends EventEmitter {
         createdAt: new Date().toISOString(),
       });
       if (role === "implementation" && task) {
-        if (task.experimentRoundId) {
+        if (task.experimentRoundId && !purpose) {
           const slot = reserveCandidate(this.store, task.experimentRoundId, created.id);
           this.store.patch(created.id, { experimentCandidateId: slot.id });
         }
@@ -317,6 +350,8 @@ export class Engine extends EventEmitter {
         },
       });
       const parsed = schema.parse(JSON.parse(output));
+      if (purpose && parsed.experimentCandidate)
+        throw new Error("PR follow-up run cannot report a new experiment candidate.");
       this.store.transaction(() => {
         const slotId = role === "implementation" ? this.store.get(run.id).experimentCandidateId : undefined;
         if (slotId && parsed.experimentCandidate)
@@ -838,7 +873,10 @@ export class Engine extends EventEmitter {
   }
   async implement(project: RecordData, task: RecordData) {
     task = this.store.get(task.id, "task");
+    if (["completed", "awaiting_human"].includes(task.status)) return;
     const recordedRound = task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
+    if (recordedRound && (recordedRound.taskId !== task.id || recordedRound.projectId !== project.id))
+      throw new Error("Experiment round does not belong to this task.");
     if (recordedRound?.status === "active") {
       const pending = recordedRound.candidateIds.map((id: string) => this.store.get(id))
         .find((candidate: RecordData) => ["reserved", "measured"].includes(candidate.status));
@@ -856,7 +894,7 @@ export class Engine extends EventEmitter {
         return;
       }
     }
-    if (recordedRound?.status === "kept" && !task.prRepair) {
+    if (recordedRound?.status === "kept" && !task.prRepair && !task.followupPr) {
       if (!task.reviewedSource || !await this.reviewedSourceMatches(task)) {
         this.gate(project.id, "Kept experiment source changed",
           "The kept candidate no longer matches its verified source. Review the preserved work before publication; do not count another candidate in the closed round.",
@@ -869,6 +907,17 @@ export class Engine extends EventEmitter {
     }
     if (task.prRepair) task = await this.preparePrRepair(project, task);
     if (this.closed || task.status === "blocked" || this.store.get(project.id).status !== "running") return;
+    let repairPurpose: "pr-repair" | "merged-pr-followup" | undefined =
+      recordedRound?.status === "kept" && task.prRepair?.stage === "prepared"
+        ? "pr-repair" : undefined;
+    if (recordedRound?.status === "kept" && task.followupPr && !task.prRepair) {
+      await this.prepareMergedFollowup(project, task);
+      task = this.store.get(task.id);
+      if (task.status === "completed") return;
+      repairPurpose = "merged-pr-followup";
+    }
+    if (recordedRound && recordedRound.status !== "active" && !repairPurpose)
+      throw new Error("Experiment round is not active.");
     if (!task.worktree) {
       let base = "HEAD";
       if (project.github) {
@@ -912,10 +961,10 @@ export class Engine extends EventEmitter {
       .slice(-6)
       .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const round = recordedRound?.status === "kept" ? undefined :
+    const round = repairPurpose ? undefined :
       task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
     if (round && round.status !== "active") throw new Error("Experiment round is not active.");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. If humanQuestion specifically waits for the current PR repair to merge, include its exact PR URL in humanQuestion and return repairWait with the supplied repair gateId and pr; omit repairWait for any other blocker. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${repairPurpose === "merged-pr-followup" ? "The prior PR merged during repair. Integrate the latest base with preserved unpublished work; report no experimentCandidate. The earlier merge does not approve remaining work.\n" : ""}${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. If humanQuestion specifically waits for the current PR repair to merge, include its exact PR URL in humanQuestion and return repairWait with the supplied repair gateId and pr; omit repairWait for any other blocker. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     let result: z.infer<typeof Result>;
     try { result = await this.run(
       project,
@@ -924,6 +973,7 @@ export class Engine extends EventEmitter {
       Result,
       task,
       task.kind !== "research",
+      repairPurpose,
     ); } catch (error) {
       const failedRun = this.store.get(task.id).implementationRunId;
       const slotId = failedRun && this.store.get(failedRun).experimentCandidateId;
@@ -1340,12 +1390,13 @@ export class Engine extends EventEmitter {
   retireRepairPrRecords(project: RecordData, task: RecordData, gate: RecordData, info: any, message?: string) {
     const observedAt = new Date().toISOString();
     const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid,
-    base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
+      base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
     this.store.patch(gate.id, { remoteObservation: observation,
       ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
     this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
       baseSha: task.prRepair?.baseSha ?? task.baseSha,
-      followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
+      followupPr: { ...observation, gateId: gate.id, worktree: task.worktree, branch: task.branch },
+      prHistory: [...(task.prHistory ?? []), observation],
       feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
     this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
       text: message ?? `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
@@ -1553,6 +1604,41 @@ export class Engine extends EventEmitter {
       }
       this.syncingProjects.delete(projectId);
     }
+  }
+  async prepareMergedFollowup(project: RecordData, task: RecordData) {
+    const followup = task.followupPr;
+    const gate = followup?.gateId && this.store.get(followup.gateId, "gate");
+    if (!followup || followup.state !== "MERGED" || !followup.mergedAt ||
+        !/^[a-f0-9]{40}$/.test(followup.mergedSha ?? "") ||
+        !/^[a-f0-9]{40}$/.test(followup.headSha ?? "") ||
+        followup.base !== project.branch || followup.worktree !== task.worktree ||
+        followup.branch !== task.branch || !task.worktree || !task.branch ||
+        task.pr || task.prRepair || gate?.status !== "reconciled" ||
+        gate.taskId !== task.id || gate.projectId !== project.id ||
+        gate.pr !== followup.url || gate.remoteObservation?.state !== "MERGED" ||
+        gate.remoteObservation?.headSha !== followup.headSha ||
+        gate.remoteObservation?.mergedSha !== followup.mergedSha ||
+        gate.remoteObservation?.mergedAt !== followup.mergedAt)
+      throw new Error("Merged PR follow-up lacks matching durable broker evidence.");
+    const common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    if (await realpath(await this.gitRunner(task.worktree, common)) !==
+        await realpath(await this.gitRunner(project.path, common)) ||
+        await this.gitRunner(task.worktree, ["branch", "--show-current"]) !== task.branch)
+      throw new Error("Merged PR follow-up worktree ownership changed.");
+    const head = await this.gitRunner(task.worktree, ["rev-parse", "HEAD"]);
+    const merging = await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+    const dirty = await this.gitRunner(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]);
+    if (head === followup.headSha && !merging && !dirty) {
+      this.store.patch(task.id, { status: "completed",
+        completedReason: "Clean owned worktree matches the externally merged final head.",
+        mergedBaseEvidence: { pr: followup.url, headSha: head, mergedSha: followup.mergedSha } });
+      this.changed("task-completed", { taskId: task.id, mergedSha: followup.mergedSha }, project.id);
+      return;
+    }
+    await this.gitRunner(project.path, ["fetch", "origin", project.branch]);
+    const baseSha = await this.gitRunner(project.path, ["rev-parse", "refs/remotes/origin/" + project.branch]);
+    if (!/^[a-f0-9]{40}$/.test(baseSha)) throw new Error("Merged PR follow-up has no current base revision.");
+    this.store.patch(task.id, { baseSha });
   }
   async preparePrRepair(project: RecordData, task: RecordData) {
     const repair = task.prRepair;

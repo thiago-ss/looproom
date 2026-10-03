@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { rm, writeFile, access } from "node:fs/promises";
+import { rm, writeFile, access, mkdir } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { Store } from "./store.ts";
 import { Engine } from "./engine.ts";
@@ -644,6 +644,214 @@ test("kept candidate resumes publication without consuming another candidate aft
   } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
+test("kept round PR repair runs after restart without another candidate or approval", async () => {
+  const dir = await testFixture("looproom-kept-pr-repair-");
+  const repo = await createRepo(join(dir, "repo"));
+  const db = join(dir, "db");
+  let store = new Store(db);
+  let engine: Engine | undefined;
+  try {
+    store.put("settings", { subagent: { model: "fixture", effort: "medium" } }, "settings");
+    const project = store.put("project", { path: repo.path, branch: repo.branch, status: "running",
+      goal: "Repair PR", constraints: "", checks: ["fixture-check"], github: "fixture/repo" });
+    const task = store.put("task", { projectId: project.id, status: "ready", kind: "implementation",
+      title: "Repair", description: "", acceptance: [], dependencies: [], attempt: 0 });
+    const independent = store.put("task", { projectId: project.id, status: "ready", dependencies: [] });
+    const tree = await createWorktree(repo.path, dir, task.id);
+    const head = await git(tree.path, ["rev-parse", "HEAD"]);
+    const pr = "https://github.com/fixture/repo/pull/9";
+    const priorGate = store.put("gate", { projectId: project.id, taskId: task.id,
+      type: "pr", status: "superseded", pr, sha: head });
+    store.patch(task.id, { worktree: tree.path, branch: tree.branch, baseSha: head,
+      pr, sha: head, prRepair: { gateId: priorGate.id, pr, expectedHead: head,
+        base: repo.branch, baseSha: head, stage: "prepared" } });
+    const baselineOwner = store.put("task", { projectId: project.id, status: "completed",
+      kind: "implementation", title: "Baseline owner" });
+    const baselineRun = store.put("run", { projectId: project.id, taskId: baselineOwner.id,
+      role: "implementation" });
+    const baselineSource = refreshReport(store, project.id, baselineRun.id, [100, 100, 100]);
+    const baselineReportId = baselineSource.slice("verification:".length);
+    await mkdir(join(dir, "verification"), { recursive: true });
+    await writeFile(join(dir, "verification", `${baselineReportId}.json`),
+      JSON.stringify(store.get(`verification-report:${baselineReportId}`).report));
+    store.patch(project.id, { refreshBaseline: { phase: "frozen", evaluatorHash: refreshHash,
+      reportId: baselineReportId, measurementSourceHash: "source-fixed",
+      ownerTaskId: baselineOwner.id } });
+    const round = startExperiment(store, project.id, task.id, "Reduce refresh bytes", refreshContract);
+    const keptRun = store.put("run", { projectId: project.id, taskId: task.id,
+      role: "implementation", experimentRoundId: round.id, status: "completed" });
+    const sourceHash = await sourceFingerprint(tree.path);
+    const evidence = refreshReport(store, project.id, keptRun.id, [89, 100, 100],
+      { checks: true, sourceHash });
+    store.patch(task.id, { reviewedSource: { sourceHash, tree: await git(tree.path, ["write-tree"]),
+      head, mergeHead: "" } });
+    const candidate = recordCandidate(store, round.id, { runId: keptRun.id, outcome: "keep",
+      measurement: "89 bytes", evidence: [evidence], ...refreshContract });
+    assert.equal(candidate.outcome, "keep");
+    store.close();
+    store = new Store(db);
+    const turns: string[] = [];
+    const runtime = Object.assign(new EventEmitter(), { close() {}, async run(options: any) {
+      if (options.prompt.includes("Independently inspect")) {
+        turns.push("review");
+        return JSON.stringify({ verdict: "pass", summary: "Independent review passed", sources: ["review:repair"] });
+      }
+      turns.push("repair");
+      await writeFile(join(options.cwd, "repair.txt"), "repaired source");
+      return JSON.stringify({ summary: "PR repaired", sources: ["source:repair"], humanQuestion: "" });
+    } }) as unknown as Runtime;
+    engine = new Engine(store, runtime, dir);
+    engine.publicationPrInfo = async () => ({ gate: store.get(priorGate.id),
+      info: { state: "OPEN", headRefOid: head, url: pr, baseRefName: repo.branch } }) as any;
+    engine.verificationRunner = async ({ commands }: any) => ({ id: randomUUID(),
+      sourceHash: await sourceFingerprint(tree.path), sourceUnchanged: true,
+      results: commands.map((command: string) => ({ command, code: 0 })) }) as any;
+    const revisedHead = "b".repeat(40);
+    engine.publish = async (_project, current) => {
+      const reviewed = store.get(current.id).reviewedSource;
+      assert.ok(reviewed?.sourceHash);
+      store.patch(current.id, { status: "awaiting_human", sha: revisedHead, prRepair: null });
+      store.put("gate", { projectId: project.id, taskId: task.id, type: "pr",
+        status: "open", pr, sha: revisedHead, prRunId: store.get(task.id).implementationRunId });
+    };
+    await assert.rejects(engine.run(store.get(project.id), "implementation", "closed round",
+      z.object({}), store.get(task.id), true), /Experiment round is not active/);
+    assert.equal(store.all("run", project.id).filter((run) => run.taskId === task.id).length, 1);
+    await engine.implement(store.get(project.id), store.get(task.id));
+    assert.deepEqual(turns, ["repair", "review"]);
+    assert.equal(store.get(round.id).candidateIds.length, 1);
+    assert.deepEqual(store.get(candidate.id).evidence, [evidence]);
+    assert.equal(store.get(candidate.id).measurement, "89 bytes");
+    assert.equal(store.get(candidate.id).outcome, "keep");
+    const repairRun = store.get(store.get(task.id).implementationRunId);
+    assert.equal(repairRun.status, "completed");
+    assert.equal(repairRun.experimentRoundId, round.id);
+    assert.equal(repairRun.experimentCandidateId, undefined);
+    assert.equal(store.get(task.id).checks[0].code, 0);
+    const reviews = store.all("run", project.id).filter((run) => run.taskId === task.id && run.role === "review");
+    assert.equal(reviews.length, 1);
+    assert.equal(reviews[0].status, "completed");
+    const freshGates = store.all("gate", project.id).filter((gate) => gate.type === "pr" && gate.status === "open");
+    assert.equal(freshGates.length, 1);
+    assert.equal(freshGates[0].sha, revisedHead);
+    assert.notEqual(freshGates[0].sha, priorGate.sha);
+    assert.equal(store.get(independent.id).status, "ready");
+    assert.equal(store.all("approval", project.id).length, 0);
+  } finally { engine?.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+for (const remaining of [false, true]) {
+  test(`merged kept PR ${remaining ? "rechecks unpublished files" : "settles clean head"} after restart`, async () => {
+    const dir = await testFixture("looproom-kept-merged-followup-");
+    const repo = await createRepo(join(dir, "repo"));
+    const origin = join(dir, "origin.git");
+    await git(repo.path, ["clone", "--bare", repo.path, origin]);
+    await git(repo.path, ["remote", "add", "origin", origin]);
+    const db = join(dir, "db");
+    let store = new Store(db);
+    let engine: Engine | undefined;
+    try {
+      store.put("settings", { subagent: { model: "fixture", effort: "medium" } }, "settings");
+      const project = store.put("project", { path: repo.path, branch: repo.branch, status: "paused",
+        goal: "Preserve kept work", constraints: "", checks: ["fixture-check"], github: "fixture/repo" });
+      const task = store.put("task", { projectId: project.id, status: "ready", kind: "implementation",
+        title: "Repair", description: "", acceptance: [], dependencies: [], attempt: 0 });
+      const independent = store.put("task", { projectId: project.id, status: "ready", dependencies: [] });
+      const tree = await createWorktree(repo.path, dir, task.id);
+      await writeFile(join(tree.path, "feature.txt"), "kept feature\n");
+      await git(tree.path, ["add", "feature.txt"]);
+      await git(tree.path, ["-c", "user.name=Fixture", "-c", "user.email=fixture@localhost", "commit", "-m", "Kept feature"]);
+      const head = await git(tree.path, ["rev-parse", "HEAD"]);
+      await git(repo.path, ["merge", "--ff-only", head]);
+      await git(repo.path, ["push", "origin", repo.branch]);
+      const pr = "https://github.com/fixture/repo/pull/9";
+      const gate = store.put("gate", { projectId: project.id, taskId: task.id,
+        type: "pr", status: "superseded", pr, sha: head });
+      store.patch(task.id, { worktree: tree.path, branch: tree.branch, baseSha: head,
+        pr, sha: head, prRepair: { gateId: gate.id, pr, expectedHead: head,
+          base: repo.branch, baseSha: head, stage: "prepared" } });
+      const baselineOwner = store.put("task", { projectId: project.id, status: "completed", kind: "implementation" });
+      const baselineRun = store.put("run", { projectId: project.id, taskId: baselineOwner.id,
+        role: "implementation" });
+      const baselineSource = refreshReport(store, project.id, baselineRun.id, [100, 100, 100]);
+      const baselineReportId = baselineSource.slice("verification:".length);
+      await mkdir(join(dir, "verification"), { recursive: true });
+      await writeFile(join(dir, "verification", `${baselineReportId}.json`),
+        JSON.stringify(store.get(`verification-report:${baselineReportId}`).report));
+      store.patch(project.id, { refreshBaseline: { phase: "frozen", evaluatorHash: refreshHash,
+        reportId: baselineReportId, measurementSourceHash: "source-fixed", ownerTaskId: baselineOwner.id } });
+      const round = startExperiment(store, project.id, task.id, "Reduce refresh bytes", refreshContract);
+      const keptRun = store.put("run", { projectId: project.id, taskId: task.id, role: "implementation",
+        experimentRoundId: round.id, status: "completed" });
+      const sourceHash = await sourceFingerprint(tree.path);
+      const evidence = refreshReport(store, project.id, keptRun.id, [89, 100, 100],
+        { checks: true, sourceHash });
+      store.patch(task.id, { reviewedSource: { sourceHash, tree: await git(tree.path, ["write-tree"]),
+        head, mergeHead: "" } });
+      const candidate = recordCandidate(store, round.id, { runId: keptRun.id, outcome: "keep",
+        measurement: "89 bytes", evidence: [evidence], ...refreshContract });
+      assert.equal(candidate.outcome, "keep");
+      if (remaining) await writeFile(join(tree.path, "remaining.txt"), "unpublished repair\n");
+      const mergedInfo = { number: 9, url: pr, baseRefName: repo.branch, headRefOid: head,
+        state: "MERGED", mergedAt: new Date().toISOString(), mergeCommit: { oid: head } };
+      engine = new Engine(store, Object.assign(new EventEmitter(), { close() {} }) as Runtime, dir);
+      engine.gitRunner = git;
+      await engine.settleMergedRepair(store.get(project.id), store.get(task.id), store.get(gate.id), mergedInfo);
+      assert.equal(store.get(gate.id).status, "reconciled");
+      assert.equal(store.get(task.id).status, remaining ? "ready" : "completed");
+      engine.close(); engine = undefined; store.close();
+      store = new Store(db);
+      const turns: string[] = [];
+      const runtime = Object.assign(new EventEmitter(), { close() {}, async run(options: any) {
+        if (options.prompt.includes("Independently inspect")) {
+          turns.push("review");
+          return JSON.stringify({ verdict: "pass", summary: "Remaining work reviewed", sources: ["source:review"] });
+        }
+        turns.push("followup");
+        return JSON.stringify({ summary: "Remaining work", sources: ["source:remaining"], humanQuestion: "" });
+      } }) as unknown as Runtime;
+      engine = new Engine(store, runtime, dir);
+      engine.gitRunner = git;
+      engine.githubRunner = async args => { assert.equal(args[0], "auth"); return "fixture"; };
+      engine.createPrOrReuse = async () => "https://github.com/fixture/repo/pull/10";
+      engine.verificationRunner = async ({ commands }: any) => ({ id: randomUUID(),
+        sourceHash: await sourceFingerprint(tree.path), sourceUnchanged: true,
+        results: commands.map((command: string) => ({ command, code: 0 })) }) as any;
+      store.patch(project.id, { status: "running" });
+      const beforeRun = store.all("run", project.id).length;
+      await assert.rejects(engine.run(store.get(project.id), "implementation", "closed round",
+        z.object({}), store.get(task.id), true), /Experiment round is not active/);
+      assert.equal(store.all("run", project.id).length, beforeRun);
+      assert.deepEqual(turns, []);
+      if (remaining) {
+        await engine.implement(store.get(project.id), store.get(task.id));
+        assert.deepEqual(turns, ["followup", "review"]);
+        const followupRun = store.get(store.get(task.id).implementationRunId);
+        assert.equal(followupRun.experimentRoundId, round.id);
+        assert.equal(followupRun.experimentCandidateId, undefined);
+        assert.equal(store.get(task.id).checks[0].code, 0);
+        assert.equal(store.all("run", project.id).filter(run => run.taskId === task.id && run.role === "review").length, 1);
+        const newGate = store.all("gate", project.id).find(g => g.type === "pr" && g.status === "open");
+        assert.ok(newGate);
+        assert.notEqual(newGate.sha, gate.sha);
+        assert.equal(newGate.pr, "https://github.com/fixture/repo/pull/10");
+      } else {
+        assert.equal(store.get(task.id).status, "completed");
+        assert.deepEqual(turns, []);
+      }
+      const runCount = store.all("run", project.id).filter(run => run.taskId === task.id).length;
+      await engine.implement(store.get(project.id), store.get(task.id));
+      assert.equal(store.all("run", project.id).filter(run => run.taskId === task.id).length, runCount);
+      assert.equal(store.get(round.id).candidateIds.length, 1);
+      assert.equal(store.get(candidate.id).outcome, "keep");
+      assert.equal(store.get(candidate.id).measurement, "89 bytes");
+      assert.deepEqual(store.get(candidate.id).evidence, [evidence]);
+      assert.equal(store.get(independent.id).status, "ready");
+      assert.equal(store.all("approval", project.id).length, 0);
+    } finally { engine?.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
 test("discarded files are cleared before the next candidate without changing its round", async () => {
   const dir = await testFixture("looproom-experiment-discard-files-");
   const repo = await createRepo(join(dir, "repo"));
@@ -1058,7 +1266,7 @@ test("a fourth implementation run is refused before worker dispatch", async () =
     try {
       const before = store.all("run", project.id).length;
       await assert.rejects(engine.run(project, "implementation", "candidate", z.object({}), task, true),
-        /active experiment round/);
+        /Experiment round is not active/);
       assert.equal(dispatches, 0);
       assert.equal(store.all("run", project.id).length, before);
       assert.equal(store.get(round.id).candidateIds.length, 3);
