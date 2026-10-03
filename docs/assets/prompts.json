@@ -1,0 +1,15 @@
+{
+  "mode": "built-in image_gen",
+  "intent": "generate",
+  "referenceRole": "identity reference; not an edit target",
+  "assets": [
+    {
+      "file": "looproom-hero-v1.png",
+      "prompt": "Use case: ads-marketing\nAsset type: original open-source project README hero and social launch artwork, wide landscape 2:1 composition.\nPrimary request: Create extraordinary, restrained launch art for Looproom, a local workspace where multiple coding agents work together and a human approves PR merges. Use the supplied historical sculpture only as a reference for the linked-loop motif, not an edit target or screenshot.\nScene/backdrop: seamless deep plum #231E27 studio field with very fine printed grain, no panel frames.\nSubject: a beautifully crafted sculptural linked open loop, three interwoven continuous rounded ribbon paths in soft citron #C5D7A3, dusty lavender #C9B6D4, and pale blue #AFD0E8, one tiny warm peach gate tile #EDAB98 at a deliberate opening. Five small differently textured orbiting spheres suggest individual agents. The paths express collaboration and an open human-controlled gate, not an infinity guarantee.\nStyle/medium: high-end editorial 3D art with tactile satin surfaces, a precise graphic silhouette, understated ambient light; memorable, sophisticated independent software identity.\nComposition/framing: sculpture occupies right half; generous quiet left space with exact lowercase wordmark 'looproom' in large, impeccably legible IBM Plex Sans semibold-style lettering, warm chalk #EEE7EF. Balance all content within generous safe margins. Fine circular orbital guide arcs extremely subtle, no node labels.\nText (verbatim): \"looproom\"\nConstraints: original artwork. Preserve existing plum/citron brand feel. No app UI, fake screenshots, human figures, robots, neon glow, generic purple gradient, badges, extra slogans, watermark, uppercase labels or decorative card grid. One coherent artwork, not a collage."
+    },
+    {
+      "file": "looproom-social-v1.png",
+      "prompt": "Use case: ads-marketing\nAsset type: square community launch poster for X and Reddit, original Looproom artwork, not a UI mockup.\nInput images: Image 1 is the approved Looproom hero art, a visual identity reference only.\nPrimary request: Create a distinct companion poster using the same tactile linked-loop sculpture, five individually textured spheres and small peach human gate. Same deep plum, citron, lavender and pale-blue palette, warm chalk text, subtle grain.\nComposition/framing: square, generous margins, lowercase 'looproom' small at upper left; a large elegant three-line headline in IBM Plex Sans-style typography occupies top third; the sculpture occupies bottom two thirds, no duplicated wordmark. Contemporary editorial software campaign, sophisticated and spacious.\nText (verbatim): \"looproom\" and \"Agents work together.\" and \"You approve the merge.\"\nConstraints: preserve sculpture identity and restrained materials. Legible exact text, no app screenshots, dashboards, robots, badges, neon, invented adoption or performance claims, watermark. Original art, not a collage."
+    }
+  ]
+}

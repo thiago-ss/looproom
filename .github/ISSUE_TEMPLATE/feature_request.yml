@@ -1,0 +1,23 @@
+name: Feature proposal
+description: Propose a focused improvement
+title: "[Proposal] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the behavior and how we would know it works.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and boundaries
+      description: Existing features, smaller solutions, or authority/licensing considerations.

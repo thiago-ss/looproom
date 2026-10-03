@@ -17,7 +17,6 @@
     "hooks": "@/hooks"
   },
   "registries": {
-    "@dotmatrix": "https://dotmatrix.zzzzshawn.cloud/r/{name}.json",
     "@orbkit": "https://orbkit.zzzzshawn.cloud/r/{name}.json",
     "@uiarc": "https://uiarc.dev/r/{name}.json"
   }
