@@ -27,7 +27,8 @@ test("actual judge output schema has explicit frozen refresh thresholds and no u
     await engine.judge(store.get(project.id), gate);
     assert.ok(schema);
     assert.equal(JSON.stringify(schema).includes('"propertyNames"'), false);
-    const thresholds = schema.properties.nextRound.properties.contract.properties.thresholds;
+    const nextRound = schema.properties.nextRound.anyOf.find((part: any) => part.type === "object");
+    const thresholds = nextRound.properties.contract.properties.thresholds;
     assert.equal(thresholds.additionalProperties, false);
     assert.deepEqual(Object.keys(thresholds.properties).sort(),
       ["minMedianImprovementPercent", "maxOtherMedianRegressionPercent", "requiredChecks"].sort());

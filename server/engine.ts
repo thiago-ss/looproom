@@ -11,6 +11,7 @@ import { escalationMode } from "../src/lib/autonomy.ts";
 import { runVerification, sourceFingerprint } from "./verification.ts";
 import { runBrowserBaseline, validateBrowserReport, type BrowserAuditReport } from "./browser-audit.ts";
 import { loadBrowserSnapshot } from "./browser-snapshot.ts";
+import { strictModelOutputSchema, normalizeModelOutput } from "./model-output.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
 // Only the frozen refresh recipe is model-facing. Its explicit keys keep the
@@ -41,14 +42,14 @@ const Claims = z.array(z.object({
   sources: z.array(z.string()).min(1),
   relation: z.enum(["new", "supports", "contradicts", "supersedes"]).default("new"),
 })).default([]);
-const Plan = z.object({
+export const Plan = z.object({
   summary: z.string(),
   gate: z.string(),
   tasks: z.array(TaskPlan).max(6),
   sources: z.array(z.string()),
   claims: Claims,
 });
-const Result = z.object({
+export const Result = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   humanQuestion: z.string(),
@@ -74,7 +75,7 @@ const BaselineRevision = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
 });
-const Judgment = z.object({
+export const Judgment = z.object({
   action: z.enum(["retry", "skip", "wait"]),
   answer: z.string().trim().min(1).max(6000),
   summary: z.string(),
@@ -324,13 +325,14 @@ export class Engine extends EventEmitter {
     let lastSave = 0,
       stream = "";
     try {
+      const originalOutputSchema = z.toJSONSchema(schema);
       const output = await this.runtime.run({
         model: profile.model,
         effort: profile.effort,
         cwd: task?.worktree ?? project.path,
         write,
         prompt: WORKFLOW + "\n\n" + autonomyPolicy(project) + "\n\n" + prompt,
-        schema: z.toJSONSchema(schema),
+        schema: strictModelOutputSchema(originalOutputSchema),
         onThread: (threadId, metadata) =>
           this.store.patch(run.id, { threadId, runtime: metadata }),
         onEvent: (method, data) => {
@@ -373,7 +375,7 @@ export class Engine extends EventEmitter {
             );
         },
       });
-      const parsed = schema.parse(JSON.parse(output));
+      const parsed = schema.parse(normalizeModelOutput(JSON.parse(output), originalOutputSchema));
       if (purpose && parsed.experimentCandidate)
         throw new Error("PR follow-up run cannot report a new experiment candidate.");
       this.store.transaction(() => {
