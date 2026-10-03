@@ -10,7 +10,34 @@ import {
   readdir,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { runVerification, sourceFingerprint, cleanupTestFixtures, npmReadRoot } from "./verification.ts";
+
+test("browser build export retains only a stable successful fixed build and refuses generated links", {
+  skip: process.platform !== "darwin" || !!process.env.LOOPROOM_VERIFICATION_JOB,
+}, async () => {
+  const dir = await testFixture("looproom-browser-build-"), cwd = join(dir, "source");
+  await mkdir(cwd);
+  const artifact = () => join(dir, "browser-audit", randomUUID(), "dist");
+  try {
+    await writeFile(join(cwd, "package.json"), JSON.stringify({ scripts: { build: "node build.cjs" } }));
+    await writeFile(join(cwd, "build.cjs"), "const fs=require('node:fs'); fs.mkdirSync('dist');fs.writeFileSync('dist/index.html','actual-built-output');");
+    const before = await sourceFingerprint(cwd), destination = artifact();
+    const result = await runVerification({ cwd, dataDir: dir, commands: ["npm run build"], codexBinary: "codex", buildArtifactDir: destination });
+    assert.equal(result.results[0].code, 0, result.results[0].output);
+    assert.equal(result.sourceUnchanged, true);
+    assert.match(result.buildArtifact!.hash, /^[a-f0-9]{64}$/);
+    assert.equal(await readFile(join(destination, "index.html"), "utf8"), "actual-built-output");
+    assert.equal(await sourceFingerprint(cwd), before);
+    await assert.rejects(runVerification({ cwd, dataDir: dir, commands: ["npm run build"], codexBinary: "codex", buildArtifactDir: destination }), /already exists/);
+    assert.equal(await readFile(join(destination, "index.html"), "utf8"), "actual-built-output");
+    await assert.rejects(runVerification({ cwd, dataDir: dir, commands: ["node build.cjs"], codexBinary: "codex", buildArtifactDir: artifact() }), /fixed build recipe/);
+    await writeFile(join(cwd, "build.cjs"), "const fs=require('node:fs');fs.mkdirSync('dist');fs.symlinkSync('../package.json','dist/index.html');");
+    await assert.rejects(runVerification({ cwd, dataDir: dir, commands: ["npm run build"], codexBinary: "codex", buildArtifactDir: artifact() }), /links are refused/);
+    await writeFile(join(cwd, "build.cjs"), "const fs=require('node:fs');fs.mkdirSync('dist');fs.writeFileSync('dist/index.html','changed');fs.writeFileSync('build.cjs','tampered-source');");
+    await assert.rejects(runVerification({ cwd, dataDir: dir, commands: ["npm run build"], codexBinary: "codex", buildArtifactDir: artifact() }), /source changed inside/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 test("unrecognized npm layouts cannot grant read access to a broad parent", () => {
   assert.equal(npmReadRoot("/opt/homebrew/lib/node_modules/npm/bin/npm-cli.js"), "/opt/homebrew/lib/node_modules/npm");
   for (const path of ["/usr/local/bin/npm", "/custom/tool/bin/npm-cli.js", "/npm-cli.js"])

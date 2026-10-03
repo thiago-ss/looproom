@@ -26,3 +26,7 @@ ReactBits Shiny Text’s CSS gradient sweep (MIT + Commons Clause) is adapted in
 ## Work components (2026-09-30)
 
 Three additional free MIT Arc components—Progress, Timeline and SegmentedControl—are incorporated under `src/components/arc/`, bringing current Arc coverage to 25. Existing Arc notice and [source hashes](docs/arc-sources.json) apply. Upstream registry metadata required a documented installation-only normalization; source comparison passed. Bencho, devl, BoardUI, Refero, Jalco, Pixel Perfect and Efferd were design references only; their component code and paid assets are not incorporated.
+
+## Browser measurements (2026-10-03)
+
+[Playwright Core](https://github.com/microsoft/playwright), pinned npm version 1.63.0, supplies the coordinator's browser driver. Apache License 2.0; installed package license retained in `licenses/playwright.txt`. The recipe uses separately installed Google Chrome and does not redistribute or automatically download a browser. Private run artifacts contain project records and are excluded from publication.

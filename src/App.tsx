@@ -526,6 +526,7 @@ export default function App() {
                 ) : null}
                 {view === "review" ? (
                   <ReviewInbox
+                    projectId={project.id}
                     gates={gates}
                     tasks={tasks}
                     act={act}
@@ -862,7 +863,7 @@ function GoalContext({ project, tasks, gates, active, openTask }: any) {
   );
 }
 
-function ReviewInbox({ gates, tasks, act, busy }: any) {
+function ReviewInbox({ projectId, gates, tasks, act, busy }: any) {
   const [selected, setSelected] = useState<string>(""),
     [answer, setAnswer] = useState(""),
     [pr, setPr] = useState<any>(null),
@@ -871,7 +872,10 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
     [confirm, setConfirm] = useState<{ gateId: string; sha: string } | null>(
       null,
     ),
-    [loading, setLoading] = useState(false);
+    [loading, setLoading] = useState(false),
+    [importOpen, setImportOpen] = useState(false),
+    [importUrl, setImportUrl] = useState(""),
+    [importError, setImportError] = useState("");
   const gate = gates.find((gate: any) => gate.id === selected) ?? gates[0];
   const task = tasks.find((task: any) => task.id === gate?.taskId);
   const mergeOpener = useRef<HTMLElement | null>(null);
@@ -905,6 +909,57 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
       alive = false;
     };
   }, [gate?.id, gate?.sha, gate?.mergeAttempt?.requestedAt]);
+  async function importPullRequest(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy || !importUrl.trim()) return;
+    setImportError("");
+    try {
+      await act(async () => {
+        const imported = await api<{ gate: { id: string } }>(
+          "/projects/" + encodeURIComponent(projectId) + "/pull-requests/import",
+          { url: importUrl.trim() },
+        );
+        setSelected(imported.gate.id);
+      }, true);
+      setImportOpen(false);
+      setImportUrl("");
+    } catch (error) {
+      setImportError((error as Error).message);
+    }
+  }
+  const importDialog = (
+    <Dialog open={importOpen} onOpenChange={(open) => {
+      setImportOpen(open);
+      if (!open) setImportError("");
+    }}>
+      <DialogContent
+        title="Import a GitHub pull request"
+        description="Add an open PR from this project's GitHub repository to Review. Looproom will verify the repository and revision."
+      >
+        <form onSubmit={importPullRequest}>
+          <Input
+            label="Pull request URL"
+            type="url"
+            inputMode="url"
+            autoComplete="url"
+            placeholder="https://github.com/owner/repo/pull/123"
+            value={importUrl}
+            onChange={(event) => {
+              setImportUrl(event.target.value);
+              if (importError) setImportError("");
+            }}
+            error={importError}
+            required
+          />
+          <p className="muted">Import records the GitHub PR. It does not run Looproom checks or an independent review.</p>
+          <div className="dialog-actions">
+            <Button type="button" variant="outline" onClick={() => setImportOpen(false)}>Cancel</Button>
+            <Button type="submit" disabled={busy || !importUrl.trim()}>Import PR</Button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
   if (!gates.length)
     return (
       <section className="page">
@@ -914,7 +969,9 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
           title="No decisions waiting"
           description="Approval before every merge"
           icon={<ShieldCheck size={40} />}
+          action={<Button variant="secondary" onClick={() => setImportOpen(true)}><GitPullRequest size={15} />Import GitHub PR</Button>}
         />
+        {importDialog}
       </section>
     );
   const response = (
@@ -978,10 +1035,10 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
         <span className="mono">
           {gates.length} {gates.length === 1 ? "decision" : "decisions"} waiting
         </span>
-        <span className="approval-note">
-          <Square size={12} />
-          Human approval required
-        </span>
+        <div className="review-caption-actions">
+          <span className="approval-note"><Square size={12} />Human approval required</span>
+          <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}><GitPullRequest size={14} />Import GitHub PR</Button>
+        </div>
       </div>
       <div className="review-layout">
         <div className="review-queue">
@@ -1000,7 +1057,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
               <div>
                 <small className="gate-kind">
                   {item.type === "pr"
-                    ? "Pull request"
+                    ? item.importedFromGitHub ? "Imported GitHub PR" : "Pull request"
                     : item.type.replaceAll("_", " ")}
                 </small>
                 <strong>{item.title}</strong>
@@ -1014,7 +1071,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
         </div>
         <article className="review-document">
           <div className="repo-line">
-            {gate.type === "pr" ? "Pull request" : "Decision"}
+            {gate.type === "pr" ? gate.importedFromGitHub ? "Imported GitHub PR" : "Pull request" : "Decision"}
             <span>·</span>
             <DateLabel date={gate.createdAt} />
           </div>
@@ -1125,6 +1182,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
           ) : null}
           {gate.type === "pr" ? (
             <>
+              {gate.importedFromGitHub ? <p className="muted">Imported from GitHub. Looproom has not run local checks or independent review for this PR.</p> : null}
               <a
                 className="source-link"
                 href={gate.pr}
@@ -1177,12 +1235,16 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                   </dl>
                   {pr.headRefOid !== gate.sha ? (
                     <Alert tone="warning" title="Revision changed">
-                      {gate.mergeAttempt ? "Reconcile the interrupted merge attempt, then Request changes so agents can verify and publish the new commit." : "Request changes so agents can verify and publish the new commit."}
+                      {gate.importedFromGitHub
+                        ? "This GitHub PR now points to a different commit. Review the new revision and import it again before approving a merge."
+                        : gate.mergeAttempt
+                          ? "Reconcile the interrupted merge attempt, then Request changes so agents can verify and publish the new commit."
+                          : "Request changes so agents can verify and publish the new commit."}
                     </Alert>
                   ) : null}
                   <h3>Verification</h3>
-                  <ul className="check-list">
-                    {task?.checks?.map((check: any, i: number) => (
+                  {task?.checks?.length ? <ul className="check-list">
+                    {task.checks.map((check: any, i: number) => (
                       <li key={i}>
                         <StatusMark
                           status={check.code === 0 ? "done" : "failed"}
@@ -1193,13 +1255,13 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                         <span>Exit {check.code}</span>
                       </li>
                     ))}
-                  </ul>
+                  </ul> : <p className="muted">Looproom checks: unknown; no local check results recorded.</p>}
                   <p className="muted">
-                    {pr.statusCheckRollup?.length ?? 0} GitHub checks reported.
-                    GitHub branch rules also apply at merge.
+                    {pr.statusCheckRollup?.length ? `${pr.statusCheckRollup.length} GitHub checks reported.` : "GitHub checks: none reported."}
+                    {" "}GitHub branch rules also apply at merge.
                   </p>
                   <h3>Independent review</h3>
-                  <p>{task?.review?.summary}</p>
+                  <p>{task?.review?.summary || "Unknown; no Looproom independent review recorded."}</p>
                   <h3>Changed files</h3>
                   <ul className="file-list">
                     {pr.files?.map((file: any) => (
@@ -1259,6 +1321,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
           {gate.type === "pr" ? response : null}
         </article>
       </div>
+      {importDialog}
       <Dialog
         open={!!confirm}
         onOpenChange={(open) => {

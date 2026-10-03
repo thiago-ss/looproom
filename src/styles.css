@@ -3228,6 +3228,13 @@ pre {
   grid-template-columns: 250px minmax(0, 1fr);
   gap: 30px;
 }
+.review-caption-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
 .review-queue-label {
   display: flex;
   justify-content: space-between;
@@ -3420,6 +3427,10 @@ pre {
   }
 }
 @media (max-width: 850px) {
+  .review-page .workspace-caption {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
   .review-page .review-layout {
     display: block;
   }

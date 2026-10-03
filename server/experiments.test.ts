@@ -498,6 +498,7 @@ test("a prior-round implementation run cannot be attached to its successor after
 });
 
 test("experiment retry requires atomic judge authorization across restart", async () => {
+  const roundContract = refreshContract;
   const dir = await testFixture("looproom-experiment-atomic-");
   const path = join(dir, "db");
   let store = new Store(path);
@@ -507,8 +508,8 @@ test("experiment retry requires atomic judge authorization across restart", asyn
     async run() { return JSON.stringify({ action: "retry", answer: "Try a source cache",
       summary: "One new bounded round", sources: ["docs/workflows/looproom-v1.md"],
       nextRound: { hypothesis: "Cache unchanged source revisions",
-        retryInstruction: "Implement source revision caching and measure with fixture-v1",
-        contract }, verificationRequests: [] }); },
+        retryInstruction: "Implement source revision caching and measure 4 paused projects, 48 completed tasks, 80 events, 5 message updates",
+        contract: roundContract }, verificationRequests: [] }); },
   }) as unknown as Runtime;
   try {
     store.put("settings", { orchestrator: { model: "fixture", effort: "high" },
@@ -520,12 +521,12 @@ test("experiment retry requires atomic judge authorization across restart", asyn
       dependencies: [], acceptance: [] });
     const independent = store.put("task", { projectId: project.id, status: "ready",
       title: "Independent work", dependencies: [] });
-    const round = startExperiment(store, project.id, task.id, "Reduce refresh time", contract);
+    const round = startExperiment(store, project.id, task.id, "Reduce refresh time", roundContract);
     for (let i = 0; i < 3; i++) {
       const run = store.put("run", { projectId: project.id, taskId: task.id, role: "implementation", experimentRoundId: round.id });
       recordCandidate(store, round.id, { runId: run.id, outcome: "discard", measurement: `${120 - i} ms`,
-        evidence: [`report:${i}`], evaluator: contract.evaluator, workload: contract.workload,
-        runtimeBudget: contract.runtimeBudget, thresholds: contract.thresholds });
+        evidence: [`report:${i}`], evaluator: roundContract.evaluator, workload: roundContract.workload,
+        runtimeBudget: roundContract.runtimeBudget, thresholds: roundContract.thresholds });
     }
     engine = new Engine(store, runtime, dir);
     const gate = engine.gate(project.id, "Experiment round exhausted", "Three candidates discarded",
@@ -975,12 +976,12 @@ for (const failureStage of ["staging", "review"] as const) {
           status: "ready", dependencies: [] });
         const tree = await createWorktree(repo.path, dir, task.id);
         store.patch(task.id, { worktree: tree.path });
-        const round = startExperiment(store, project.id, task.id, "Reduce latency", contract);
+        const round = startExperiment(store, project.id, task.id, "Reduce latency", refreshContract);
         if (finalSlot) for (let i = 0; i < 2; i++) {
           const prior = store.put("run", { projectId: project.id, taskId: task.id,
             role: "implementation", experimentRoundId: round.id, status: "completed" });
           recordCandidate(store, round.id, { runId: prior.id, outcome: "discard",
-            measurement: `${120 - i} ms`, evidence: [`report:${i}`], ...contract });
+            measurement: `${120 - i} ms`, evidence: [`report:${i}`], ...refreshContract });
         }
         const separate = finalSlot ? store.put("gate", { projectId: project.id,
           taskId: task.id, type: "decision", status: "open",
@@ -992,7 +993,7 @@ for (const failureStage of ["staging", "review"] as const) {
           await writeFile(join(options.cwd, "candidate.txt"), "measured source");
           return JSON.stringify({ summary: "Measured candidate", sources: ["report:measured"],
             humanQuestion: "", experimentCandidate: { outcome: "keep", measurement: "90 ms",
-              evidence: ["report:measured"], ...contract } });
+              evidence: ["report:measured"], ...refreshContract } });
         } }) as unknown as Runtime;
         engine = new Engine(store, runtime, dir);
         if (failureStage === "staging")

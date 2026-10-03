@@ -9,12 +9,23 @@ import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
 import { runVerification, sourceFingerprint } from "./verification.ts";
+import { runBrowserBaseline, validateBrowserReport, type BrowserAuditReport } from "./browser-audit.ts";
+import { loadBrowserSnapshot } from "./browser-snapshot.ts";
+import { strictModelOutputSchema, normalizeModelOutput } from "./model-output.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
+// Only the frozen refresh recipe is model-facing. Its explicit keys keep the
+// structured output schema compatible; experiments.ts checks the exact
+// contract again before any candidate or successor is accepted.
+const RefreshThresholds = z.object({
+  minMedianImprovementPercent: z.number(),
+  maxOtherMedianRegressionPercent: z.number(),
+  requiredChecks: z.string(),
+});
 const ExperimentContract = z.object({
   evaluator: z.string().trim().min(1), workload: z.string().trim().min(1),
   runtimeBudget: z.string().trim().min(1),
-  thresholds: z.record(z.string(), z.union([z.string(), z.number()])),
+  thresholds: RefreshThresholds,
   candidateLimit: z.number().int().min(1).max(3),
 });
 const TaskPlan = z.object({
@@ -31,14 +42,14 @@ const Claims = z.array(z.object({
   sources: z.array(z.string()).min(1),
   relation: z.enum(["new", "supports", "contradicts", "supersedes"]).default("new"),
 })).default([]);
-const Plan = z.object({
+export const Plan = z.object({
   summary: z.string(),
   gate: z.string(),
   tasks: z.array(TaskPlan).max(6),
   sources: z.array(z.string()),
   claims: Claims,
 });
-const Result = z.object({
+export const Result = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   humanQuestion: z.string(),
@@ -48,7 +59,7 @@ const Result = z.object({
     outcome: z.enum(["keep", "discard"]), measurement: z.string().trim().min(1),
     evidence: z.array(z.string().trim().min(1)).min(1),
     evaluator: z.string(), workload: z.string(), runtimeBudget: z.string(),
-    thresholds: z.record(z.string(), z.union([z.string(), z.number()])),
+    thresholds: RefreshThresholds,
   }).optional(),
 });
 const Review = z.object({
@@ -64,7 +75,7 @@ const BaselineRevision = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
 });
-const Judgment = z.object({
+export const Judgment = z.object({
   action: z.enum(["retry", "skip", "wait"]),
   answer: z.string().trim().min(1).max(6000),
   summary: z.string(),
@@ -75,8 +86,8 @@ const Judgment = z.object({
     contract: ExperimentContract,
   }).optional(),
   verificationRequests: z
-    .array(z.enum(["configured-checks", "refresh-baseline", "cleanup-test-fixtures"]))
-    .max(3)
+    .array(z.enum(["configured-checks", "refresh-baseline", "cleanup-test-fixtures", "browser-baseline"]))
+    .max(4)
     .default([]),
 });
 type WikiLogEntry = { runId: string; pageId: string; capturedAt: string; text: string };
@@ -122,6 +133,8 @@ export function validateDependencies(tasks: { dependencies: number[] }[]) {
 }
 const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Where the output schema offers claims, use a stable subject key, precise statement, and source references; explicitly mark contradictions or supersession. An earlier agent report is never independent support. Omit claims if no specific sourced claim can be extracted. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
 
+const PUBLICATION_WAIT = "GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.";
+
 function autonomyPolicy(project: RecordData) {
   if (escalationMode(project) !== "yolo")
     return `Autonomy mode: ${escalationMode(project)}. Preserve the configured human/draft submission rules.`;
@@ -139,6 +152,7 @@ export class Engine extends EventEmitter {
   nextRemoteSync = new Map<string, number>();
   gitRunner = git;
   verificationRunner = runVerification;
+  browserAuditRunner = runBrowserBaseline;
   mergeBroker = gh;
   get github() { return this.mergeBroker; }
   set github(broker: typeof gh) { this.mergeBroker = broker; }
@@ -215,9 +229,20 @@ export class Engine extends EventEmitter {
     task?: RecordData,
     write = false,
     purpose?: "pr-repair" | "merged-pr-followup",
+    cwdOverride?: string,
   ) {
     if (task) task = this.store.get(task.id, "task");
-    if (task?.worktree) await this.handoffBaselineEvidence(project, task);
+    let browserBaselineIntegrityError: string | undefined;
+    if (task?.worktree) {
+      await this.handoffBaselineEvidence(project, task);
+      try {
+        await this.handoffBrowserBaselineEvidence(project, task);
+      } catch (error) {
+        if (role !== "judge") throw error;
+        browserBaselineIntegrityError = error instanceof Error ? error.message : String(error);
+        prompt += `\nCoordinator browser baseline integrity check failed: ${browserBaselineIntegrityError}. The pinned report, snapshot or artifacts cannot establish a measurement. Treat any existing browser baseline file in this worktree as untrusted; report the exact repair needed without claiming capability success.`;
+      }
+    }
     const settings = this.settings(),
       profile =
         role === "orchestrator"
@@ -280,6 +305,7 @@ export class Engine extends EventEmitter {
         status: "running",
         workflowVersion: "looproom-v1",
         requestedProfile: profile,
+        ...(browserBaselineIntegrityError ? { browserBaselineIntegrityError } : {}),
         output: "",
         createdAt: new Date().toISOString(),
       });
@@ -300,13 +326,14 @@ export class Engine extends EventEmitter {
     let lastSave = 0,
       stream = "";
     try {
+      const originalOutputSchema = z.toJSONSchema(schema);
       const output = await this.runtime.run({
         model: profile.model,
         effort: profile.effort,
-        cwd: task?.worktree ?? project.path,
+        cwd: cwdOverride ?? task?.worktree ?? project.path,
         write,
         prompt: WORKFLOW + "\n\n" + autonomyPolicy(project) + "\n\n" + prompt,
-        schema: z.toJSONSchema(schema),
+        schema: strictModelOutputSchema(originalOutputSchema),
         onThread: (threadId, metadata) =>
           this.store.patch(run.id, { threadId, runtime: metadata }),
         onEvent: (method, data) => {
@@ -349,7 +376,7 @@ export class Engine extends EventEmitter {
             );
         },
       });
-      const parsed = schema.parse(JSON.parse(output));
+      const parsed = schema.parse(normalizeModelOutput(JSON.parse(output), originalOutputSchema));
       if (purpose && parsed.experimentCandidate)
         throw new Error("PR follow-up run cannot report a new experiment candidate.");
       this.store.transaction(() => {
@@ -479,6 +506,62 @@ export class Engine extends EventEmitter {
           await readFile(target, "utf8") !== bytes)
         throw new Error("Existing baseline report differs from the coordinator evidence.");
     });
+  }
+  async handoffBrowserBaselineEvidence(project: RecordData, task: RecordData) {
+    const baseline = this.store.get(project.id, "project").browserBaseline;
+    if (!task.worktree || !baseline?.reportId || baseline.ownerTaskId === task.id) return;
+    if (task.projectId !== project.id ||
+        this.store.get(baseline.ownerTaskId, "task").projectId !== project.id ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(baseline.reportId))
+      throw new Error("Frozen browser baseline belongs to another project or has an invalid identity.");
+    const expected = join(await realpath(this.dataDir), "browser-audit", baseline.reportId + ".json");
+    if (await realpath(expected).catch(() => null) !== expected ||
+        !(await lstat(expected).catch(() => ({ isFile: () => false }))).isFile())
+      throw new Error("Frozen browser baseline report is missing or not a regular coordinator file.");
+    const bytes = await readFile(expected);
+    if (createHash("sha256").update(bytes).digest("hex") !== baseline.reportHash)
+      throw new Error("Frozen browser baseline report differs from its pinned hash.");
+    const report = JSON.parse(bytes.toString("utf8"));
+    if (report.id !== baseline.reportId || report.kind !== "browser-baseline" ||
+        report.projectId !== project.id || report.status !== "complete" ||
+        report.sourceUnchanged !== true || !report.sourceSha ||
+        report.snapshotId !== baseline.snapshotId || report.snapshotHash !== baseline.snapshotHash ||
+        report.protocolHash !== baseline.protocolHash || report.evaluatorHash !== baseline.evaluatorHash ||
+        validateBrowserReport(report).length)
+      throw new Error("Frozen browser baseline report does not match accepted measurement evidence.");
+    await this.verifyBrowserArtifacts(report);
+    const snapshot = await loadBrowserSnapshot(
+      join(this.dataDir, "browser-snapshots"), baseline.snapshotId, project.id);
+    if (snapshot.hash !== baseline.snapshotHash)
+      throw new Error("Frozen browser baseline snapshot differs from the pinned evidence.");
+    const directory = join(task.worktree, ".looproom-verification");
+    await mkdir(directory, { recursive: true });
+    if (await realpath(directory) !== join(await realpath(task.worktree), ".looproom-verification"))
+      throw new Error("Verification evidence directory must not be a symlink.");
+    for (const name of [report.id + ".json", "baseline-browser.json"]) {
+      const target = join(directory, name);
+      await writeFile(target, bytes, { flag: "wx" }).catch(async (error) => {
+        if (error.code !== "EEXIST") throw error;
+        if (await realpath(target) !== join(await realpath(directory), name) ||
+            createHash("sha256").update(await readFile(target)).digest("hex") !== baseline.reportHash)
+          throw new Error("Existing browser baseline handoff differs from the coordinator evidence.");
+      });
+    }
+  }
+  async verifyBrowserArtifacts(report: BrowserAuditReport) {
+    const directory = join(await realpath(this.dataDir), "browser-audit", report.id);
+    if (await realpath(directory).catch(() => null) !== directory ||
+        !(await lstat(directory).catch(() => ({ isDirectory: () => false }))).isDirectory())
+      throw new Error("Browser artifacts must remain in their real coordinator audit directory.");
+    for (const artifact of report.artifacts) {
+      if (typeof artifact !== "string" || !artifact.startsWith(directory + "/") ||
+          await realpath(artifact).catch(() => null) !== artifact ||
+          !(await lstat(artifact).catch(() => ({ isFile: () => false }))).isFile())
+        throw new Error("Browser artifact is missing, linked, or outside its audit directory.");
+      const actualHash = createHash("sha256").update(await readFile(artifact)).digest("hex");
+      if (actualHash !== report.artifactHashes[artifact])
+        throw new Error("Browser artifact differs from the recorded SHA-256 evidence.");
+    }
   }
   async document(
     projectId: string,
@@ -873,6 +956,8 @@ export class Engine extends EventEmitter {
   }
   async implement(project: RecordData, task: RecordData) {
     task = this.store.get(task.id, "task");
+    if (task.kind === "external-pr")
+      throw new Error("Imported GitHub PRs are human Review records, not implementation work.");
     if (["completed", "awaiting_human"].includes(task.status)) return;
     const recordedRound = task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
     if (recordedRound && (recordedRound.taskId !== task.id || recordedRound.projectId !== project.id))
@@ -964,7 +1049,7 @@ export class Engine extends EventEmitter {
     const round = repairPurpose ? undefined :
       task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
     if (round && round.status !== "active") throw new Error("Experiment round is not active.");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${repairPurpose === "merged-pr-followup" ? "The prior PR merged during repair. Integrate the latest base with preserved unpublished work; report no experimentCandidate. The earlier merge does not approve remaining work.\n" : ""}${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. If humanQuestion specifically waits for the current PR repair to merge, include its exact PR URL in humanQuestion and return repairWait with the supplied repair gateId and pr; omit repairWait for any other blocker. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${repairPurpose === "merged-pr-followup" ? "The prior PR merged during repair. Integrate the latest base with preserved unpublished work; report no experimentCandidate. The earlier merge does not approve remaining work.\n" : ""}${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nFrozen browser baseline: ${JSON.stringify(this.store.get(project.id).browserBaseline ?? null)}. If present for a candidate task, read .looproom-verification/baseline-browser.json and its matching by-ID report before comparing results.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. Browser baseline reports, when requested by the judge, are separate: read .looproom-verification/browser-latest.json and its matching <report-id>.json. An unavailable browser report is diagnostic evidence, never a measured baseline or passing result. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. If humanQuestion specifically waits for the current PR repair to merge, include its exact PR URL in humanQuestion and return repairWait with the supplied repair gateId and pr; omit repairWait for any other blocker. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     let result: z.infer<typeof Result>;
     try { result = await this.run(
       project,
@@ -1116,7 +1201,9 @@ export class Engine extends EventEmitter {
       Review,
       task,
     );
-    this.store.patch(task.id, { review });
+    const reviewRun = this.store.all("run", project.id).findLast(run =>
+      run.taskId === task.id && run.role === "review" && run.status === "completed");
+    this.store.patch(task.id, { review, reviewRunId: reviewRun?.id ?? null });
     if (review.verdict === "changes") {
       const reviewRun = this.store.all("run", project.id).findLast((run) =>
         run.taskId === task.id && run.role === "review");
@@ -1352,13 +1439,28 @@ export class Engine extends EventEmitter {
         "A commit hook or concurrent edit changed checked source. Repeat verification and full task review before pushing.", "check");
       return;
     }
-    await git(task.worktree, ["push", "origin", task.branch]);
     const sha = await git(task.worktree, ["rev-parse", "HEAD"]);
+    const publicationIntent = {
+      sha, pr: task.pr ?? null, gateId: task.prRepair?.gateId ?? null,
+      branch: task.branch, base: project.branch, tree: task.reviewedSource.tree,
+      sourceHash: task.reviewedSource.sourceHash, reviewedHead: task.reviewedSource.head,
+      parents: await git(task.worktree, ["show", "-s", "--format=%P", "HEAD"]),
+      verificationReportId: task.verification?.id ?? null,
+      reviewRunId: task.reviewRunId ?? null, implementationRunId: task.implementationRunId ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.store.patch(task.id, { publicationIntent });
+    await git(task.worktree, ["push", "origin", task.branch]);
     if (task.pr) {
       const { gate, info } = await this.publicationPrInfo(project, task);
       if (this.closed) return;
       if (info.state !== "OPEN") { this.retireRepairPr(project, task, gate, info); return; }
-      if (info.headRefOid !== sha) throw new Error("GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.");
+      if (info.headRefOid !== sha) {
+        const wait = this.gate(project.id, "Work needs attention", PUBLICATION_WAIT, "runtime", task.id,
+          { awaitingCapability: true, publicationIntentSha: sha });
+        this.store.patch(task.id, { publicationIntent: { ...publicationIntent, waitGateId: wait.id } });
+        return;
+      }
     }
     let url = task.pr;
     if (!url) {
@@ -1369,7 +1471,7 @@ export class Engine extends EventEmitter {
       );
       url = await this.createPrOrReuse(project, task, sha, bodyPath);
     }
-    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha, prRepair: null });
+    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha, prRepair: null, publicationIntent: null });
     const prRunId = await this.recordRunEvidence(task.id, { prEvidence: { url, headSha: sha, status: "awaiting_human" } });
     this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
       pr: url,
@@ -1459,6 +1561,169 @@ export class Engine extends EventEmitter {
     this.tick();
     await this.repairReconciledEvidence(this.store.get(gate.id));
   }
+  async confirmPublishedRepair(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    const active = () => this.busy.has("task:" + task.id) || this.busy.has("judge:" + project.id) ||
+      this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" &&
+        (g.judgeStatus === "running" || ["running", "verifying"].includes(g.judgeRecoveryStatus))) ||
+      this.store.all("run", project.id).some(run => run.taskId === task.id && run.status === "running");
+    if (this.closed || this.store.get(project.id).status !== "running" ||
+        this.store.hasOpenInterruption(project.id) || info.state !== "OPEN" ||
+        info.mergeable !== "MERGEABLE" || gate.status !== "superseded" ||
+        !["blocked", "verifying"].includes(task.status) || !task.worktree || !task.branch ||
+        active()) return;
+    const repair = task.prRepair;
+    if (repair?.gateId !== gate.id || repair.pr !== gate.pr || repair.base !== project.branch ||
+        repair.stage !== "prepared" || task.pr !== gate.pr || task.projectId !== project.id) return;
+    const waits = this.store.all("gate", project.id).filter(wait =>
+      wait.taskId === task.id && wait.status === "open" && wait.type === "runtime" &&
+      wait.detail === PUBLICATION_WAIT && wait.awaitingCapability === true);
+    const recorded = task.publicationIntent;
+    if (waits.length > 1 || (!recorded && waits.length !== 1) ||
+        (recorded && !waits.length && this.store.all("gate", project.id).some(g =>
+          g.taskId === task.id && g.status === "open"))) return;
+    const wait = waits[0];
+    if (this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" && g.id !== wait?.id)) return;
+    if (recorded && (recorded.gateId !== gate.id || recorded.pr !== gate.pr ||
+        (wait && (recorded.waitGateId && recorded.waitGateId !== wait.id ||
+          wait.publicationIntentSha !== recorded.sha)))) return;
+    if (!recorded && wait.publicationIntentSha) return; // Legacy recovery requires its exact machine wait.
+    const reviewed = task.reviewedSource;
+    if (!reviewed?.sourceHash || !reviewed.tree || !reviewed.head ||
+        task.review?.verdict !== "pass" || !task.verification?.id ||
+        !task.verification.sourceUnchanged || task.verification.sourceHash !== reviewed.sourceHash ||
+        !task.checks?.length || task.checks.some((check: any) => check.code !== 0 || check.timedOut))
+      throw new Error("Publication confirmation lacks matching checks and independent review.");
+    const reportId = task.verification.id;
+    if (!/^[a-f0-9-]{36}$/.test(reportId)) throw new Error("Invalid publication check report identity.");
+    const reportPath = join(await realpath(this.dataDir), "verification", reportId + ".json");
+    if (await realpath(reportPath).catch(() => null) !== reportPath)
+      throw new Error("Publication check report is missing or linked.");
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    if (report.id !== reportId || report.sourceHash !== reviewed.sourceHash ||
+        report.sourceUnchanged !== true || report.results?.length !== task.checks.length ||
+        report.createdAt !== task.verification.createdAt ||
+        (report.runId && report.runId !== task.implementationRunId) ||
+        report.results.some((result: any, index: number) => result.code !== 0 || result.timedOut ||
+          result.command !== task.checks[index].command || result.code !== task.checks[index].code))
+      throw new Error("Publication check report does not match the reviewed source and task checks.");
+    const implementationRun = this.store.get(task.implementationRunId, "run");
+    if (implementationRun.projectId !== project.id || implementationRun.taskId !== task.id ||
+        implementationRun.role !== "implementation" || implementationRun.status !== "completed")
+      throw new Error("Publication implementation run identity changed.");
+    const reviewRuns = this.store.all("run", project.id).filter(run => {
+      if (run.taskId !== task.id || run.role !== "review" || run.status !== "completed") return false;
+      try { const output = JSON.parse(run.output); return output.verdict === "pass" && output.summary === task.review.summary; }
+      catch { return false; }
+    });
+    const reviewRun = task.reviewRunId
+      ? reviewRuns.find(run => run.id === task.reviewRunId)
+      : reviewRuns.at(-1);
+    if (!reviewRun || (task.reviewRunId && reviewRun.id !== task.reviewRunId) ||
+        !Number.isFinite(Date.parse(report.createdAt)) ||
+        !Number.isFinite(Date.parse(reviewRun.finishedAt)) ||
+        Date.parse(reviewRun.finishedAt) < Date.parse(report.createdAt) ||
+        (implementationRun.finishedAt && reviewRun.finishedAt &&
+        Date.parse(reviewRun.finishedAt) < Date.parse(implementationRun.finishedAt)))
+      throw new Error("Publication independent review run does not match this task revision.");
+    const common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    const owned = await realpath(await this.gitRunner(task.worktree, common)) ===
+      await realpath(await this.gitRunner(project.path, common));
+    if (!owned) throw new Error("Publication worktree belongs to another repository.");
+    const local = async () => ({
+      head: await this.gitRunner(task.worktree, ["rev-parse", "HEAD"]),
+      tree: await this.gitRunner(task.worktree, ["rev-parse", "HEAD^{tree}"]),
+      parents: await this.gitRunner(task.worktree, ["show", "-s", "--format=%P", "HEAD"]),
+      branch: await this.gitRunner(task.worktree, ["branch", "--show-current"]),
+      mergeHead: await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => ""),
+      dirty: await this.gitRunner(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]),
+      sourceHash: await sourceFingerprint(task.worktree),
+    });
+    const first = await local();
+    const expectedHead = recorded?.sha ?? first.head;
+    const validLocal = (item: Awaited<ReturnType<typeof local>>) => item.head === expectedHead &&
+      item.head === info.headRefOid && item.tree === reviewed.tree &&
+      item.sourceHash === reviewed.sourceHash && item.branch === task.branch &&
+      !item.mergeHead && !item.dirty &&
+      (recorded
+        ? recorded.tree === reviewed.tree && recorded.sourceHash === reviewed.sourceHash &&
+          recorded.reviewedHead === reviewed.head && recorded.parents === item.parents &&
+          recorded.branch === task.branch && recorded.base === project.branch &&
+          recorded.verificationReportId === reportId && recorded.reviewRunId === reviewRun.id &&
+          recorded.implementationRunId === implementationRun.id
+        : item.head === reviewed.head || item.parents === reviewed.head);
+    if (!validLocal(first)) throw new Error("Publication commit, lineage or reviewed source changed.");
+    const confirmed = await this.prInfo(gate.id);
+    this.validateRemotePr(gate, project, confirmed);
+    if (confirmed.state !== "OPEN" || confirmed.mergeable !== "MERGEABLE" ||
+        confirmed.url !== gate.pr || confirmed.baseRefName !== project.branch ||
+        confirmed.headRefOid !== expectedHead)
+      throw new Error("GitHub publication confirmation changed before registration.");
+    const second = await local();
+    if (!validLocal(second) || JSON.stringify(second) !== JSON.stringify(first))
+      throw new Error("Publication source changed during confirmation.");
+    if (this.closed || this.store.get(project.id).status !== "running" ||
+        this.store.hasOpenInterruption(project.id) || active()) return;
+    const answer = `GitHub confirmed the reviewed PR revision ${expectedHead}. It is ready for human review; no merge was approved.`;
+    let newGate: RecordData | undefined;
+    let evidencePage: RecordData | undefined;
+    const resolvedAt = new Date().toISOString();
+    this.store.transaction(() => {
+      const currentProject = this.store.get(project.id), current = this.store.get(task.id),
+        currentGate = this.store.get(gate.id), currentWait = wait && this.store.get(wait.id),
+        currentRun = this.store.get(implementationRun.id), currentReviewRun = this.store.get(reviewRun.id);
+      if (this.closed || currentProject.status !== "running" ||
+          currentProject.branch !== project.branch || currentProject.path !== project.path ||
+          currentProject.github !== project.github || this.store.hasOpenInterruption(project.id) || active() ||
+          current.status !== task.status || current.projectId !== project.id ||
+          current.pr !== gate.pr || current.branch !== task.branch ||
+          current.worktree !== task.worktree || current.implementationRunId !== implementationRun.id ||
+          JSON.stringify(current.reviewedSource) !== JSON.stringify(reviewed) ||
+          JSON.stringify(current.review) !== JSON.stringify(task.review) ||
+          JSON.stringify(current.checks) !== JSON.stringify(task.checks) ||
+          JSON.stringify(current.verification) !== JSON.stringify(task.verification) ||
+          current.reviewRunId !== task.reviewRunId || current.verification?.id !== reportId ||
+          currentRun.status !== "completed" || currentRun.taskId !== task.id ||
+          currentRun.projectId !== project.id || currentRun.role !== "implementation" ||
+          currentReviewRun.status !== "completed" || currentReviewRun.taskId !== task.id ||
+          currentReviewRun.projectId !== project.id || currentReviewRun.role !== "review" ||
+          currentReviewRun.output !== reviewRun.output ||
+          JSON.stringify(current.prRepair) !== JSON.stringify(repair) ||
+          JSON.stringify(current.publicationIntent ?? null) !== JSON.stringify(recorded ?? null) ||
+          currentGate.status !== "superseded" || currentGate.projectId !== project.id ||
+          currentGate.taskId !== task.id || currentGate.pr !== gate.pr ||
+          currentGate.sha !== gate.sha || currentGate.base !== gate.base ||
+          (wait && (currentWait?.status !== "open" || currentWait.projectId !== project.id ||
+            currentWait.taskId !== task.id || currentWait.type !== "runtime" ||
+            currentWait.detail !== PUBLICATION_WAIT || currentWait.awaitingCapability !== true ||
+            currentWait.publicationIntentSha !== wait.publicationIntentSha)) ||
+          this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" && g.id !== wait?.id))
+        throw new Error("Publication gate or task changed during confirmation.");
+      const prEvidence = { url: gate.pr, headSha: expectedHead, status: "awaiting_human" };
+      this.store.patch(implementationRun.id, { prEvidence });
+      const intent = this.store.all("wiki-ingest", project.id).find(item => item.runId === implementationRun.id);
+      if (intent) this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence } });
+      const page = this.store.all("memory", project.id).find(item => item.runId === implementationRun.id);
+      if (page) evidencePage = this.store.patch(page.id, { prEvidence });
+      newGate = this.store.put("gate", { projectId: project.id, taskId: task.id,
+        title: "Review pull request", detail: task.summary, type: "pr", status: "open",
+        createdAt: resolvedAt, scope: "task", authorRole: "coordinator",
+        pr: gate.pr, sha: expectedHead, prRunId: implementationRun.id, base: project.branch });
+      this.store.recordEscalation(newGate);
+      if (wait) {
+        this.store.patch(wait.id, { status: "resolved", answer, resolvedBy: "coordinator", resolvedAt,
+          awaitingCapability: false, judgeNextAttemptAt: null,
+          brokerEvidence: { url: confirmed.url, number: confirmed.number, state: confirmed.state,
+            headSha: confirmed.headRefOid, base: confirmed.baseRefName, mergeable: confirmed.mergeable, observedAt: resolvedAt } });
+        this.store.recordGateResponse(wait, answer, "coordinator", resolvedAt);
+      }
+      this.store.patch(task.id, { status: "awaiting_human", sha: expectedHead, prRepair: null,
+        publicationIntent: null, publicationConfirmation: { pr: gate.pr, headSha: expectedHead,
+          waitGateId: wait?.id ?? null, reviewGateId: newGate.id, legacy: !recorded, observedAt: resolvedAt } });
+    });
+    if (evidencePage) await this.writeIfChanged(join(this.dataDir, "wiki", project.id, evidencePage.id + ".md"), this.pageMarkdown(evidencePage));
+    this.changed("publication-confirmed", { taskId: task.id, waitGateId: wait?.id ?? null,
+      reviewGateId: newGate!.id, headSha: expectedHead }, project.id);
+  }
   async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
     try {
       return await this.githubRunner([
@@ -1499,6 +1764,7 @@ export class Engine extends EventEmitter {
     try {
       const gates = this.store.all("gate", projectId).filter(g =>
         g.type === "pr" && (["open", "merging"].includes(g.status) ||
+          (g.importedFromGitHub && g.status === "resolved" && this.store.get(g.taskId).externalPr?.awaitingUpdate) ||
           (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id)));
       for (const snapshot of gates) {
         if (this.closed) return;
@@ -1506,7 +1772,8 @@ export class Engine extends EventEmitter {
         this.prDecisionBusy.add(snapshot.id);
         try {
           const gate = this.store.get(snapshot.id);
-          if (!["open", "merging", "superseded"].includes(gate.status)) continue;
+          if (!["open", "merging", "superseded"].includes(gate.status) &&
+              !(gate.importedFromGitHub && gate.status === "resolved")) continue;
           if (gate.mergeAttempt) { await this.reconcileMergeReserved(gate.id); continue; }
           const info = await this.prInfo(gate.id);
           if (this.closed) return;
@@ -1516,6 +1783,58 @@ export class Engine extends EventEmitter {
             throw new Error("Remote PR identity, base or head does not match this project.");
           const task = this.store.get(gate.taskId, "task");
           if (task.projectId !== projectId) throw new Error("Remote PR task belongs to another project.");
+          if (gate.importedFromGitHub) {
+            if (task.kind !== "external-pr" || task.externalPr?.url !== gate.pr ||
+                gate.base !== project.branch || !/^[a-f0-9]{40}$/.test(gate.baseSha ?? ""))
+              throw new Error("Imported PR provenance no longer matches its project and task.");
+            const observedAt = new Date().toISOString();
+            const observation = { url: info.url, number: info.number, state: info.state,
+              headSha: info.headRefOid, baseSha: info.baseRefOid, base: info.baseRefName,
+              mergeable: info.mergeable, mergedSha: info.mergeCommit?.oid,
+              mergedAt: info.mergedAt, observedAt };
+            if (info.state === "MERGED") {
+              this.store.transaction(() => {
+                const current = this.store.get(gate.id, "gate");
+                const currentTask = this.store.get(task.id, "task");
+                if (!current.importedFromGitHub || current.pr !== gate.pr || current.sha !== gate.sha ||
+                    current.baseSha !== gate.baseSha || !["open", "resolved"].includes(current.status) ||
+                    currentTask.kind !== "external-pr" || currentTask.externalPr?.url !== gate.pr)
+                  throw new Error("Imported PR changed during merge observation.");
+                this.store.patch(gate.id, { status: "reconciled", remoteObservation: observation,
+                  mergedSha: info.mergeCommit.oid, resolvedAt: observedAt,
+                  mergeRecovery: "Merged externally on GitHub; merge actor unverified." });
+                this.store.patch(task.id, { status: "completed", externalPr: { ...currentTask.externalPr,
+                  finalHeadSha: info.headRefOid, mergedSha: info.mergeCommit.oid, mergedAt: info.mergedAt } });
+                this.store.put("message", { projectId, taskId: task.id, role: "coordinator",
+                  text: `GitHub reports imported PR #${info.number} merged. Merge actor is unverified.`, createdAt: observedAt });
+              });
+              this.changed("external-pr-merged", { gateId: gate.id, ...observation }, projectId);
+              this.tick();
+            } else if (info.state === "CLOSED") {
+              this.store.transaction(() => {
+                const current = this.store.get(gate.id, "gate");
+                const currentTask = this.store.get(task.id, "task");
+                if (!current.importedFromGitHub || current.pr !== gate.pr || current.sha !== gate.sha ||
+                    current.baseSha !== gate.baseSha || !["open", "resolved"].includes(current.status) ||
+                    currentTask.kind !== "external-pr" || currentTask.externalPr?.url !== gate.pr)
+                  throw new Error("Imported PR changed during close observation.");
+                this.store.patch(gate.id, { status: "reconciled", remoteObservation: observation,
+                  resolvedAt: observedAt, mergeRecovery: "GitHub closed this PR without a merge." });
+                this.store.patch(task.id, { status: "cancelled", externalPr: { ...currentTask.externalPr,
+                  closedAt: observedAt, closedWithoutMerge: true } });
+              });
+              this.changed("external-pr-closed", { gateId: gate.id, ...observation }, projectId);
+            } else if (info.state === "OPEN" &&
+                       (info.headRefOid !== gate.sha || info.baseRefOid !== gate.baseSha)) {
+              await this.importExternalPr(projectId, gate.pr);
+            } else if (info.state === "OPEN" &&
+                       (gate.remoteObservation?.mergeable !== info.mergeable ||
+                        gate.remoteObservation?.state !== info.state)) {
+              this.store.patch(gate.id, { remoteObservation: observation });
+              this.changed("external-pr-observed", { gateId: gate.id, ...observation }, projectId);
+            }
+            continue;
+          }
           if (gate.status === "superseded") {
             const previous = gate.remoteObservation;
             if (previous?.state !== info.state || previous?.headSha !== info.headRefOid || previous?.mergeable !== info.mergeable) {
@@ -1525,6 +1844,7 @@ export class Engine extends EventEmitter {
               this.changed("repair-pr-observed", { gateId: gate.id, ...observation }, projectId);
             }
             await this.settleMergedRepair(project, this.store.get(task.id), this.store.get(gate.id), info);
+            await this.confirmPublishedRepair(project, this.store.get(task.id), this.store.get(gate.id), info);
             continue;
           }
           if (this.busy.has("task:" + task.id) || this.store.all("run", projectId).some(r => r.taskId === task.id && r.status === "running")) continue;
@@ -1706,9 +2026,133 @@ export class Engine extends EventEmitter {
         "view",
         gate.pr,
         "--json",
-        "number,url,title,headRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt",
+        "number,url,title,headRefOid,baseRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt",
       ]),
     );
+  }
+  externalPrIdentity(project: RecordData, url: string, info: any) {
+    if (!project.github || !project.branch ||
+        !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(url))
+      throw new Error("Import requires a GitHub PR in the configured repository.");
+    this.mergeTarget(url, info.number);
+    if (url !== info.url || !url.startsWith(`https://github.com/${project.github}/pull/`) ||
+        info.baseRefName !== project.branch || info.state !== "OPEN" ||
+        !/^[a-f0-9]{40}$/.test(info.headRefOid ?? "") ||
+        !/^[a-f0-9]{40}$/.test(info.baseRefOid ?? ""))
+      throw new Error("Imported PR must be open with a valid head and base in this project's configured repository.");
+    return { url, number: info.number, sha: info.headRefOid, baseSha: info.baseRefOid, base: info.baseRefName };
+  }
+  async externalPrInfo(url: string) {
+    return JSON.parse(await this.mergeBroker(["pr", "view", url, "--json",
+      "number,url,title,headRefOid,baseRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt"]));
+  }
+  async importExternalPr(projectId: string, url: string) {
+    const project = this.store.get(projectId, "project");
+    // Validate the requested repository before asking GitHub to resolve it.
+    if (!project.github || !project.branch ||
+        !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(url) ||
+        !url.startsWith(`https://github.com/${project.github}/pull/`))
+      throw new Error("PR URL must belong to this project's configured GitHub repository.");
+    const first = await this.externalPrInfo(url);
+    const identity = this.externalPrIdentity(project, url, first);
+    const second = await this.externalPrInfo(url);
+    const confirmed = this.externalPrIdentity(project, url, second);
+    if (JSON.stringify(identity) !== JSON.stringify(confirmed))
+      throw new Error("PR revision or base changed during import. Refresh and retry.");
+    if (this.closed) throw new Error("Coordinator closed during PR import.");
+    const importedAt = new Date().toISOString();
+    const imported = this.store.transaction(() => {
+      const currentProject = this.store.get(projectId, "project");
+      if (currentProject.github !== project.github || currentProject.branch !== project.branch)
+        throw new Error("Project repository settings changed during PR import.");
+      const matches = this.store.all("task", projectId).filter(task => task.pr === url || task.externalPr?.url === url);
+      if (matches.length > 1 || matches.some(task => task.kind !== "external-pr"))
+        throw new Error("This PR is already owned by another Looproom task.");
+      let task = matches[0];
+      if (task && ["completed", "cancelled"].includes(task.status))
+        throw new Error("This PR has already reached a terminal Looproom state.");
+      const gates = task ? this.store.all("gate", projectId).filter(g => g.taskId === task.id && g.type === "pr" && g.importedFromGitHub) : [];
+      const active = gates.find(g => g.status === "open" || g.status === "merging");
+      if (active?.mergeAttempt || active?.status === "merging")
+        throw new Error("An earlier merge attempt must be reconciled before refreshing this PR.");
+      if (active && active.sha === identity.sha && active.baseSha === identity.baseSha && active.base === identity.base)
+        return { task: task!, gate: active };
+      if (task?.externalPr?.sha === identity.sha && task?.externalPr?.baseSha === identity.baseSha &&
+          gates.some(g => g.status === "resolved" && g.sha === identity.sha && g.baseSha === identity.baseSha))
+        throw new Error("Changes were requested for this revision. Wait for a new PR head or base before importing again.");
+      if (active) this.store.patch(active.id, { status: "superseded", resolvedAt: importedAt,
+        remoteObservation: { url, number: identity.number, state: "OPEN", headSha: identity.sha,
+          baseSha: identity.baseSha, base: identity.base, mergeable: second.mergeable, observedAt: importedAt } });
+      const externalPr = { ...identity, importedAt, provenance: "imported-from-github" };
+      if (task) task = this.store.patch(task.id, { status: "awaiting_human", sha: identity.sha,
+        externalPr, title: second.title || task.title, feedback: null });
+      else task = this.store.put("task", { projectId, kind: "external-pr", status: "awaiting_human",
+        title: second.title || `GitHub PR #${identity.number}`, description: `External GitHub PR ${url}`,
+        acceptance: [], dependencies: [], pr: url, sha: identity.sha, checks: [], review: null,
+        externalPr, createdAt: importedAt });
+      const gate = this.store.put("gate", { projectId, taskId: task.id, type: "pr", scope: "task",
+        status: "open", importedFromGitHub: true, title: `Review GitHub PR #${identity.number}`,
+        detail: `External GitHub PR ${url} at head ${identity.sha} against base ${identity.baseSha}. Looproom has no originating implementation, configured checks, or independent review for this import. Review the exact GitHub diff and checks before human approval.`,
+        pr: url, sha: identity.sha, base: identity.base, baseSha: identity.baseSha,
+        authorRole: "coordinator", createdAt: importedAt, judgeStatus: "pending",
+        remoteObservation: { url, number: identity.number, state: "OPEN", headSha: identity.sha,
+          baseSha: identity.baseSha, base: identity.base, mergeable: second.mergeable, observedAt: importedAt } });
+      this.store.recordEscalation(gate);
+      return { task, gate };
+    });
+    this.changed("external-pr-imported", { taskId: imported.task.id, gateId: imported.gate.id,
+      sha: identity.sha, baseSha: identity.baseSha }, projectId);
+    return imported;
+  }
+  async importedPrDiff(gateId: string) {
+    const gate = this.store.get(gateId, "gate");
+    if (!gate.importedFromGitHub || gate.type !== "pr" || gate.status !== "open")
+      throw new Error("This imported PR revision is no longer open for review.");
+    const project = this.store.get(gate.projectId, "project");
+    const first = this.externalPrIdentity(project, gate.pr, await this.externalPrInfo(gate.pr));
+    if (first.sha !== gate.sha || first.baseSha !== gate.baseSha || first.base !== gate.base)
+      throw new Error("Imported PR revision or base changed. Refresh its Review gate.");
+    const target = this.mergeTarget(gate.pr, first.number).replace(/\/pulls\/\d+\/merge$/, "");
+    const diff = await this.mergeBroker(["api", "-H", "Accept: application/vnd.github.diff",
+      `${target}/compare/${first.baseSha}...${first.sha}`]);
+    if (!diff.trim()) throw new Error("GitHub returned no diff for this imported PR revision.");
+    if (Buffer.byteLength(diff) > 2_000_000)
+      throw new Error("Imported PR diff exceeds the 2 MB review limit; inspect it directly on GitHub.");
+    const second = this.externalPrIdentity(project, gate.pr, await this.externalPrInfo(gate.pr));
+    if (JSON.stringify(first) !== JSON.stringify(second) || this.closed)
+      throw new Error("Imported PR changed while its diff was captured.");
+    const current = this.store.get(gateId, "gate");
+    if (current.status !== "open" || current.sha !== first.sha || current.baseSha !== first.baseSha ||
+        current.pr !== gate.pr || !current.importedFromGitHub)
+      throw new Error("Imported PR Review gate changed during diff capture.");
+    return { diff, sha: first.sha, baseSha: first.baseSha,
+      diffSha256: createHash("sha256").update(diff).digest("hex") };
+  }
+  async importedPrJudgeContext(project: RecordData, task: RecordData, gate: RecordData) {
+    if (task.kind !== "external-pr" || !gate.importedFromGitHub ||
+        task.projectId !== project.id || task.externalPr?.url !== gate.pr ||
+        task.externalPr?.sha !== gate.sha || task.externalPr?.baseSha !== gate.baseSha ||
+        !/^[a-f0-9]{40}$/.test(gate.sha ?? "") || !/^[a-f0-9]{40}$/.test(gate.baseSha ?? ""))
+      throw new Error("Imported PR judge context has stale task or gate provenance.");
+    const captured = await this.importedPrDiff(gate.id);
+    const current = this.store.get(gate.id, "gate");
+    if (current.status !== "open" || current.sha !== captured.sha || current.baseSha !== captured.baseSha)
+      throw new Error("Imported PR gate changed during judge context capture.");
+    const cwd = join(this.dataDir, "external-pr-context", gate.id, `${captured.baseSha}-${captured.sha}`);
+    await mkdir(cwd, { recursive: true });
+    const canonicalRoot = await realpath(this.dataDir);
+    if (!(await realpath(cwd)).startsWith(canonicalRoot + "/external-pr-context/"))
+      throw new Error("Imported PR context directory escaped coordinator storage.");
+    const path = join(cwd, `review-${captured.diffSha256}.diff`);
+    try { await writeFile(path, captured.diff, { flag: "wx" }); }
+    catch (error) {
+      const existing = await lstat(path).catch(() => null);
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" ||
+          !existing?.isFile() || existing.isSymbolicLink() ||
+          createHash("sha256").update(await readFile(path)).digest("hex") !== captured.diffSha256)
+        throw error;
+    }
+    return { cwd, filename: `review-${captured.diffSha256}.diff`, ...captured };
   }
   mergeTarget(pr: string, number: number) {
     const match = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/([1-9]\d*)$/.exec(pr);
@@ -1833,7 +2277,7 @@ export class Engine extends EventEmitter {
       throw new Error("This PR approval is no longer open.");
     if (gate.mergeAttempt)
       throw new Error("A prior merge attempt needs manual reconciliation before another approval.");
-    const info = await this.prInfo(gateId);
+    let info = await this.prInfo(gateId);
     if (reviewedSha !== gate.sha)
       throw new Error(
         "Review the currently displayed revision before approving.",
@@ -1843,6 +2287,16 @@ export class Engine extends EventEmitter {
       throw new Error("Pull request identity changed. Refresh and review.");
     if (this.closed) throw new Error("Coordinator closed during PR approval.");
     this.validateRemotePr(gate, this.store.get(gate.projectId), info);
+    if (gate.importedFromGitHub) {
+      if (info.baseRefOid !== gate.baseSha)
+        throw new Error("Imported PR base changed. Refresh its Review gate before approval.");
+      const confirmed = await this.prInfo(gateId);
+      this.validateRemotePr(gate, this.store.get(gate.projectId), confirmed);
+      if (confirmed.state !== "OPEN" || confirmed.headRefOid !== info.headRefOid ||
+          confirmed.baseRefOid !== info.baseRefOid || confirmed.baseRefOid !== gate.baseSha)
+        throw new Error("Imported PR changed during approval. Refresh its Review gate.");
+      info = confirmed;
+    }
     const target = this.mergeTarget(gate.pr, info.number);
     checkApproval(
       reviewedSha,
@@ -1854,18 +2308,27 @@ export class Engine extends EventEmitter {
     const task = this.store.get(gate.taskId, "task");
     if (task.projectId !== project.id || task.status !== "awaiting_human")
       throw new Error("This PR task is no longer awaiting human review.");
+    if (gate.importedFromGitHub && (task.kind !== "external-pr" || task.externalPr?.url !== gate.pr ||
+        task.externalPr?.sha !== gate.sha || task.externalPr?.baseSha !== gate.baseSha))
+      throw new Error("Imported PR task provenance changed before approval.");
     const run = this.prEvidenceRun(gate, reviewedSha, true);
+    if (gate.importedFromGitHub && (run || gate.prRunId))
+      throw new Error("Imported PR has unexpected native implementation evidence; review provenance before merging.");
     const intent = run && this.store.all("wiki-ingest", project.id).find((item) => item.runId === run.id && item.taskId === gate.taskId);
     const existingPr = intent?.pendingEvidence?.prEvidence;
     if (intent && (existingPr?.url !== gate.pr || existingPr?.headSha !== reviewedSha))
       throw new Error("Wiki PR evidence does not match the approved revision.");
     this.store.transaction(() => {
       const current = this.store.get(gateId);
-      if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha)
+      if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha ||
+          (gate.importedFromGitHub && (!current.importedFromGitHub || current.baseSha !== gate.baseSha ||
+            current.pr !== gate.pr || this.store.get(gate.taskId, "task").externalPr?.baseSha !== gate.baseSha)))
         throw new Error("This revision already has a merge attempt or is no longer open.");
       this.store.patch(gateId, {
         status: "merging",
-        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, base: info.baseRefName, prRunId: run?.id, requestedAt: new Date().toISOString() },
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, base: info.baseRefName,
+          ...(gate.importedFromGitHub ? { baseSha: gate.baseSha, importedFromGitHub: true } : {}),
+          prRunId: run?.id, requestedAt: new Date().toISOString() },
       });
     });
     let result: any;
@@ -1923,6 +2386,7 @@ export class Engine extends EventEmitter {
         gateId,
         taskId: gate.taskId,
         reviewedSha,
+        ...(gate.importedFromGitHub ? { importedFromGitHub: true, baseSha: gate.baseSha } : {}),
         mergedSha: result.sha,
         createdAt: new Date().toISOString(),
       });
@@ -1958,18 +2422,27 @@ export class Engine extends EventEmitter {
       if (info.state !== "OPEN") throw new Error("Pull request is not open.");
       if (info.headRefOid !== reviewedSha)
         throw new Error("PR revision changed. Refresh and review the new commit.");
+      if (gate.importedFromGitHub && info.baseRefOid !== gate.baseSha)
+        throw new Error("Imported PR base changed. Refresh its Review gate before requesting changes.");
       const resolvedAt = new Date().toISOString();
       this.store.transaction(() => {
         const current = this.store.get(gateId, "gate");
         const currentTask = this.store.get(gate.taskId, "task");
-        if (current.status !== "open" || currentTask.status !== "awaiting_human")
+        if (current.status !== "open" || currentTask.status !== "awaiting_human" ||
+            (gate.importedFromGitHub && (!current.importedFromGitHub || current.sha !== reviewedSha ||
+              current.baseSha !== gate.baseSha || current.pr !== gate.pr ||
+              currentTask.kind !== "external-pr" || currentTask.externalPr?.baseSha !== gate.baseSha)))
           throw new Error("This PR review is no longer open.");
         this.store.patch(gateId, {
           status: "resolved", answer, resolvedBy: "human", resolvedAt,
           reviewedSha,
         });
         this.store.recordGateResponse(gate, answer, "human", resolvedAt);
-        this.store.patch(task.id, {
+        this.store.patch(task.id, gate.importedFromGitHub ? {
+          status: "blocked", externalPr: { ...currentTask.externalPr, awaitingUpdate: true,
+            requestedChangesAt: resolvedAt, requestedChangesSha: reviewedSha },
+          feedback: `Human requested changes to external PR revision ${reviewedSha}: ${answer}`,
+        } : {
           status: "ready", attempt: 0, judgeRetries: 0,
           feedback: `Human requested changes to revision ${reviewedSha}: ${answer}`,
         });
@@ -1989,6 +2462,7 @@ export class Engine extends EventEmitter {
   ) {
     const gate = this.store.get(gateId, "gate");
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
+    if (gate.publicationIntentSha) throw new Error("Coordinator publication confirmation owns this wait.");
     if (actor === "judge" && gate.type === "interrupted")
       throw new Error("Interrupted work requires explicit human resolution.");
     if (gate.type === "pr" && gate.mergeAttempt)
@@ -2014,12 +2488,16 @@ export class Engine extends EventEmitter {
         project = this.store.get(gate.projectId);
       if (current.status !== "open")
         throw new Error("Gate is already resolved.");
+      if (current.publicationIntentSha)
+        throw new Error("Coordinator publication confirmation owns this wait.");
       if (current.type === "experiment" && retry &&
           (!authorizedRoundId || current.experimentRoundId !== this.store.get(authorizedRoundId, "experiment-round").previousRoundId ||
            this.store.get(current.taskId, "task").experimentRoundId !== authorizedRoundId))
         throw new Error("An exhausted experiment requires judge authorization of a distinct round before retry.");
       if (current.type === "pr" && current.mergeAttempt)
         throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
+      if (current.type === "pr" && current.importedFromGitHub)
+        throw new Error("Imported PRs require Approve, Request changes, or remote reconciliation.");
       if (
         actor === "judge" &&
         (escalationMode(project) === "human" || project.status !== "running")
@@ -2123,6 +2601,113 @@ export class Engine extends EventEmitter {
         judgeRetries: 0,
       });
     }
+    return report;
+  }
+  async verifyBrowserBaseline(project: RecordData, task: RecordData, gate?: RecordData) {
+    if (!task.worktree || task.projectId !== project.id)
+      throw new Error("Browser baseline needs the assigned task worktree.");
+    if (gate && (this.store.get(gate.id).status !== "open" ||
+        this.store.get(project.id).status !== "running" ||
+        escalationMode(this.store.get(project.id)) !== "yolo" ||
+        this.store.hasOpenInterruption(project.id)))
+      throw new Error("Browser baseline gate is no longer eligible for automatic verification.");
+    const pinned = this.store.get(project.id).browserBaseline;
+    const report = await this.browserAuditRunner({
+      cwd: task.worktree,
+      dataDir: this.dataDir,
+      projectId: project.id,
+      databasePath: join(this.dataDir, "looproom.sqlite"),
+      codexBinary: this.runtime.binary,
+      runId: this.store.get(task.id).implementationRunId,
+      ...(pinned ? { snapshotId: pinned.snapshotId } : {}),
+      timeoutMs: 30 * 60_000,
+    });
+    if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(report.id) || report.projectId !== project.id ||
+        report.kind !== "browser-baseline" || !["complete", "unavailable"].includes(report.status))
+      throw new Error("Browser baseline runner returned an invalid report identity or status.");
+    const expectedReportPath = join(await realpath(this.dataDir), "browser-audit", report.id + ".json");
+    if (report.reportPath !== expectedReportPath ||
+        (await realpath(report.reportPath)) !== expectedReportPath ||
+        !(await lstat(report.reportPath)).isFile())
+      throw new Error("Browser baseline report is not the coordinator's immutable report file.");
+    const reportBytes = await readFile(report.reportPath);
+    if (JSON.stringify(JSON.parse(reportBytes.toString("utf8"))) !== JSON.stringify(report))
+      throw new Error("Browser baseline report bytes differ from the runner result.");
+    if (!report.sourceUnchanged || report.sourceHash !== await sourceFingerprint(task.worktree))
+      throw new Error("Browser baseline source changed during measurement; retain the coordinator report and remeasure.");
+    const currentTask = this.store.get(task.id);
+    if (currentTask.projectId !== project.id || currentTask.worktree !== task.worktree)
+      throw new Error("Browser baseline task ownership changed during measurement.");
+    if (report.status === "complete" && (!report.sourceSha ||
+        report.unavailable.length || validateBrowserReport(report).length))
+      throw new Error("Browser baseline runner claimed complete without required measured evidence.");
+    if (report.snapshotId && report.snapshotHash) {
+      const snapshot = await loadBrowserSnapshot(
+        join(this.dataDir, "browser-snapshots"), report.snapshotId, project.id);
+      if (snapshot.hash !== report.snapshotHash)
+        throw new Error("Browser baseline report does not match its immutable project snapshot.");
+    } else if (report.status === "complete")
+      throw new Error("Complete browser baseline has no immutable project snapshot.");
+    if (report.status === "complete") await this.verifyBrowserArtifacts(report);
+    if (pinned && (report.snapshotId !== pinned.snapshotId ||
+        report.snapshotHash !== pinned.snapshotHash || report.protocolHash !== pinned.protocolHash ||
+        report.evaluatorHash !== pinned.evaluatorHash))
+      throw new Error("Browser baseline candidate did not use the pinned snapshot and evaluator.");
+    if (gate && (this.store.get(gate.id).status !== "open" ||
+        this.store.get(project.id).status !== "running" ||
+        escalationMode(this.store.get(project.id)) !== "yolo" ||
+        this.store.hasOpenInterruption(project.id)))
+      throw new Error("Browser baseline completed after the gate or project changed; report retained by coordinator without automatic handoff.");
+    const summary = {
+      id: report.id,
+      kind: report.kind,
+      status: report.status,
+      unavailable: report.unavailable.slice(0, 20),
+      unavailableCount: report.unavailable.length,
+      sourceHash: report.sourceHash,
+      sourceSha: report.sourceSha,
+      sourceUnchanged: report.sourceUnchanged,
+      snapshotId: report.snapshotId,
+      snapshotHash: report.snapshotHash,
+      protocolHash: report.protocolHash,
+      evaluatorHash: report.evaluatorHash,
+      reportPath: report.reportPath,
+      reportHash: createHash("sha256").update(reportBytes).digest("hex"),
+      createdAt: report.createdAt,
+    };
+    const evidenceDir = join(task.worktree, ".looproom-verification");
+    await mkdir(evidenceDir, { recursive: true });
+    if ((await realpath(evidenceDir)) !==
+        join(await realpath(task.worktree), ".looproom-verification"))
+      throw new Error("Verification evidence directory must not be a symlink.");
+    await writeFile(join(evidenceDir, report.id + ".json"), reportBytes, { flag: "wx" });
+    const temporary = join(evidenceDir, report.id + ".tmp");
+    await writeFile(temporary, reportBytes, { flag: "wx" });
+    await rename(temporary, join(evidenceDir, "browser-latest.json"));
+    if (gate && (this.store.get(gate.id).status !== "open" ||
+        this.store.get(project.id).status !== "running" ||
+        escalationMode(this.store.get(project.id)) !== "yolo" ||
+        this.store.hasOpenInterruption(project.id)))
+      throw new Error("Browser baseline gate changed before report handoff; coordinator evidence remains available by ID.");
+    this.store.patch(task.id, {
+      browserVerification: summary,
+      ...(report.status === "complete" ? { judgeRetries: 0 } : {}),
+    });
+    if (!pinned && report.status === "complete" && report.sourceUnchanged &&
+        report.unavailable.length === 0) {
+      this.store.patch(project.id, { browserBaseline: {
+        ownerTaskId: task.id,
+        reportId: report.id,
+        snapshotId: report.snapshotId,
+        snapshotHash: report.snapshotHash,
+        protocolHash: report.protocolHash,
+        evaluatorHash: report.evaluatorHash,
+        reportHash: createHash("sha256").update(reportBytes).digest("hex"),
+      } });
+    }
+    this.changed("browser-verification-completed", {
+      taskId: task.id, reportId: report.id, status: report.status,
+    }, project.id);
     return report;
   }
   async freezeBaseline(project: RecordData, task: RecordData) {
@@ -2277,7 +2862,11 @@ export class Engine extends EventEmitter {
     }
   }
   async judge(project: RecordData, gate: RecordData) {
-    if (gate.status !== "open" || this.store.hasOpenInterruption(project.id)) return;
+    gate = this.store.get(gate.id, "gate");
+    // Only the remote publication observer may settle a pushed revision's
+    // machine wait and register its exact-head human PR gate.
+    if (gate.status !== "open" || gate.publicationIntentSha ||
+        this.store.hasOpenInterruption(project.id)) return;
     const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
     if (
       escalationMode(project) === "yolo" &&
@@ -2287,12 +2876,13 @@ export class Engine extends EventEmitter {
       task
     )
       this.store.patch(task.id, { judgeRetries: 0 });
+    const ownedAttempt = (gate.judgeAttempts ?? 0) + 1;
     this.store.patch(gate.id, {
       judgeStatus: "running",
       judgeError: null,
       judgeRecoveryStatus: null,
       judgeRecoveryError: null,
-      judgeAttempts: (gate.judgeAttempts ?? 0) + 1,
+      judgeAttempts: ownedAttempt,
     });
     this.changed("judge-started", { gateId: gate.id }, project.id);
     try {
@@ -2312,6 +2902,7 @@ export class Engine extends EventEmitter {
               feedback: t.feedback,
               checks: t.checks,
               verification: t.verification,
+              browserVerification: t.browserVerification,
               baselineVerification: t.baselineVerification,
               verificationEvaluatorHash: t.verificationEvaluatorHash,
               judgeRetries: t.judgeRetries,
@@ -2325,16 +2916,19 @@ export class Engine extends EventEmitter {
         (gate.originRunId ?? gate.runId)
           ? this.store.get(gate.originRunId ?? gate.runId)
           : undefined;
+      const externalContext = task?.kind === "external-pr"
+        ? await this.importedPrJudgeContext(project, task, gate) : undefined;
       let result = await this.run(
         project,
         "judge",
-        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request coordinator verification using verificationRequests: ["configured-checks"] and/or ["refresh-baseline"]. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs a disposable isolated snapshot with child execution, fixture cleanup and test loopback; the worker permissions stay unchanged. If recorded evidence is missing for the available verification runner, request the appropriate recipe instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
+        `${externalContext ? `External GitHub PR provenance: imported, with no Looproom implementation run, configured checks, or independent review. This judge is read-only. Read only ${externalContext.filename} in the isolated external PR context as the diff of base ${externalContext.baseSha} to head ${externalContext.sha}; SHA-256 ${externalContext.diffSha256}. Do not treat the local project checkout as this PR source. Give a sourced review note only and keep human merge approval.\n` : ""}You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request fixed coordinator recipes via verificationRequests: "configured-checks", "refresh-baseline", or "browser-baseline". Request "browser-baseline" only when actual read-only project records and controlled browser measurements are needed; the coordinator snapshots records, runs a private browser against a separate viewer, and returns an immutable report. An unavailable report is diagnostic, not a measured baseline. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs disposable isolated verification; the worker permissions stay unchanged. If recorded evidence is missing for an available recipe, request it instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
 Goal: ${project.goal}
 Scope/exclusions: ${project.constraints}
 Repository: ${project.path}
 Authorized checks: ${JSON.stringify(project.checks ?? [])}
 Escalation: ${JSON.stringify({ id: gate.id, title: gate.title, detail: gate.detail, type: gate.type, scope: gate.scope, authorRole: gate.authorRole, lastVerificationError: gate.judgeRecoveryError ?? gate.judgeError })}
 Refresh baseline state: ${JSON.stringify(this.store.get(project.id).refreshBaseline ?? null)}. During initial setup, a revised evaluator needs independent review of unchanged measurement rules and a fresh baseline. Once reviewed and frozen, candidate evaluator edits are refused. Scores from different evaluator versions are never comparable.
+Browser baseline state: ${JSON.stringify(this.store.get(project.id).browserBaseline ?? null)}. Browser evidence must identify the actual snapshot, frozen protocol and raw observations; source or fixture reports cannot substitute for it.
 Experiment round: ${JSON.stringify(gate.experimentRoundId ? this.store.get(gate.experimentRoundId, "experiment-round") : null)}. For an exhausted experiment round in YOLO, return action retry and nextRound with a new concrete hypothesis, exact unchanged contract and a specific instruction for the originating task. For other gates omit nextRound. Candidate limits never reset inside a round.
 Task and dependency frontier: ${JSON.stringify(relatedTasks)}
 Originating run: ${JSON.stringify(origin ? { role: origin.role, output: String(origin.output ?? "").slice(-16000), error: origin.error } : null)}
@@ -2344,7 +2938,16 @@ Action retry: your specific decision permits continuing within existing capabili
         Judgment,
         task,
         false,
+        undefined,
+        externalContext?.cwd,
       );
+      const judgeIntegrityError = this.store.all("run", project.id)
+        .filter(run => run.role === "judge" && run.taskId === task?.id).at(-1)?.browserBaselineIntegrityError;
+      if (judgeIntegrityError)
+        result = { ...result, action: "wait", verificationRequests: [], nextRound: undefined,
+          answer: (result.answer + "\nThe frozen browser baseline failed coordinator integrity checks: " +
+            judgeIntegrityError + ". Preserve the diagnostic and repair the pinned evidence before relying on it.").slice(0, 6000) };
+      let browserMeasurementIncomplete = result.verificationRequests.includes("browser-baseline");
       if (
         result.verificationRequests.length &&
         task?.worktree &&
@@ -2353,25 +2956,38 @@ Action retry: your specific decision permits continuing within existing capabili
         this.store.get(project.id).status === "running" &&
         this.store.get(gate.id).status === "open"
       ) {
-        let report;
+        const reports: unknown[] = [];
         try {
           const commands = await this.verificationCommands(project, this.store.get(task.id), result.verificationRequests);
           if (commands.length) {
             this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
             this.changed("judge-verification-started", { gateId: gate.id, taskId: task.id }, project.id);
-            report = await this.verify(project, task, commands,
+            reports.push(await this.verify(project, task, commands,
               result.verificationRequests.includes("cleanup-test-fixtures"),
-              this.store.get(task.id).implementationRunId);
+              this.store.get(task.id).implementationRunId));
+          }
+          if (result.verificationRequests.includes("browser-baseline") &&
+              this.store.get(gate.id).status === "open" &&
+              this.store.get(project.id).status === "running" &&
+              escalationMode(this.store.get(project.id)) === "yolo") {
+            this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
+            this.changed("judge-browser-verification-started", { gateId: gate.id, taskId: task.id }, project.id);
+            const browserReport = await this.verifyBrowserBaseline(
+              this.store.get(project.id), this.store.get(task.id), gate);
+            reports.push(this.store.get(task.id).browserVerification);
+            browserMeasurementIncomplete = browserReport.status !== "complete" ||
+              !browserReport.sourceUnchanged || browserReport.unavailable.length > 0;
           }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
+          if (this.store.get(gate.id).status !== "open") return;
           this.store.patch(gate.id, { judgeRecoveryStatus: "failed", judgeRecoveryError: detail });
           this.changed("judge-verification-failed", { gateId: gate.id, taskId: task.id, error: detail }, project.id);
           result = { ...result, action: "wait", verificationRequests: [],
             answer: (result.answer.slice(0, 4200) + "\nThe coordinator verification request failed: " + detail.slice(0, 1200) +
               "\nRepair this specific source or setup condition within existing capabilities before retrying; no passing result was produced.").slice(0, 6000) };
         }
-        if (report) {
+        if (reports.length && this.store.get(gate.id).judgeRecoveryStatus !== "failed") {
           if (this.store.get(gate.id).status !== "open") return;
           if (this.store.get(project.id).status !== "running" ||
               escalationMode(this.store.get(project.id)) !== "yolo") {
@@ -2381,27 +2997,35 @@ Action retry: your specific decision permits continuing within existing capabili
           result = await this.run(
             this.store.get(project.id),
             "judge",
-            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator snapshot report: ${JSON.stringify(report)}\nThe report has real command outputs/exit status, original-source hash and a sourceUnchanged flag. It ran in a disposable isolated copy, not the worker shell. If checks failed, return retry with a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Do not claim checks passed when their exit code is nonzero. The worker can read .looproom-verification/latest.json and .looproom-verification/<report-id>.json; the coordinator runs configured checks after implementation. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
+            `Reassess this exact escalation using actual coordinator verification. Goal: ${project.goal}\nTask: ${JSON.stringify({ title: task.title, acceptance: task.acceptance })}\nEscalation: ${gate.detail}\nCoordinator reports: ${JSON.stringify(reports)}\nCheck reports contain actual command outputs/exit status and source identity from a disposable copy. Browser-baseline reports contain actual read-only project snapshot and controlled browser observations, or an explicit unavailable status. Read the exact immutable browser report by ID in .looproom-verification/<report-id>.json; browser-latest.json points only to the latest browser batch, while latest.json is reserved for configured checks. An unavailable browser observation cannot establish the baseline or justify candidate promotion or capability-success retry; give specific documentation or repair steps while keeping the measurement gate blocked. If checks failed, return a specific repair when possible; source changes require fresh verification. If checks passed and the missing broker evidence is the only blocker, return retry and tell the worker to use the recorded results and finish its task. Never grant worker permissions or approve a PR. Return action, answer, summary, sources and verificationRequests: [] (one verification batch per assessment).`,
             Judgment,
             task,
             false,
           );
           this.store.patch(gate.id, { judgeRecoveryStatus: "verified" });
         }
+        if (browserMeasurementIncomplete)
+          result = { ...result, action: "wait", verificationRequests: [],
+            answer: (result.answer + "\nThe browser report remains incomplete. Preserve its diagnostics and recheck after the missing observation is available; do not claim a measured baseline or promote a candidate.").slice(0, 6000) };
       }
       if (
         result.action === "wait" &&
         gate.type !== "pr" &&
+        !judgeIntegrityError &&
+        !browserMeasurementIncomplete &&
         escalationMode(this.store.get(project.id)) === "yolo"
       )
         result = await this.recoverEscalation(project, gate, task, result);
+      if (browserMeasurementIncomplete && result.action !== "wait")
+        result = { ...result, action: "wait", verificationRequests: [],
+          answer: (result.answer + "\nThe actual browser baseline remains incomplete; the measurement gate stays open until a complete report is recorded.").slice(0, 6000) };
       const run = this.store
         .all("run", project.id)
         .filter((run) => run.role === "judge")
         .at(-1)!;
       const current = this.store.get(gate.id),
         currentProject = this.store.get(project.id);
-      if (current.status !== "open") return;
+      if (current.status !== "open" || current.publicationIntentSha) return;
       let action = gate.type === "pr" ? "wait" : result.action,
         answer = result.answer;
       if (result.nextRound) {
@@ -2410,7 +3034,7 @@ Action retry: your specific decision permits continuing within existing capabili
             currentProject.status !== "running")
           throw new Error("Next round authorization requires an active YOLO experiment gate and retry decision.");
         const next = this.store.transaction(() => {
-          if (this.store.get(gate.id).status !== "open")
+          if (this.store.get(gate.id).status !== "open" || this.store.get(gate.id).publicationIntentSha)
             throw new Error("Gate is already resolved.");
           const round = authorizeNextRound(this.store, gate.experimentRoundId!, run.id,
             result.nextRound!.hypothesis, result.nextRound!.retryInstruction,
@@ -2445,6 +3069,7 @@ Action retry: your specific decision permits continuing within existing capabili
           "\nThree judge retries did not clear this task. This task remains blocked until its failed prerequisite or unavailable capability changes; independent tasks may continue. Do not repeat the same attempt.";
       }
       this.store.transaction(() => {
+        if (this.store.get(gate.id).publicationIntentSha) return;
         this.store.patch(gate.id, {
           judgeStatus: "answered",
           judgeAnswer: answer,
@@ -2464,6 +3089,7 @@ Action retry: your specific decision permits continuing within existing capabili
           "escalation_draft",
         );
       });
+      if (this.store.get(gate.id).publicationIntentSha) return;
       if (
         gate.type !== "pr" &&
         action !== "wait" &&
@@ -2488,6 +3114,7 @@ Action retry: your specific decision permits continuing within existing capabili
             latestGate = this.store.get(gate.id);
           if (
             latestGate.status !== "open" ||
+            latestGate.publicationIntentSha ||
             escalationMode(latestProject) !== "yolo" ||
             latestProject.status !== "running"
           )
@@ -2531,7 +3158,7 @@ Action retry: your specific decision permits continuing within existing capabili
       );
     } catch (error) {
       const current = this.store.get(gate.id);
-      if (current.status === "open")
+      if (current.status === "open" && !current.publicationIntentSha)
         this.store.patch(gate.id, {
           judgeStatus:
             escalationMode(this.store.get(project.id)) === "yolo" &&
@@ -2549,6 +3176,10 @@ Action retry: your specific decision permits continuing within existing capabili
       this.changed("judge-failed", { gateId: gate.id }, project.id);
     } finally {
       const current = this.store.get(gate.id);
+      if (current.status === "open" && current.publicationIntentSha &&
+          current.judgeStatus === "running" && current.judgeAttempts === ownedAttempt)
+        this.store.patch(gate.id, { judgeStatus: "pending", judgeRecoveryStatus: null,
+          judgeNextAttemptAt: null });
       if (current.status !== "open" && current.judgeStatus === "running")
         this.store.patch(gate.id, {
           judgeStatus: "answered",
@@ -2591,7 +3222,10 @@ Action retry: your specific decision permits continuing within existing capabili
     for (const project of this.store.all("project")) {
       if (!project.github || !project.branch || this.syncingProjects.has(project.id) ||
           (this.nextRemoteSync.get(project.id) ?? 0) > Date.now()) continue;
-      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" && (["open", "merging"].includes(g.status) || (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id))))
+      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" &&
+          (["open", "merging"].includes(g.status) ||
+           (g.importedFromGitHub && g.status === "resolved" && this.store.get(g.taskId).externalPr?.awaitingUpdate) ||
+           (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id))))
         void this.syncProject(project.id);
     }
     const limit = this.settings().concurrency;
@@ -2603,6 +3237,7 @@ Action retry: your specific decision permits continuing within existing capabili
       const judgeKey = "judge:" + project.id;
       if (this.busy.size < limit && !this.busy.has(judgeKey)) {
         const candidate = gates.find((gate) => {
+          if (gate.publicationIntentSha) return false;
           if (gate.judgeStatus === "running") return false;
           if (gate.judgeNextAttemptAt && gate.judgeNextAttemptAt > Date.now())
             return false;
@@ -2656,7 +3291,7 @@ Action retry: your specific decision permits continuing within existing capabili
         if (this.busy.size >= limit) break;
         const key = "task:" + task.id;
         if (
-          task.status !== "ready" ||
+          task.status !== "ready" || task.kind === "external-pr" ||
           this.busy.has(key) ||
           this.store.all("gate", project.id).some((gate) =>
             gate.taskId === task.id && gate.judgeStatus === "running" &&
