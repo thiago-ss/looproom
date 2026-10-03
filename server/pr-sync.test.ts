@@ -493,3 +493,122 @@ test("a PR merging across publication preserves remaining code for a newly revie
     assert.equal(f.store.all("approval").length, 0);
   } finally { await f.close(); }
 });
+
+async function mergedRepairFixture(status = "paused") {
+  const f = await fixture(status);
+  const repo = await createRepo(join(f.dir, "settle-repo"));
+  const tree = await createWorktree(repo.path, f.dir, f.task.id);
+  const finalHead = await git(tree.path, ["rev-parse", "HEAD"]);
+  f.store.patch(f.project.id, { path: repo.path });
+  f.store.patch(f.task.id, { status: "blocked", worktree: tree.path, branch: tree.branch,
+    prRepair: { gateId: f.gate.id, pr: url, expectedHead: head, base: "main", stage: "prepared" } });
+  f.store.patch(f.gate.id, { status: "superseded" });
+  const wait = f.store.put("gate", { projectId: f.project.id, taskId: f.task.id, status: "open",
+    type: "decision", awaitingCapability: true, judgeStatus: "answered", judgeNextAttemptAt: Date.now() + 600_000 });
+  f.engine.gitRunner = git;
+  // Observation fixture; use the local repository's own valid head as its base lookup.
+  const originalGit = f.engine.gitRunner;
+  f.engine.gitRunner = async (cwd, args) => args[0] === "fetch" ? "" :
+    args[0] === "rev-parse" && args[1] === "refs/remotes/origin/main" ? finalHead : originalGit(cwd, args);
+  f.setInfo({ headRefOid: finalHead });
+  return { ...f, repo, tree, finalHead, wait };
+}
+
+test("merged clean exact-head repair satisfies its capability wait without approvals or native runs", async () => {
+  const f = await mergedRepairFixture();
+  try {
+    await writeFile(join(f.tree.path, ".looproom-verification"), "derived evidence");
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "completed");
+    assert.equal(f.store.get(f.task.id).prRepair, null);
+    assert.equal(f.store.get(f.gate.id).status, "reconciled");
+    assert.equal(f.store.get(f.wait.id).status, "resolved");
+    assert.equal(f.store.get(f.wait.id).resolvedBy, "coordinator");
+    assert.equal(f.store.get(f.wait.id).brokerEvidence.headSha, f.finalHead);
+    assert.equal(f.store.get(f.project.id).status, "paused");
+    assert.equal(f.store.all("approval").length, 0);
+    assert.equal(f.store.all("run").length, 0);
+    const messages = f.store.all("message").length;
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.all("message").length, messages);
+  } finally { await f.close(); }
+});
+
+test("idle settlement retries an unchanged merged observation after a real active judge releases ownership", async () => {
+  const f = await mergedRepairFixture();
+  try {
+    const run = f.store.put("run", { projectId: f.project.id, taskId: f.task.id, role: "judge", status: "running" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    assert.equal(f.store.get(f.wait.id).status, "open");
+    assert.equal(f.store.get(f.task.id).prRepair.remoteObservation.state, "MERGED");
+    f.store.patch(run.id, { status: "completed" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "completed");
+    assert.equal(f.store.get(f.wait.id).status, "resolved");
+  } finally { await f.close(); }
+});
+
+test("unpublished repair files survive merge and queue fresh verification; unrelated and human gates survive", async () => {
+  const f = await mergedRepairFixture();
+  try {
+    await writeFile(join(f.tree.path, "unpublished.txt"), "preserve this work\n");
+    const human = f.store.put("gate", { projectId: f.project.id, taskId: f.task.id, type: "decision", status: "open" });
+    const other = f.store.put("gate", { projectId: f.project.id, taskId: "other-task", type: "decision", status: "open", awaitingCapability: true });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "ready");
+    assert.equal(f.store.get(f.task.id).followupPr.state, "MERGED");
+    assert.equal(f.store.get(f.wait.id).status, "resolved");
+    assert.equal(f.store.get(human.id).status, "open");
+    assert.equal(f.store.get(other.id).status, "open");
+    assert.equal(await readFile(join(f.tree.path, "unpublished.txt"), "utf8"), "preserve this work\n");
+    assert.equal(await git(f.tree.path, ["rev-parse", "HEAD"]), f.finalHead);
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("shutdown, human interruptions and invalid merged repair evidence cannot clear waits", async () => {
+  const f = await mergedRepairFixture();
+  try {
+    const interrupted = f.store.put("gate", { projectId: f.project.id, taskId: f.task.id, type: "interrupted", status: "open" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.wait.id).status, "open");
+    f.store.patch(interrupted.id, { status: "resolved" });
+    f.setInfo({ mergedAt: "not a date" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.wait.id).status, "open");
+    f.setInfo({ mergedAt: new Date().toISOString() });
+    const original = f.engine.gitRunner;
+    f.engine.gitRunner = async (cwd, args) => { const result = await original(cwd, args); if (args[0] === "status") f.engine.close(); return result; };
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.wait.id).status, "open");
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+  } finally { await f.close(); }
+});
+
+test("merged repair from the wrong worktree branch cannot complete or satisfy a capability wait", async () => {
+  const f = await mergedRepairFixture();
+  try {
+    f.store.patch(f.task.id, { branch: "wrong-branch" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    assert.equal(f.store.get(f.wait.id).status, "open");
+    assert.equal(f.store.get(f.gate.id).status, "superseded");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("judge gate ownership before its run record exists prevents merged repair settlement", async () => {
+  const f = await mergedRepairFixture();
+  try {
+    f.store.patch(f.wait.id, { judgeStatus: "running" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    assert.equal(f.store.get(f.wait.id).status, "open");
+    assert.equal(f.store.all("run").length, 0);
+    f.store.patch(f.wait.id, { judgeStatus: "answered" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "completed");
+    assert.equal(f.store.get(f.wait.id).status, "resolved");
+  } finally { await f.close(); }
+});

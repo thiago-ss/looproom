@@ -797,7 +797,7 @@ export class Engine extends EventEmitter {
       .slice(-6)
       .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     const result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
@@ -1093,23 +1093,71 @@ export class Engine extends EventEmitter {
     if (!this.closed) this.validateRemotePr(gate, project, info);
     return { gate, info };
   }
-  retireRepairPr(project: RecordData, task: RecordData, gate: RecordData, info: any) {
-    if (this.closed) return;
+  retireRepairPrRecords(project: RecordData, task: RecordData, gate: RecordData, info: any, message?: string) {
     const observedAt = new Date().toISOString();
     const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid,
-      base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
-    this.store.transaction(() => {
-      this.store.patch(gate.id, { remoteObservation: observation,
-        ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
-      this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
-        baseSha: task.prRepair?.baseSha ?? task.baseSha,
-        followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
-        feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
-      this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
-        text: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
-    });
+    base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
+    this.store.patch(gate.id, { remoteObservation: observation,
+      ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
+    this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
+      baseSha: task.prRepair?.baseSha ?? task.baseSha,
+      followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
+      feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
+    this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
+      text: message ?? `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
+    return observation;
+  }
+  retireRepairPr(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    if (this.closed) return;
+    const observation = this.store.transaction(() => this.retireRepairPrRecords(project, task, gate, info));
     if (info.state !== "MERGED") this.gate(project.id, "PR closed during integration", "Decide whether remaining work needs a fresh PR or should be discarded. The earlier PR was closed without merging.", "publication", task.id);
     this.changed("repair-pr-retired", { taskId: task.id, ...observation }, project.id);
+  }
+  async settleMergedRepair(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    // A repair may be waiting for a broker fact rather than running a worker.
+    // Observe even unchanged facts again: ownership can have become idle since the last poll.
+    const active = () => this.busy.has("task:" + task.id) ||
+      this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" &&
+        (g.judgeStatus === "running" || ["running", "verifying"].includes(g.judgeRecoveryStatus))) ||
+      this.store.all("run", project.id).some(r => r.taskId === task.id && r.status === "running");
+    if (info.state !== "MERGED" || active() || this.store.hasOpenInterruption(project.id)) return;
+    if (!task.worktree || !task.branch || task.prRepair?.gateId !== gate.id ||
+        task.prRepair.pr !== info.url || task.prRepair.base !== project.branch)
+      throw new Error("Merged repair has no matching owned task worktree.");
+    const common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    if (await realpath(await this.gitRunner(task.worktree, common)) !==
+        await realpath(await this.gitRunner(project.path, common)) ||
+        await this.gitRunner(task.worktree, ["branch", "--show-current"]) !== task.branch)
+      throw new Error("Merged repair worktree ownership changed.");
+    const head = await this.gitRunner(task.worktree, ["rev-parse", "HEAD"]);
+    const mergeHead = await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+    const dirty = await this.gitRunner(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]);
+    if (this.closed || active() || this.store.hasOpenInterruption(project.id)) return;
+    const current = this.store.get(task.id), currentGate = this.store.get(gate.id);
+    if (currentGate.status !== "superseded" || current.prRepair?.gateId !== gate.id ||
+        JSON.stringify(current.prRepair) !== JSON.stringify(task.prRepair)) return;
+    const included = head === info.headRefOid && !mergeHead && !dirty;
+    const answer = included
+      ? `GitHub reports PR #${info.number} merged at ${info.mergeCommit.oid}. Its final head ${info.headRefOid} exactly matches the clean owned worktree; no additional work remains. Merge actor is unverified; no approval was created.`
+      : `GitHub reports PR #${info.number} merged at ${info.mergeCommit.oid}. Preserve remaining work and reverify it against the latest base for a fresh PR; the earlier merge does not approve unpublished changes.`;
+    const resolvedAt = new Date().toISOString();
+    this.store.transaction(() => {
+      this.retireRepairPrRecords(project, current, currentGate, info, answer);
+      // Satisfy only machine capability waits in this task; preserve human/interruption gates.
+      for (const wait of this.store.all("gate", project.id).filter(g => g.taskId === task.id &&
+        g.status === "open" && g.awaitingCapability && !["pr", "interrupted"].includes(g.type))) {
+        this.store.patch(wait.id, { status: "resolved", answer, resolvedBy: "coordinator", resolvedAt,
+          awaitingCapability: false, judgeNextAttemptAt: null, brokerEvidence: this.store.get(gate.id).remoteObservation });
+        this.store.recordGateResponse(wait, answer, "coordinator", resolvedAt);
+      }
+      this.store.patch(task.id, included
+        ? { status: "completed", completedReason: "Clean owned worktree matches the externally merged final head.",
+            mergedBaseEvidence: { pr: info.url, headSha: head, mergedSha: info.mergeCommit.oid } }
+        : { status: "ready", attempt: 0, judgeRetries: 0 });
+    });
+    this.changed("merged-repair-settled", { taskId: task.id, included, headSha: head, mergedSha: info.mergeCommit.oid }, project.id);
+    this.tick();
+    await this.repairReconciledEvidence(this.store.get(gate.id));
   }
   async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
     try {
@@ -1176,6 +1224,7 @@ export class Engine extends EventEmitter {
               if (task.prRepair?.gateId === gate.id) this.store.patch(task.id, { prRepair: { ...task.prRepair, remoteObservation: observation } });
               this.changed("repair-pr-observed", { gateId: gate.id, ...observation }, projectId);
             }
+            await this.settleMergedRepair(project, this.store.get(task.id), this.store.get(gate.id), info);
             continue;
           }
           if (this.busy.has("task:" + task.id) || this.store.all("run", projectId).some(r => r.taskId === task.id && r.status === "running")) continue;
@@ -1916,6 +1965,9 @@ export class Engine extends EventEmitter {
               baselineVerification: t.baselineVerification,
               verificationEvaluatorHash: t.verificationEvaluatorHash,
               judgeRetries: t.judgeRetries,
+              pr: t.pr, sha: t.sha, prRepair: t.prRepair,
+              remotePrEvidence: this.store.all("gate", project.id).filter(g => g.type === "pr" && g.taskId === t.id)
+                .map(g => ({ id: g.id, pr: g.pr, sha: g.sha, status: g.status, remoteObservation: g.remoteObservation })),
             }
           : {}),
       }));
