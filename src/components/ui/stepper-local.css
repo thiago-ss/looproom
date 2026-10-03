@@ -1,0 +1,20 @@
+.stepper-content {
+  position: relative;
+  overflow: hidden;
+  transition: height 260ms ease;
+}
+.stepper-panel {
+  display: flow-root;
+  padding-bottom: 4px;
+  animation: stepper-arrive 260ms ease both;
+}
+.stepper-panel[data-direction="back"] { --stepper-shift: -12px; }
+.stepper-panel[data-direction="forward"] { --stepper-shift: 12px; }
+@keyframes stepper-arrive {
+  from { opacity: 0; transform: translateX(var(--stepper-shift)); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stepper-content { transition: none; }
+  .stepper-panel { animation: none; }
+}

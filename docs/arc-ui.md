@@ -35,7 +35,7 @@ For a change: search the intent, inspect the chosen component, get its install c
 | Skeleton | Lazy Memory content loading |
 | ToastStack | Escalation delivery, review action and dismissal; one provider |
 | Accordion | Expand actual recorded check output |
-| Stepper | Four-step setup progress; retained wizard content adapts the original ReactBits flow |
+| Stepper | Four-step setup progress; original Looproom wizard content |
 | ScrollArea | Native Goal viewport, forwarded ref, bottom-follow and user scroll tracking |
 | EmptyState | Empty project/review/work/Memory surfaces |
 | Alert | Setup, network, operation, folder, memory, agent and PR errors |
@@ -51,7 +51,7 @@ These are 25 applicable free components. Do not install unrelated controls just 
 
 Source hashes: `docs/arc-sources.json`. License: `src/components/arc/LICENSE`, MIT, Copyright (c) 2026 Elia Kuratli. The upstream license page was marked draft on capture. Preserve the notice in distributions. Registry JSON and MCP evidence are archived in the parent LLM wiki. Captured registry source matches installed code after removal of CSS comments; installed byte hashes are authoritative for this revision.
 
-Orbkit owns agent visual identities, DotMatrix owns operation indicators, and ReactBits StatusMark owns task state marks. Those domain visuals complement Arc controls. Native macOS folder selection/drop stays behind the existing local bridge. Human approval of every PR merge and model defaults are retained.
+Orbkit owns agent visual identities, original Looproom components own operation indicators and task state marks. Those domain visuals complement Arc controls. Native macOS folder selection/drop stays behind the existing local bridge. Human approval of every PR merge and model defaults are retained.
 
 ## Work expansion (2026-09-30)
 
