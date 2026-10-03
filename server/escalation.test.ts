@@ -42,6 +42,43 @@ async function fixture(run?: (options: any) => Promise<string>) {
   };
 }
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+test("YOLO authorizes an in-goal experiment continuation while retaining failed evidence and merge authority", async () => {
+  let prompt = "";
+  const f = await fixture(async (options) => {
+    prompt = options.prompt;
+    options.onThread("continuation-fixture");
+    return JSON.stringify({
+      action: "retry",
+      answer: "Start a distinct three-candidate round using a source-revision snapshot cache hypothesis. Preserve the three discarded candidates, frozen evaluator, budget and keep rule. Record new measurements before promotion.",
+      summary: "Another bounded round is within the same goal.",
+      sources: ["docs/verification-baseline.md"],
+    });
+  });
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo", bypass: false });
+    const discarded = [1, 2, 3].map((candidate) => ({ candidate, verdict: "discard" }));
+    const task = f.store.put("task", {
+      projectId: f.project.id, title: "Refresh experiment", status: "ready",
+      dependencies: [], acceptance: ["Three candidates per bounded round; frozen keep rule."],
+      discarded,
+    });
+    const gate = f.engine.gate(f.project.id, "Candidate budget exhausted", "Three candidates failed. May another round start?", "decision", task.id);
+    await f.engine.judge(f.store.get(f.project.id), gate);
+    assert.match(prompt, /authorizing another bounded experiment round/);
+    assert.match(prompt, /Explicit user limits and exclusions remain binding/);
+    assert.match(prompt, /Only PR merges require human approval of the exact revision/);
+    assert.equal(f.store.get(gate.id).status, "resolved");
+    assert.equal(f.store.get(gate.id).resolvedBy, "judge");
+    assert.equal(f.store.get(task.id).status, "ready");
+    assert.deepEqual(f.store.get(task.id).discarded, discarded);
+    assert.equal(f.store.all("approval").length, 0);
+    const pr = f.engine.gate(f.project.id, "Merge", "Exact revision", "pr", task.id);
+    await f.engine.judge(f.store.get(f.project.id), pr);
+    assert.equal(f.store.get(pr.id).status, "open");
+    assert.equal(f.store.get(pr.id).judgeSubmittedAt, undefined);
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
 test("blocked and dependent tasks wait while two independent tasks dispatch without duplicates", async () => {
   const f = await fixture();
   const held: (() => void)[] = [],

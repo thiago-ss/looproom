@@ -7,7 +7,7 @@ import {
   ShieldAlert,
   ExternalLink,
 } from "lucide-react";
-import { recordGateSnapshot } from "../lib/escalations";
+import { createChimeGate, groupEscalationNotices, recordGateSnapshot } from "../lib/escalations";
 import { useToastStack } from "./arc/toast-stack/toast-stack";
 import { Button } from "./ui/button";
 import { Switch } from "./ui/switch";
@@ -24,6 +24,7 @@ function preferences(): Preferences {
   }
 }
 let audio: AudioContext | undefined;
+const canAutomaticChime = createChimeGate(3000);
 export async function chime() {
   if (!("AudioContext" in window))
     throw new Error("Sound is unavailable in this browser.");
@@ -89,25 +90,22 @@ export function useEscalations(
     async function deliver() {
       const ids = seen();
       const previousSize = ids.size;
-      const fresh = recordGateSnapshot(gates!, ids).filter((gate) =>
-        needsHumanReview(
-          gate,
-          projects?.find((p) => p.id === gate.projectId) ?? {},
-        ),
-      );
+      const fresh = recordGateSnapshot(gates!, ids);
       if (ids.size !== previousSize) writeSeen(ids);
-      if (!fresh.length) return;
+      const notices = groupEscalationNotices(gates!, fresh, projects);
+      if (!notices.length) return;
       const prefs = preferences();
-      if (prefs.sound) void chime().catch(() => {});
-      for (const gate of fresh) {
-        const project =
-          projects?.find((p) => p.id === gate.projectId)?.name ?? "Project";
+      if (prefs.sound && canAutomaticChime(Date.now())) {
+        void chime().catch(() => {});
+      }
+      for (const notice of notices) {
         toast({
+          id: "escalations:" + notice.projectId,
           type: "warning",
-          title: gate.title ?? "Your decision is needed",
-          description: project + " · " + (gate.type ?? "Review"),
+          title: notice.title,
+          description: notice.projectName + " · " + notice.type,
           duration: 12000,
-          action: { label: "Review", onClick: () => open(gate.projectId) },
+          action: { label: "Review", onClick: () => open(notice.projectId) },
         });
         if (
           prefs.desktop &&
@@ -115,15 +113,15 @@ export function useEscalations(
           Notification.permission === "granted"
         ) {
           try {
-            const notification = new Notification("Looproom · " + project, {
-              body: gate.title ?? "Your decision is needed",
-              tag: gate.id,
+            const notification = new Notification("Looproom · " + notice.projectName, {
+              body: notice.title,
+              tag: "escalations:" + notice.projectId,
               icon: "/brand/looproom-mark.svg",
               silent: true,
             });
             notification.onclick = () => {
               window.focus();
-              open(gate.projectId);
+              open(notice.projectId);
               notification.close();
             };
           } catch {

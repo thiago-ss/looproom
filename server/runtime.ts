@@ -15,6 +15,7 @@ export class Runtime extends EventEmitter {
   seq = 0;
   userAgent?: string;
   starting?: Promise<void>;
+  private generation = 0;
   constructor(
     public binary: string,
     public home: string,
@@ -23,15 +24,19 @@ export class Runtime extends EventEmitter {
   }
   async start() {
     if (this.starting) return this.starting;
-    this.starting = this.connect().catch((error) => {
-      this.starting = undefined;
+    const generation = ++this.generation;
+    const connection = this.connect(generation).catch((error) => {
+      if (this.starting === connection) this.starting = undefined;
       throw error;
     });
-    return this.starting;
+    this.starting = connection;
+    return connection;
   }
-  private async connect() {
+  private async connect(generation: number) {
     await mkdir(this.home, { recursive: true, mode: 0o700 });
-    this.child = spawn(this.binary, ["app-server", "--listen", "stdio://"], {
+    if (generation !== this.generation)
+      throw new Error("Codex runtime closed during startup.");
+    const child = spawn(this.binary, ["app-server", "--listen", "stdio://"], {
       env: {
         PATH: process.env.PATH,
         HOME: process.env.HOME,
@@ -40,15 +45,20 @@ export class Runtime extends EventEmitter {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    this.child.stderr.on("data", () => {});
-    this.child.on("error", (error) => this.fail(error));
-    this.child.on("exit", () =>
-      this.fail(
-        new Error("Codex runtime disconnected. Reconnect from Settings."),
-      ),
-    );
-    const reader = createInterface({ input: this.child.stdout });
+    this.child = child;
+    child.stderr.on("data", () => {});
+    const disconnected = (error: Error) => {
+      // Events from an already replaced process must not disconnect its successor.
+      if (this.child === child) this.fail(error);
+    };
+    child.on("error", disconnected);
+    child.on("exit", () => disconnected(
+      new Error("Codex runtime disconnected. Reconnect from Settings."),
+    ));
+    child.stdin.on("error", disconnected);
+    const reader = createInterface({ input: child.stdout });
     reader.on("line", (line) => {
+      if (this.child !== child) return;
       let message: any;
       try {
         message = JSON.parse(line);
@@ -94,6 +104,8 @@ export class Runtime extends EventEmitter {
       clientInfo: { name: "looproom", title: "Looproom", version: "0.1.0" },
       capabilities: { experimentalApi: true },
     });
+    if (this.child !== child || generation !== this.generation)
+      throw new Error("Codex runtime disconnected during startup.");
     this.userAgent = initialized.userAgent;
     this.send({ method: "initialized" });
   }
@@ -101,6 +113,8 @@ export class Runtime extends EventEmitter {
     this.child?.stdin.write(JSON.stringify(message) + "\n");
   }
   request(method: string, params: any = {}): Promise<any> {
+    if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null || this.child.stdin.destroyed)
+      return Promise.reject(new Error("Codex runtime disconnected. Reconnect from Settings."));
     const id = ++this.seq;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -257,6 +271,9 @@ export class Runtime extends EventEmitter {
     return this.request("turn/interrupt", { threadId, turnId });
   }
   close() {
-    this.child?.kill("SIGTERM");
+    this.generation++;
+    const child = this.child;
+    this.fail(new Error("Codex runtime closed."));
+    child?.kill("SIGTERM");
   }
 }

@@ -1,0 +1,116 @@
+{
+  "benchmark": "local API state and SSE fixture",
+  "baselineRevision": "8ca5f69",
+  "samplesPerRun": 40,
+  "sseClientsPerRun": 32,
+  "dataset": {
+    "projects": 4,
+    "tasks": 1000,
+    "messages": 1000,
+    "runs": 1000,
+    "storedEvents": 2000,
+    "returnedEvents": 80
+  },
+  "runs": [
+    {
+      "source": "state-before.json",
+      "variant": "original",
+      "stateMedianMs": 7.785,
+      "stateP95Ms": 8.911,
+      "sseMedianMs": 162.245,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": true
+    },
+    {
+      "source": "state-after-cache-1.json",
+      "variant": "modified",
+      "stateMedianMs": 2.925,
+      "stateP95Ms": 12.377,
+      "sseMedianMs": 179.067,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    },
+    {
+      "source": "state-after-cache-2.json",
+      "variant": "modified",
+      "stateMedianMs": 2.939,
+      "stateP95Ms": 7.684,
+      "sseMedianMs": 171.114,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    },
+    {
+      "source": "state-after-cache-3.json",
+      "variant": "modified",
+      "stateMedianMs": 2.214,
+      "stateP95Ms": 3.736,
+      "sseMedianMs": 179.409,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    },
+    {
+      "source": "state-before-2.json",
+      "variant": "original",
+      "stateMedianMs": 8.696,
+      "stateP95Ms": 9.617,
+      "sseMedianMs": 165.078,
+      "stateBytes": 402465,
+      "notifiedClients": 32,
+      "listenerWarning": true
+    },
+    {
+      "source": "state-after-cache-4.json",
+      "variant": "modified",
+      "stateMedianMs": 1.052,
+      "stateP95Ms": 1.694,
+      "sseMedianMs": 163.477,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    },
+    {
+      "source": "state-before-3.json",
+      "variant": "original",
+      "stateMedianMs": 7.963,
+      "stateP95Ms": 8.593,
+      "sseMedianMs": 163.138,
+      "stateBytes": 402465,
+      "notifiedClients": 32,
+      "listenerWarning": true
+    },
+    {
+      "source": "state-after-cache-5.json",
+      "variant": "modified",
+      "stateMedianMs": 1.775,
+      "stateP95Ms": 4.983,
+      "sseMedianMs": 172.693,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    },
+    {
+      "source": "state-after-final.json",
+      "variant": "modified",
+      "stateMedianMs": 2.285,
+      "stateP95Ms": 4.648,
+      "sseMedianMs": 170.559,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    },
+    {
+      "source": "state-after-final-2.json",
+      "variant": "modified",
+      "stateMedianMs": 2.918,
+      "stateP95Ms": 5.454,
+      "sseMedianMs": 180.016,
+      "stateBytes": 402449,
+      "notifiedClients": 32,
+      "listenerWarning": false
+    }
+  ]
+}

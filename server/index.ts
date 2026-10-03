@@ -50,7 +50,8 @@ const defaults = JSON.parse(
 );
 try {
   store.get("settings");
-} catch {
+} catch (error) {
+  if (!(error instanceof Error) || error.message !== "Record not found") throw error;
   const profile = (name: string) => ({
     model: defaults.profiles[name].model,
     effort: defaults.profiles[name].reasoningEffort,
@@ -132,6 +133,7 @@ let runtimeState: any = {
   models: [],
   error: null,
 };
+let runtimeRevision = 0;
 async function refreshRuntime() {
   try {
     const [account, models] = await Promise.all([
@@ -152,6 +154,7 @@ async function refreshRuntime() {
       error: error instanceof Error ? error.message : String(error),
     };
   }
+  runtimeRevision++;
   engine.emit("change");
 }
 runtime.on("notification", (message) => {
@@ -160,13 +163,22 @@ runtime.on("notification", (message) => {
 });
 runtime.on("disconnected", (error) => {
   runtimeState = { ...runtimeState, connected: false, error: error.message };
+  runtimeRevision++;
   engine.emit("change");
 });
 app.get("/api/health", (_req, res) =>
   res.json({ app: "looproom", status: "ok", root: appRoot, dataDir: canonicalDataDir }),
 );
-app.get("/api/state", (_req, res) =>
-  res.json({
+let stateCache:
+  | { storeRevision: number; runtimeRevision: number; json: string }
+  | undefined;
+function stateJson() {
+  if (
+    stateCache?.storeRevision === store.revision &&
+    stateCache.runtimeRevision === runtimeRevision
+  )
+    return stateCache.json;
+  const json = JSON.stringify({
     projects: store.all("project"),
     tasks: store.all("task"),
     gates: store.all("gate"),
@@ -177,10 +189,47 @@ app.get("/api/state", (_req, res) =>
     events: store.events(),
     settings: store.get("settings"),
     runtime: runtimeState,
-  }),
-);
+  });
+  stateCache = { storeRevision: store.revision, runtimeRevision, json };
+  return json;
+}
+app.get("/api/state", (_req, res) => res.type("json").send(stateJson()));
+// All SSE clients observe the same invalidation signal. One engine listener and
+// one heartbeat suffice regardless of the number of open browser windows.
+const eventClients = new Set<express.Response>();
+let eventHeartbeat: ReturnType<typeof setInterval> | undefined;
+let eventFlush: ReturnType<typeof setTimeout> | undefined;
+function writeEvent(res: express.Response, event: string) {
+  if (res.destroyed || !res.write(event)) {
+    removeEventClient(res);
+    res.destroy(); // A slow client reconnects and reads a fresh state snapshot.
+  }
+}
+function broadcastEvent(event: string) {
+  for (const client of eventClients) writeEvent(client, event);
+}
+function scheduleEvent() {
+  if (eventFlush) return;
+  eventFlush = setTimeout(() => {
+    eventFlush = undefined;
+    broadcastEvent("data: changed\n\n");
+  }, 150);
+}
+function removeEventClient(res: express.Response) {
+  eventClients.delete(res);
+  if (eventClients.size) return;
+  engine.off("change", scheduleEvent);
+  if (eventHeartbeat) clearInterval(eventHeartbeat);
+  if (eventFlush) clearTimeout(eventFlush);
+  eventHeartbeat = undefined;
+  eventFlush = undefined;
+}
 app.get("/api/events", (req, res) => {
-  if (!req.headers.cookie?.includes("looproom_session=" + session)) {
+  if (
+    !req.headers.cookie
+      ?.split(";")
+      .some((cookie) => cookie.trim() === "looproom_session=" + session)
+  ) {
     res.status(403).end();
     return;
   }
@@ -188,22 +237,16 @@ app.get("/api/events", (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
-  let pending = false;
-  const listener = () => {
-    if (pending) return;
-    pending = true;
-    setTimeout(() => {
-      pending = false;
-      if (!res.destroyed) res.write("data: changed\n\n");
-    }, 150);
-  };
-  const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 15000);
-  engine.on("change", listener);
-  res.write("data: connected\n\n");
-  req.on("close", () => {
-    clearInterval(heartbeat);
-    engine.off("change", listener);
-  });
+  if (!eventClients.size) {
+    engine.on("change", scheduleEvent);
+    eventHeartbeat = setInterval(
+      () => broadcastEvent(": heartbeat\n\n"),
+      15000,
+    );
+  }
+  eventClients.add(res);
+  res.once("close", () => removeEventClient(res));
+  writeEvent(res, "data: connected\n\n");
 });
 app.post(
   "/api/runtime/connect",
@@ -299,7 +342,7 @@ app.post(
   route(async (req, res) => {
     const action = z.enum(["start", "pause", "stop"]).parse(req.body.action);
     const id = String(req.params.id),
-      project = store.get(id);
+      project = store.get(id, "project");
     if (action === "start") {
       if (store.hasOpenInterruption(id))
         throw new Error("Review and resolve the interrupted work in Review before starting this project.");
@@ -317,7 +360,7 @@ app.post(
         await runtime.interrupt(run.threadId, run.turnId).catch(() => {});
     }
     engine.changed("project-" + action, {}, id);
-    res.json(store.get(id));
+    res.json(store.get(id, "project"));
   }),
 );
 app.post(
@@ -325,7 +368,7 @@ app.post(
   route((req, res) => {
     const text = z.string().trim().min(1).max(12000).parse(req.body.text),
       id = String(req.params.id);
-    const project = store.get(id);
+    const project = store.get(id, "project");
     if (project.status === "idle")
       store.patch(id, { status: "running", planned: false });
     store.put("message", {
@@ -392,7 +435,7 @@ app.post(
       })
       .parse(req.body);
     const projectId = String(req.params.id),
-      previous = store.get(projectId);
+      previous = store.get(projectId, "project");
     const updated = store.transaction(() => {
       const record = store.patch(projectId, settings);
       if (escalationMode(previous) !== escalationMode(record)) {
@@ -427,7 +470,7 @@ app.get(
 app.get(
   "/api/gates/:id/diff",
   route(async (req, res) => {
-    const gate = store.get(String(req.params.id));
+    const gate = store.get(String(req.params.id), "gate");
     if (gate.type !== "pr") throw new Error("Not a PR gate.");
     res.json({ diff: await gh(["pr", "diff", gate.pr]) });
   }),
@@ -440,6 +483,19 @@ app.post(
       .regex(/^[a-f0-9]{40}$/)
       .parse(req.body.sha);
     await engine.approve(String(req.params.id), sha);
+    res.json({ ok: true });
+  }),
+);
+app.post(
+  "/api/gates/:id/changes",
+  route(async (req, res) => {
+    const body = z
+      .object({
+        sha: z.string().regex(/^[a-f0-9]{40}$/),
+        answer: z.string().trim().min(1).max(6000),
+      })
+      .parse(req.body);
+    await engine.requestChanges(String(req.params.id), body.sha, body.answer);
     res.json({ ok: true });
   }),
 );
@@ -466,8 +522,8 @@ app.post(
 app.post(
   "/api/gates/:id/judge",
   route((req, res) => {
-    const gate = store.get(String(req.params.id)),
-      project = store.get(gate.projectId);
+    const gate = store.get(String(req.params.id), "gate"),
+      project = store.get(gate.projectId, "project");
     if (gate.status !== "open")
       throw new Error("Judge drafting is unavailable for this gate.");
     if (gate.judgeStatus === "running")
@@ -483,9 +539,11 @@ app.post(
     res.json({ ok: true });
   }),
 );
-app.get("/api/projects/:id/memory", (req, res) =>
-  res.json(store.search(String(req.params.id), String(req.query.q ?? ""))),
-);
+app.get("/api/projects/:id/memory", (req, res) => {
+  const projectId = String(req.params.id);
+  store.get(projectId, "project");
+  res.json(store.search(projectId, String(req.query.q ?? "")));
+});
 app.get("/api/verification/:id", route(async (req, res) => {
   const id = String(req.params.id);
   if (!/^[0-9a-f-]{36}$/i.test(id) ||
@@ -501,7 +559,7 @@ app.get("/api/verification/:id", route(async (req, res) => {
 app.get(
   "/api/tasks/:id/diff",
   route(async (req, res) => {
-    const task = store.get(String(req.params.id));
+    const task = store.get(String(req.params.id), "task");
     res.json({
       diff: task.worktree ? await git(task.worktree, ["diff", "HEAD"]) : "",
     });
@@ -548,14 +606,23 @@ server.on("error", (error) => {
   ownership.close();
   process.exit(1);
 });
+let shuttingDown = false;
 function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
   engine.close();
+  for (const client of eventClients) client.end();
+  const forceConnections = setTimeout(() => {
+    console.error("Looproom shutdown: closing stalled HTTP connections.");
+    server.closeAllConnections();
+  }, 30_000);
+  forceConnections.unref();
   server.close(() => {
+    clearTimeout(forceConnections);
     store.close();
     ownership.close();
     process.exit(0);
   });
-  setTimeout(() => process.exit(0), 2000).unref();
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

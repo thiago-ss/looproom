@@ -7,15 +7,27 @@ import { dirname } from "node:path";
 export type RecordData = { id: string; [key: string]: any };
 export class Store {
   db: DatabaseSync;
+  revision = 0;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
-    this.db
-      .exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1);
-      CREATE INDEX IF NOT EXISTS record_kind ON records(kind);
-      CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, project_id UNINDEXED, title, content);`);
+    try {
+      // A failed integrity check must not be followed by schema writes or
+      // default-setting initialization on a damaged existing database.
+      const results = this.db.prepare("PRAGMA quick_check").all() as {
+        quick_check: string;
+      }[];
+      if (results.length !== 1 || results[0].quick_check !== "ok")
+        throw new Error("Looproom database integrity check failed.");
+      this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+        CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS record_kind ON records(kind);
+        CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, project_id UNINDEXED, title, content);`);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
   all(kind: string, projectId?: string): RecordData[] {
     const rows = this.db
@@ -25,11 +37,12 @@ export class Store {
       .map((row) => JSON.parse(row.data))
       .filter((row) => !projectId || row.projectId === projectId);
   }
-  get(id: string): RecordData {
+  get(id: string, kind?: string): RecordData {
     const row = this.db
-      .prepare("SELECT data FROM records WHERE id=?")
-      .get(id) as { data: string } | undefined;
+      .prepare("SELECT data,kind FROM records WHERE id=?")
+      .get(id) as { data: string; kind: string } | undefined;
     if (!row) throw new Error("Record not found");
+    if (kind && row.kind !== kind) throw new Error("Record not found");
     return JSON.parse(row.data);
   }
   put(
@@ -43,6 +56,7 @@ export class Store {
         "INSERT INTO records(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,version=records.version+1",
       )
       .run(id, kind, JSON.stringify(record));
+    this.revision++;
     return record;
   }
   patch(id: string, changes: Record<string, any>): RecordData {
@@ -50,6 +64,7 @@ export class Store {
     this.db
       .prepare("UPDATE records SET data=?,version=version+1 WHERE id=?")
       .run(JSON.stringify(record), id);
+    this.revision++;
     return record;
   }
   transaction<T>(fn: () => T): T {
@@ -74,6 +89,7 @@ export class Store {
         JSON.stringify(data),
         new Date().toISOString(),
       );
+    this.revision++;
   }
   events(projectId?: string) {
     const rows = this.db

@@ -75,7 +75,7 @@ npm run check:ui
 npm run build
 ```
 
-Forty-two tests cover scoped gates, concurrent reservation, attributed judge replies and preserved human merge authority, persistence, scoped search, transaction rollback, crash recovery, worktree preservation/reuse, DAG validation, transport final-message handling, bounded repair, local API authority, revision/check preflight and native macOS sandbox enforcement. Coordinator integration uses a fixture runtime; it makes no model calls or GitHub mutations.
+The test suite covers scoped gates, concurrent dispatch, attributed judge replies, human-only revision approval, persistence, crash recovery, transport lifecycle, local API authority and native macOS sandbox enforcement. Coordinator integration uses fixture runtimes and GitHub responses; it makes no live GitHub mutations. See the [2026-10-02 end-to-end and performance report](docs/e2e-performance.md) for the fixture, measured results and limits.
 
 ## Remaining work
 
