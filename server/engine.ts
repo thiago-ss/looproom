@@ -1,13 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdir, readFile, writeFile, realpath, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, realpath, rename, rm, link, lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
 import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
-import { runVerification } from "./verification.ts";
+import { runVerification, sourceFingerprint } from "./verification.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
 const TaskPlan = z.object({
@@ -17,21 +17,30 @@ const TaskPlan = z.object({
   dependencies: z.array(z.number().int()),
   kind: z.enum(["implementation", "research"]),
 });
+const Claims = z.array(z.object({
+  key: z.string().trim().min(1),
+  statement: z.string().trim().min(1),
+  sources: z.array(z.string()).min(1),
+  relation: z.enum(["new", "supports", "contradicts", "supersedes"]).default("new"),
+})).default([]);
 const Plan = z.object({
   summary: z.string(),
   gate: z.string(),
   tasks: z.array(TaskPlan).max(6),
   sources: z.array(z.string()),
+  claims: Claims,
 });
 const Result = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   humanQuestion: z.string(),
+  claims: Claims,
 });
 const Review = z.object({
   verdict: z.enum(["pass", "changes", "gate"]),
   summary: z.string(),
   sources: z.array(z.string()),
+  claims: Claims,
 });
 const BaselineRevision = z.object({
   baselineSetupOnly: z.boolean(),
@@ -50,6 +59,25 @@ const Judgment = z.object({
     .max(3)
     .default([]),
 });
+type WikiLogEntry = { runId: string; pageId: string; capturedAt: string; text: string };
+
+function parseWikiLog(content: string): WikiLogEntry[] {
+  const header = "# Memory log\n";
+  if (!content.startsWith(header)) throw new Error("Unparseable wiki log header.");
+  const body = content.slice(header.length);
+  if (!body) return [];
+  const starts = [...body.matchAll(/\n## \[/g)].map((match) => match.index);
+  if (!starts.length || starts[0] !== 0) throw new Error("Unparseable wiki log entry.");
+  return starts.map((start, index) => {
+    const text = body.slice(start, starts[index + 1] ?? body.length);
+    const match = /^\n## \[([^\]\n]+)\] outcome \| ([^\n]+)\n\nRun ([A-Za-z0-9:_-]+); page ([A-Za-z0-9:_-]+)\.\n$/.exec(text);
+    if (!match || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(match[1]) ||
+        !Number.isFinite(Date.parse(match[1])) || new Date(match[1]).toISOString() !== match[1])
+      throw new Error("Unparseable wiki log entry.");
+    return { capturedAt: match[1], runId: match[3], pageId: match[4], text };
+  });
+}
+
 export function validateDependencies(tasks: { dependencies: number[] }[]) {
   const active = new Set<number>(),
     done = new Set<number>();
@@ -72,13 +100,32 @@ export function validateDependencies(tasks: { dependencies: number[] }[]) {
   }
   tasks.forEach((_, i) => visit(i));
 }
-const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
+const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Where the output schema offers claims, use a stable subject key, precise statement, and source references; explicitly mark contradictions or supersession. An earlier agent report is never independent support. Omit claims if no specific sourced claim can be extracted. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
+
+function autonomyPolicy(project: RecordData) {
+  if (escalationMode(project) !== "yolo")
+    return `Autonomy mode: ${escalationMode(project)}. Preserve the configured human/draft submission rules.`;
+  return `Autonomy mode: YOLO. The judge owns routine decisions within the user's goal, including selecting alternatives and authorizing another bounded experiment round. Planner-created candidate and retry limits bound each round; exhausting them is not a request for human permission. Preserve the exhausted round's measurements and discard decisions, record a distinct next round with a concrete hypothesis and unchanged measurement/runtime budget, and send the originating agent a specific retry instruction. Never relabel a failed candidate as successful. Explicit user limits and exclusions remain binding; do not weaken acceptance thresholds, change a frozen evaluator, invent capabilities or expand credentials/sandbox access. Only PR merges require human approval of the exact revision. A real unavailable prerequisite can remain a machine blocker while independent work continues. Workers escalate routine decisions to the judge, not the human.`;
+}
 
 export class Engine extends EventEmitter {
   busy = new Set<string>();
+  prDecisionBusy = new Set<string>();
+  githubRunner = gh;
   documentation = new Map<string, Promise<void>>();
   timer?: ReturnType<typeof setInterval>;
+  closed = false;
+  syncingProjects = new Set<string>();
+  nextRemoteSync = new Map<string, number>();
+  gitRunner = git;
   verificationRunner = runVerification;
+  mergeBroker = gh;
+  get github() { return this.mergeBroker; }
+  set github(broker: typeof gh) { this.mergeBroker = broker; }
+  wikiFailureStage?: string;
+  wikiCheckpoint(stage: string) {
+    if (this.wikiFailureStage === stage) throw new Error("Injected wiki failure: " + stage);
+  }
   constructor(
     public store: Store,
     public runtime: Runtime,
@@ -99,6 +146,7 @@ export class Engine extends EventEmitter {
   }
   close() {
     clearInterval(this.timer);
+    this.closed = true;
     this.runtime.close();
   }
   gate(
@@ -147,6 +195,7 @@ export class Engine extends EventEmitter {
     task?: RecordData,
     write = false,
   ) {
+    if (task?.worktree) await this.handoffBaselineEvidence(project, task);
     const settings = this.settings(),
       profile =
         role === "orchestrator"
@@ -176,6 +225,8 @@ export class Engine extends EventEmitter {
       output: "",
       createdAt: new Date().toISOString(),
     });
+    if (role === "implementation" && task)
+      this.store.patch(task.id, { implementationRunId: run.id });
     this.changed(
       "run-started",
       { runId: run.id, role, taskId: task?.id },
@@ -189,7 +240,7 @@ export class Engine extends EventEmitter {
         effort: profile.effort,
         cwd: task?.worktree ?? project.path,
         write,
-        prompt: WORKFLOW + "\n\n" + prompt,
+        prompt: WORKFLOW + "\n\n" + autonomyPolicy(project) + "\n\n" + prompt,
         schema: z.toJSONSchema(schema),
         onThread: (threadId, metadata) =>
           this.store.patch(run.id, { threadId, runtime: metadata }),
@@ -234,29 +285,47 @@ export class Engine extends EventEmitter {
         },
       });
       const parsed = schema.parse(JSON.parse(output));
-      this.store.patch(run.id, {
-        status: "completed",
-        output,
-        finishedAt: new Date().toISOString(),
+      this.store.transaction(() => {
+        this.store.patch(run.id, {
+          status: "completed",
+          output,
+          finishedAt: new Date().toISOString(),
+        });
+        this.wikiCheckpoint("completed");
+        this.prepareWikiIntent(project.id, role + " outcome", parsed.summary,
+          parsed.sources ?? [], run.id, parsed.claims ?? []);
       });
-      await this.document(
-        project.id,
-        role + " outcome",
-        parsed.summary,
-        parsed.sources ?? [],
-        run.id,
-      );
+      try {
+        await this.document(
+          project.id,
+          role + " outcome",
+          parsed.summary,
+          parsed.sources ?? [],
+          run.id,
+          parsed.claims ?? [],
+        );
+      } catch (error) {
+        // Completion and the intent are durable. Restart can replay the wiki;
+        // this filesystem failure must not become a task decision gate.
+        this.store.patch("wiki-ingest:" + run.id, {
+          replayError: error instanceof Error ? error.message : String(error),
+        });
+        this.changed("wiki-recovery-needed", { runId: run.id }, project.id);
+      }
       this.changed("run-completed", { runId: run.id, role }, project.id);
       return parsed;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const paused = this.store.get(project.id).status !== "running";
-      this.store.patch(run.id, {
-        status: paused ? "interrupted" : "failed",
-        error: message,
-        output: stream,
-        finishedAt: new Date().toISOString(),
-      });
+      // The agent outcome is durable once its ingestion intent commits. A later
+      // filesystem failure must not turn that completed run into a failed run.
+      if (!this.store.all("wiki-ingest").some((intent) => intent.runId === run.id))
+        this.store.patch(run.id, {
+          status: paused ? "interrupted" : "failed",
+          error: message,
+          output: stream,
+          finishedAt: new Date().toISOString(),
+        });
       if (paused && task && role !== "judge")
         this.store.patch(task.id, { status: "ready" });
       else if (
@@ -279,18 +348,54 @@ export class Engine extends EventEmitter {
       throw error;
     }
   }
+  async handoffBaselineEvidence(project: RecordData, task: RecordData) {
+    const baseline = this.store.get(project.id, "project").refreshBaseline;
+    if (!task.worktree || baseline?.phase !== "frozen" || !baseline.reportId ||
+        baseline.ownerTaskId === task.id) return;
+    if (!/^[a-f0-9-]{36}$/.test(baseline.reportId))
+      throw new Error("Invalid baseline report identity.");
+    const owner = this.store.get(baseline.ownerTaskId, "task");
+    if (owner.projectId !== project.id || task.projectId !== project.id)
+      throw new Error("Baseline evidence must belong to the same project.");
+    const source = join(this.dataDir, "verification", baseline.reportId + ".json");
+    const canonical = await realpath(source).catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!canonical)
+      throw new Error("Frozen baseline report is missing from coordinator storage. Restore the recorded report before comparing candidates; do not invent or replace its measurements.");
+    if (canonical !== join(await realpath(this.dataDir), "verification", baseline.reportId + ".json"))
+      throw new Error("Baseline report must not be a symlink.");
+    const bytes = await readFile(source, "utf8"), report = JSON.parse(bytes);
+    if (report.id !== baseline.reportId || report.sourceHash !== baseline.measurementSourceHash ||
+        report.sourceUnchanged !== true || !report.results?.some((result: any) =>
+          result.command === "node --import tsx scripts/measure-refresh.ts" && result.code === 0 && !result.timedOut))
+      throw new Error("Baseline report does not match the frozen measurement evidence.");
+    const directory = join(task.worktree, ".looproom-verification");
+    await mkdir(directory, { recursive: true });
+    if (await realpath(directory) !== join(await realpath(task.worktree), ".looproom-verification"))
+      throw new Error("Verification evidence directory must not be a symlink.");
+    const target = join(directory, report.id + ".json");
+    await writeFile(target, bytes, { flag: "wx" }).catch(async (error) => {
+      if (error.code !== "EEXIST") throw error;
+      if (await realpath(target) !== join(await realpath(directory), report.id + ".json") ||
+          await readFile(target, "utf8") !== bytes)
+        throw new Error("Existing baseline report differs from the coordinator evidence.");
+    });
+  }
   async document(
     projectId: string,
     title: string,
     content: string,
     sources: string[],
     runId: string,
+    claims: any[] = [],
   ) {
     const previous = this.documentation.get(projectId) ?? Promise.resolve();
     const next = previous
       .catch(() => {})
       .then(() =>
-        this.writeDocument(projectId, title, content, sources, runId),
+        this.writeDocument(projectId, title, content, sources, runId, claims),
       );
     this.documentation.set(projectId, next);
     try {
@@ -306,41 +411,187 @@ export class Engine extends EventEmitter {
     content: string,
     sources: string[],
     runId: string,
+    claims: any[] = [],
   ) {
+    const intent = this.prepareWikiIntent(projectId, title, content, sources, runId, claims);
+    this.wikiCheckpoint("intent");
+    await this.replayDocument(intent);
+  }
+  prepareWikiIntent(projectId: string, title: string, content: string,
+    sources: string[], runId: string, claims: any[] = []) {
+    const intentId = "wiki-ingest:" + runId;
+    let intent: RecordData;
+    try {
+      intent = this.store.get(intentId);
+      if (intent.projectId !== projectId || intent.title !== title || intent.content !== content ||
+          JSON.stringify(intent.sources) !== JSON.stringify(sources) ||
+          JSON.stringify(intent.claims) !== JSON.stringify(claims))
+        throw new Error("Wiki ingestion intent differs from the existing run.");
+    } catch (error) {
+      if (error instanceof Error && error.message !== "Record not found") throw error;
+      intent = this.store.put("wiki-ingest", {
+        projectId, title, content, sources, claims, runId,
+        raw: JSON.stringify(this.store.get(runId), null, 2),
+        taskId: this.store.get(runId).taskId,
+        capturedAt: new Date().toISOString(),
+      }, intentId);
+    }
+    return intent;
+  }
+  prEvidenceRun(gate: RecordData, headSha: string, strict = false) {
+    const matches = (pr: any) => pr?.url === gate.pr && pr.headSha === headSha;
+    const intents = this.store.all("wiki-ingest", gate.projectId);
+    const pages = this.store.all("memory", gate.projectId);
+    const candidates = this.store.all("run", gate.projectId).filter((run) =>
+      run.taskId === gate.taskId && run.role === "implementation" && run.status === "completed" &&
+      (matches(run.prEvidence) || intents.some((intent) => intent.runId === run.id && matches(intent.pendingEvidence?.prEvidence)) ||
+        pages.some((page) => page.runId === run.id && matches(page.prEvidence))));
+    const origin = gate.mergeAttempt?.prRunId ?? gate.prRunId;
+    const run = origin ? candidates.find((run) => run.id === origin) : candidates.length === 1 ? candidates[0] : undefined;
+    if (strict && !run && (origin || candidates.length > 1))
+      throw new Error("Originating PR evidence run is missing or ambiguous; review attribution before merging.");
+    return run;
+  }
+  async repairReconciledEvidence(gate: RecordData) {
+    const attempt = gate.remoteObservation ? {
+      pr: gate.remoteObservation.url, reviewedSha: gate.remoteObservation.headSha,
+    } : gate.mergeAttempt;
+    if (gate.type !== "pr" || gate.status !== "reconciled" || !attempt ||
+        gate.pr !== attempt.pr || !gate.mergedSha) return;
+    // A reconciled remote fact is not a human approval. Attribute only records
+    // already tied to this exact PR/head, never the task's newest retry.
+    const matches = (pr: any) => pr?.url === attempt.pr && pr.headSha === attempt.reviewedSha;
+    const run = this.prEvidenceRun(gate, attempt.reviewedSha);
+    if (!run) return;
+    {
+      const intent = this.store.all("wiki-ingest", gate.projectId).find((item) => item.runId === run.id);
+      const page = this.store.all("memory", gate.projectId).find((item) => item.runId === run.id);
+      const evidence = [run.prEvidence, intent?.pendingEvidence?.prEvidence, page?.prEvidence].find(matches);
+      if (!evidence) return;
+      const prEvidence = { ...evidence, status: "merged", mergedSha: gate.mergedSha,
+        mergeActor: "unverified", reconciledAt: gate.resolvedAt };
+      this.store.transaction(() => {
+        if (!run.prEvidence || matches(run.prEvidence)) this.store.patch(run.id, { prEvidence });
+        if (intent && (!intent.pendingEvidence?.prEvidence || matches(intent.pendingEvidence.prEvidence)))
+          this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence } });
+        if (page && (!page.prEvidence || matches(page.prEvidence))) this.store.patch(page.id, { prEvidence });
+      });
+      if (page && (!page.prEvidence || matches(page.prEvidence)))
+        await this.writeIfChanged(join(this.dataDir, "wiki", gate.projectId, page.id + ".md"),
+          this.pageMarkdown(this.store.get(page.id)));
+    }
+  }
+  async recoverWiki() {
+    // The durable reconciled gate also repairs a crash before derived writes.
+    for (const gate of this.store.all("gate")) await this.repairReconciledEvidence(gate);
+    // Repair approvals written before merged PR evidence was stored on intents.
+    // Approval and gate records are authoritative for this derived evidence.
+    for (const approval of this.store.all("approval")) {
+      const gate = this.store.get(approval.gateId);
+      if (gate.status !== "approved" || gate.reviewedSha !== approval.reviewedSha ||
+          gate.mergedSha !== approval.mergedSha) continue;
+      const run = this.prEvidenceRun(gate, approval.reviewedSha);
+      const intent = run && this.store.all("wiki-ingest", approval.projectId).find((item) => item.runId === run.id);
+      if (run) this.store.patch(run.id, { prEvidence: { ...run.prEvidence, url: gate.pr,
+        headSha: approval.reviewedSha, status: "merged", reviewedSha: approval.reviewedSha,
+        mergedSha: approval.mergedSha } });
+      if (intent && intent.pendingEvidence.prEvidence.status !== "merged")
+        this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence,
+          prEvidence: { ...intent.pendingEvidence.prEvidence, status: "merged",
+            reviewedSha: approval.reviewedSha, mergedSha: approval.mergedSha } } });
+    }
+    const projects = new Map<string, Set<string>>();
+    for (const intent of this.store.all("wiki-ingest")) {
+      await this.replayDocument(intent, true);
+      const current = projects.get(intent.projectId) ?? new Set<string>();
+      current.add("memory:" + intent.runId);
+      projects.set(intent.projectId, current);
+    }
+    for (const [projectId, current] of projects)
+      await this.reconcileWiki(projectId, current);
+    // Older runs may have a Memory page but no ingestion intent. The approval
+    // record is durable; reconcile its derived page without touching raw files.
+    for (const approval of this.store.all("approval")) {
+      const gate = this.store.get(approval.gateId);
+      if (gate.status !== "approved" || gate.reviewedSha !== approval.reviewedSha ||
+          gate.mergedSha !== approval.mergedSha) continue;
+      const run = this.prEvidenceRun(gate, approval.reviewedSha);
+      const page = run && this.store.all("memory", approval.projectId).find((item) =>
+        item.runId === run.id && item.prEvidence?.url === gate.pr && item.prEvidence?.headSha === approval.reviewedSha);
+      if (!page || page.prEvidence.status === "merged" ||
+          this.store.all("wiki-ingest", approval.projectId).some((intent) => intent.runId === page.runId)) continue;
+      const updated = this.store.patch(page.id, { prEvidence: {
+        ...page.prEvidence, status: "merged", reviewedSha: approval.reviewedSha, mergedSha: approval.mergedSha,
+      } });
+      await this.atomicWrite(join(this.dataDir, "wiki", approval.projectId, page.id + ".md"), this.pageMarkdown(updated));
+    }
+  }
+  async replayDocument(intent: RecordData, deferDerived = false) {
+    const { projectId, title, content, sources, claims, runId } = intent;
     const folder = join(this.dataDir, "wiki", projectId);
     await mkdir(join(folder, "raw"), { recursive: true });
     const rawPath = join(folder, "raw", runId + ".json");
-    const raw = JSON.stringify(this.store.get(runId), null, 2);
-    await writeFile(rawPath, raw, {
-      flag: "wx",
-    });
+    const raw = intent.raw as string;
+    const hash = createHash("sha256").update(raw).digest("hex");
+    const rawTemporary = rawPath + "." + randomUUID() + ".tmp";
+    try {
+      await writeFile(rawTemporary, raw, { flag: "wx" });
+      try { await link(rawTemporary, rawPath); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    } finally { await rm(rawTemporary, { force: true }); }
+    if (createHash("sha256").update(await readFile(rawPath)).digest("hex") !== hash)
+      throw new Error("Existing raw capture differs from the ingestion intent: " + runId);
+    this.wikiCheckpoint("raw");
     const manifestPath = join(folder, "raw", "manifest.json");
     const manifest = JSON.parse(
-      await readFile(manifestPath, "utf8").catch(() => '{"sources":[]}'),
+      await readFile(manifestPath, "utf8").catch((error) => {
+        if (error.code === "ENOENT") return '{"sources":[]}';
+        throw error;
+      }),
     );
-    manifest.sources.push({
-      file: runId + ".json",
-      sha256: createHash("sha256").update(raw).digest("hex"),
-      capturedAt: new Date().toISOString(),
-      origin: "codex-run:" + runId,
+    const entry = manifest.sources.find((item: any) => item.file === runId + ".json");
+    if (entry && entry.sha256 !== hash) throw new Error("Raw manifest hash differs: " + runId);
+    if (!entry) {
+      manifest.sources.push({ file: runId + ".json", sha256: hash,
+        capturedAt: intent.capturedAt, origin: "codex-run:" + runId });
+      await this.atomicWrite(manifestPath, JSON.stringify(manifest, null, 2));
+    }
+    this.wikiCheckpoint("manifest");
+    let record = this.store.memory(projectId, title, content, sources, runId, claims, intent.taskId);
+    if (intent.pendingEvidence) record = this.store.patch(record.id, intent.pendingEvidence);
+    this.wikiCheckpoint("memory");
+    if (!deferDerived) await this.reconcileWiki(projectId, new Set([record.id]));
+    if (intent.replayError) this.store.patch(intent.id, { replayError: null });
+  }
+  async reconcileWiki(projectId: string, current: Set<string>) {
+    const folder = join(this.dataDir, "wiki", projectId);
+    const logPath = join(folder, "log.md");
+    const previousLog = await readFile(logPath, "utf8").catch((error) => {
+      if (error.code === "ENOENT") return "# Memory log\n";
+      throw error;
     });
-    await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
-    const record = this.store.memory(projectId, title, content, sources);
-    const path = join(folder, record.id + ".md");
-    await writeFile(
-      path,
-      "# " +
-        title +
-        "\n\n" +
-        content +
-        "\n\n## Evidence\n\n- [Raw run](raw/" +
-        runId +
-        ".json)\n" +
-        sources.map((source) => "- " + source).join("\n") +
-        "\n\nStatus: agent-reported outcome; checks and PR state are recorded separately.\n",
-    );
+    const entries = new Map<string, WikiLogEntry>();
+    for (const entry of parseWikiLog(previousLog)) {
+      const prior = entries.get(entry.runId);
+      if (prior && prior.text !== entry.text)
+        throw new Error("Conflicting wiki log entries for run: " + entry.runId);
+      entries.set(entry.runId, entry);
+    }
+    for (const intent of this.store.all("wiki-ingest", projectId)) {
+      if (entries.has(intent.runId)) continue;
+      entries.set(intent.runId, {
+        runId: intent.runId, pageId: "memory:" + intent.runId,
+        capturedAt: intent.capturedAt,
+        text: "\n## [" + intent.capturedAt + "] outcome | " + intent.title +
+          "\n\nRun " + intent.runId + "; page memory:" + intent.runId + ".\n",
+      });
+    }
+    const changed = this.reviseClaims(projectId);
     const pages = this.store.all("memory", projectId);
-    await writeFile(
+    for (const page of pages.filter((page) => page.runId && (current.has(page.id) || changed.has(page.id))))
+      await this.writeIfChanged(join(folder, page.id + ".md"), this.pageMarkdown(page));
+    this.wikiCheckpoint("page");
+    await this.writeIfChanged(
       join(folder, "index.md"),
       "# Project memory\n\n" +
         pages
@@ -348,21 +599,102 @@ export class Engine extends EventEmitter {
           .join("\n") +
         "\n",
     );
-    const log = join(folder, "log.md");
-    const previous = await readFile(log, "utf8").catch(() => "# Memory log\n");
-    await writeFile(
-      log,
-      previous +
-        "\n## [" +
-        new Date().toISOString() +
-        "] outcome | " +
-        title +
-        "\n\nRun " +
-        runId +
-        "; page " +
-        record.id +
-        ".\n",
-    );
+    this.wikiCheckpoint("index");
+    await this.writeIfChanged(logPath, "# Memory log\n" + [...entries.values()]
+      .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt) || a.runId.localeCompare(b.runId))
+      .map((entry) => entry.text).join(""));
+    this.wikiCheckpoint("log");
+  }
+  async writeIfChanged(path: string, content: string) {
+    const existing = await readFile(path, "utf8").catch((error) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (existing !== content) await this.atomicWrite(path, content);
+  }
+  async atomicWrite(path: string, content: string) {
+    const temporary = path + "." + randomUUID() + ".tmp";
+    try { await writeFile(temporary, content, { flag: "wx" }); await rename(temporary, path); }
+    finally { await rm(temporary, { force: true }); }
+  }
+  reviseClaims(projectId: string) {
+    const pages = this.store.all("memory", projectId);
+    const changed = new Set<string>();
+    const groups = new Map<string, { page: RecordData; index: number; claim: any }[]>();
+    for (const page of pages) for (const [index, claim] of (page.claims ?? []).entries()) {
+      const key = claim.key.trim().toLowerCase();
+      const group = groups.get(key) ?? [];
+      group.push({ page, index, claim }); groups.set(key, group);
+    }
+    for (const page of pages) {
+      if (!page.claims?.length) continue;
+      const revisions = page.claims.map((claim: any, index: number) => {
+        const related = (groups.get(claim.key.trim().toLowerCase()) ?? [])
+          .filter((item) => (item.page.id !== page.id || item.index !== index) &&
+            item.claim.statement !== claim.statement);
+        // Source labels come from agent output. A new spelling cannot prove independence.
+        // An agent's proposed relation cannot establish independent corroboration.
+        return { ...claim, status: related.length || claim.relation === "supersedes" || claim.relation === "contradicts" ? "unresolved" : "reported",
+          related: related.map((item) => ({ pageId: item.page.id, claimIndex: item.index,
+            statement: item.claim.statement, sources: item.claim.sources })) };
+      });
+      if (JSON.stringify(page.claimRevisions) !== JSON.stringify(revisions)) {
+        this.store.patch(page.id, { claimRevisions: revisions });
+        changed.add(page.id);
+      }
+    }
+    return changed;
+  }
+  pageMarkdown(page: RecordData) {
+    return "# " + page.title + "\n\n" + page.content + "\n\n## Evidence\n\n- [Raw run](raw/" + page.runId + ".json)\n" +
+      page.sources.map((source: string) => "- " + source).join("\n") +
+      "\n\nStatus: agent-reported outcome; checks and PR state are separate evidence.\n" +
+      (page.claimRevisions?.length ? "\n## Claim revisions\n" + page.claimRevisions.map((claim: any) =>
+        "\n- **" + claim.status + (claim.relation === "supersedes" ? "; proposed supersession" : claim.relation === "contradicts" ? "; proposed contradiction" : "") + "** " + claim.key + ": " + claim.statement +
+        " (sources: " + claim.sources.join(", ") + ")" +
+        claim.related.map((item: any) => "\n  - Conflicts with [" + item.pageId + " claim " + (item.claimIndex + 1) + "](" + item.pageId + ".md): " + item.statement + " (sources: " + item.sources.join(", ") + ")").join("")
+      ).join("\n") + "\n" : "") +
+      ((page.checkEvidenceHistory?.length || page.checkEvidence || page.prEvidence) ? "\n## Separate evidence\n" +
+        (page.checkEvidenceHistory ?? (page.checkEvidence ? [page.checkEvidence] : [])).map((check: any) =>
+          "\n- [Check report](/api/verification/" + check.reportId + ") (source hash " + check.sourceHash + ")").join("") + "\n" +
+        (page.prEvidence ? "\n- [PR outcome](" + page.prEvidence.url + "): " + page.prEvidence.status + "; head " + page.prEvidence.headSha +
+          (page.prEvidence.mergedSha ? "; merged " + page.prEvidence.mergedSha : "") +
+          (page.prEvidence.mergeActor === "unverified" ? "; merge actor unverified" : "") + "\n" : "") : "");
+  }
+  async recordRunEvidence(taskId: string, evidence: Record<string, any>, runId?: string) {
+    const task = this.store.get(taskId);
+    const pages = this.store.all("memory", task.projectId);
+    // The optional lookup retains the existing PR publication path. Check
+    // callers provide the exact run, including failed retries without Memory.
+    const run = runId ? this.store.get(runId) : this.store.all("run", task.projectId).findLast((item) =>
+      item.taskId === taskId && item.role === "implementation" && item.status === "completed" &&
+      (pages.some((page) => page.runId === item.id) ||
+        this.store.all("wiki-ingest", task.projectId).some((intent) => intent.runId === item.id)));
+    if (run) {
+      if (run.projectId !== task.projectId || run.taskId !== taskId || run.role !== "implementation")
+        throw new Error("Evidence run does not match the implementation task.");
+      const current = pages.find((page) => page.runId === run.id);
+      const intent = this.store.all("wiki-ingest", task.projectId).find((item) => item.runId === run.id);
+      const existing = { ...run, ...current, ...intent?.pendingEvidence };
+      const check = evidence.checkEvidence;
+      const history = check ? existing.checkEvidenceHistory ??
+        (existing.checkEvidence ? [existing.checkEvidence] : []) : undefined;
+      const next = check ? {
+        ...evidence,
+        checkEvidenceHistory: history!.some((item: any) => item.reportId === check.reportId)
+          ? history : [...history!, check],
+      } : evidence;
+      // The run owns evidence even if it failed before wiki ingestion. An
+      // intent also keeps a durable copy for repair of its derived page.
+      this.store.patch(run.id, next);
+      const pendingEvidence = { ...intent?.pendingEvidence, ...next };
+      if (intent) this.store.patch(intent.id, { pendingEvidence });
+      if (current) {
+        const page = this.store.patch(current.id, pendingEvidence);
+        await this.writeIfChanged(join(this.dataDir, "wiki", task.projectId, page.id + ".md"), this.pageMarkdown(page));
+      }
+    }
+    return run?.id;
   }
   async plan(project: RecordData) {
     const memory = this.store
@@ -428,6 +760,8 @@ export class Engine extends EventEmitter {
     );
   }
   async implement(project: RecordData, task: RecordData) {
+    if (task.prRepair) task = await this.preparePrRepair(project, task);
+    if (this.closed || task.status === "blocked" || this.store.get(project.id).status !== "running") return;
     if (!task.worktree) {
       let base = "HEAD";
       if (project.github) {
@@ -443,6 +777,7 @@ export class Engine extends EventEmitter {
       task = this.store.patch(task.id, {
         worktree: tree.path,
         branch: tree.branch,
+        baseSha: await git(tree.path, ["rev-parse", "HEAD"]),
       });
     }
     if (await prepareDependencies(project.path, task.worktree))
@@ -496,9 +831,14 @@ export class Engine extends EventEmitter {
       this.changed("task-completed", { taskId: task.id }, project.id);
       return;
     }
-    this.store.patch(task.id, { status: "verifying", summary: result.summary });
+    await this.stageProduct(task);
+    if (task.prRepair) await this.stagePrConflicts(task);
+    const checkedSource = { sourceHash: await sourceFingerprint(task.worktree),
+      tree: await git(task.worktree, ["write-tree"]), head: await git(task.worktree, ["rev-parse", "HEAD"]),
+      mergeHead: await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "") };
+    this.store.patch(task.id, { status: "verifying", summary: result.summary, reviewedSource: null });
     const report = project.checks.length
-      ? await this.verify(project, task, project.checks)
+      ? await this.verify(project, task, project.checks, false, this.store.get(task.id).implementationRunId)
       : undefined;
     const checks = report?.results ?? [];
     if (this.store.get(project.id).status !== "running") {
@@ -537,10 +877,12 @@ export class Engine extends EventEmitter {
       );
       return;
     }
+    const reviewBase = task.prRepair?.baseSha ?? task.baseSha ??
+      await git(task.worktree, ["merge-base", "HEAD", project.branch]).catch(() => "");
     const review = await this.run(
       project,
       "review",
-      `Independently inspect git diff in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
+      `Independently inspect ${reviewBase ? "git diff " + reviewBase + " (the full task diff against its base), and git diff HEAD" : "git diff HEAD"} (including staged merge resolutions) in this worktree for task: ${task.title}. Goal: ${project.goal}. Acceptance: ${task.acceptance.join("; ")}. Coordinator check outcomes: ${JSON.stringify(checks.map((c) => ({ command: c.command, code: c.code })))}. Read matching .looproom-verification/<report-id>.json history when documents cite earlier results; latest.json is only the most recent batch. Read actual changed code and look for missing functionality, unsafe behavior, usability/accessibility and unnecessary complexity. Do not edit. Return verdict pass, changes, or gate with evidence.`,
       Review,
       task,
     );
@@ -566,6 +908,13 @@ export class Engine extends EventEmitter {
       );
       return;
     }
+    if (await sourceFingerprint(task.worktree) !== checkedSource.sourceHash ||
+        await git(task.worktree, ["write-tree"]) !== checkedSource.tree) {
+      this.repairOrGate(project, task, "Source changed after verification or review",
+        "Repeat checks and independent review against the current source.", "check");
+      return;
+    }
+    this.store.patch(task.id, { reviewedSource: checkedSource });
     await this.freezeBaseline(project, this.store.get(task.id));
     await this.publish(project, this.store.get(task.id));
   }
@@ -596,6 +945,26 @@ export class Engine extends EventEmitter {
         task.id,
       );
   }
+  async stageProduct(task: RecordData) {
+    const paths = ["--", ".", ":(top,exclude).looproom-verification"];
+    const changed = (await git(task.worktree, ["diff", "HEAD", "--name-only", "-z", ...paths])).split("\0").filter(Boolean);
+    const untracked = (await git(task.worktree, ["ls-files", "--others", "--exclude-standard", "-z", ...paths])).split("\0").filter(Boolean);
+    const unsafe = [...new Set([...changed, ...untracked])].filter(path =>
+      /(^|\/)(node_modules|dist|auth\.json|\.npmrc|\.netrc|\.codex|\.ssh|\.aws|\.gnupg|\.env(?:\.[^/]*)?|\.looproom-test-fixtures)(\/|$)/.test(path) || /\.(pem|key)$/i.test(path));
+    if (unsafe.length) throw new Error("Exclude protected or generated files before review: " + unsafe.slice(0, 8).join(", "));
+    await git(task.worktree, ["add", "--all", ...paths]);
+  }
+  async reviewedSourceMatches(task: RecordData) {
+    const evidence = task.reviewedSource;
+    if (!evidence || await sourceFingerprint(task.worktree) !== evidence.sourceHash ||
+        await git(task.worktree, ["write-tree"]) !== evidence.tree ||
+        await git(task.worktree, ["rev-parse", "HEAD"]) !== evidence.head ||
+        (await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "")) !== evidence.mergeHead)
+      return false;
+    const paths = ["--", ".", ":(top,exclude).looproom-verification"];
+    return !(await git(task.worktree, ["diff", "--name-only", ...paths])) &&
+      !(await git(task.worktree, ["ls-files", "--others", "--exclude-standard", "-z", ...paths]));
+  }
   async publish(project: RecordData, task: RecordData) {
     if (this.store.get(project.id).status !== "running") {
       this.store.patch(task.id, { status: "ready" });
@@ -613,37 +982,52 @@ export class Engine extends EventEmitter {
       );
       return;
     }
-    await gh(["auth", "status"]);
-    const productPaths = ["--", ".", ":(top,exclude).looproom-verification"];
-    const diff = await git(task.worktree, ["status", "--porcelain", ...productPaths]);
-    const untracked = (
-      await git(task.worktree, [
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        ...productPaths,
-      ])
-    )
-      .split("\0")
-      .filter(Boolean);
-    const unsafe = untracked.filter(
-      (path) =>
-        /(^|\/)(node_modules|auth\.json|\.env(?:\.[^/]*)?)(\/|$)/.test(path) ||
-        /\.(pem|key)$/.test(path),
-    );
-    if (unsafe.length) {
+    try {
+      await this.githubRunner(["auth", "status"]);
+    } catch (error) {
       this.gate(
         project.id,
-        "Check files before publishing",
-        "These untracked paths need exclusion or review: " +
-          unsafe.slice(0, 8).join(", "),
-        "publication",
+        "Prepare GitHub publishing",
+        `Verified work remains in ${task.worktree}. Install GitHub CLI and run gh auth login before retrying publication. GitHub reported: ${error instanceof Error ? error.message : String(error)}`,
+        "github",
         task.id,
       );
       return;
     }
-    if (!diff && !task.pr) {
+    if (await git(task.worktree, ["diff", "--name-only", "--diff-filter=U"]))
+      throw new Error("Resolve all merge conflicts before publication.");
+    const merging = !!(await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => ""));
+    if (task.pr) {
+      const { gate, info } = await this.publicationPrInfo(project, task);
+      if (this.closed) return;
+      if (info.state !== "OPEN") { this.retireRepairPr(project, task, gate, info); return; }
+      if (![task.prRepair?.expectedHead, task.sha, task.reviewedSource?.head].includes(info.headRefOid))
+        throw new Error("Remote PR head changed during implementation; preserve this work and refresh integration before publication.");
+    }
+    if (!task.pr && task.followupPr?.state === "MERGED") {
+      await git(project.path, ["fetch", "origin", project.branch]);
+      const baseSha = await git(project.path, ["rev-parse", "refs/remotes/origin/" + project.branch]);
+      const baseTree = await git(project.path, ["rev-parse", baseSha + "^{tree}"]);
+      if (baseTree === task.reviewedSource?.tree && await this.reviewedSourceMatches(task)) {
+        this.store.patch(task.id, { status: "completed", completedReason: "Verified source already exists in the merged base.", mergedBaseEvidence: { baseSha, baseTree, pr: task.followupPr.url } });
+        this.changed("task-completed", { taskId: task.id, baseSha, baseTree }, project.id);
+        return;
+      }
+    }
+    const productPaths = ["--", ".", ":(top,exclude).looproom-verification"];
+    const diff = await git(task.worktree, ["status", "--porcelain", ...productPaths]);
+    if (!(await this.reviewedSourceMatches(task))) {
+      this.store.patch(task.id, { reviewedSource: null });
+      this.repairOrGate(project, task, "Source changed after independent review",
+        "Repeat checks and review before publishing the changed source or Git tree.", "check");
+      return;
+    }
+    const publicationBase = task.prRepair?.baseSha ?? task.baseSha ??
+      await git(task.worktree, ["merge-base", "HEAD", project.branch]).catch(() => "");
+    const alreadyCommittedChanges = publicationBase
+      ? task.reviewedSource.tree !== await git(task.worktree, ["rev-parse", publicationBase + "^{tree}"])
+      : true;
+    if (!diff && !task.pr && !alreadyCommittedChanges) {
       this.store.patch(task.id, {
         status: "completed",
         summary: task.summary + "\nNo code changes were needed.",
@@ -651,8 +1035,7 @@ export class Engine extends EventEmitter {
       this.changed("task-completed", { taskId: task.id }, project.id);
       return;
     }
-    if (diff) {
-      await git(task.worktree, ["add", "--all", ...productPaths]);
+    if (diff || merging) {
       await git(task.worktree, [
         "-c",
         "user.name=Looproom agent",
@@ -663,8 +1046,26 @@ export class Engine extends EventEmitter {
         task.title,
       ]);
     }
+    const expectedParents = [task.reviewedSource.head, task.reviewedSource.mergeHead].filter(Boolean).join(" ");
+    const changedParents = (diff || merging)
+      ? await git(task.worktree, ["show", "-s", "--format=%P", "HEAD"]) !== expectedParents
+      : await git(task.worktree, ["rev-parse", "HEAD"]) !== task.reviewedSource.head;
+    if (changedParents || await git(task.worktree, ["rev-parse", "HEAD^{tree}"]) !== task.reviewedSource.tree ||
+        await sourceFingerprint(task.worktree) !== task.reviewedSource.sourceHash ||
+        await git(task.worktree, ["branch", "--show-current"]) !== task.branch) {
+      this.store.patch(task.id, { reviewedSource: null });
+      this.repairOrGate(project, task, "Commit changed the reviewed source",
+        "A commit hook or concurrent edit changed checked source. Repeat verification and full task review before pushing.", "check");
+      return;
+    }
     await git(task.worktree, ["push", "origin", task.branch]);
     const sha = await git(task.worktree, ["rev-parse", "HEAD"]);
+    if (task.pr) {
+      const { gate, info } = await this.publicationPrInfo(project, task);
+      if (this.closed) return;
+      if (info.state !== "OPEN") { this.retireRepairPr(project, task, gate, info); return; }
+      if (info.headRefOid !== sha) throw new Error("GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.");
+    }
     let url = task.pr;
     if (!url) {
       const bodyPath = join(this.dataDir, "pr-" + task.id + ".md");
@@ -672,7 +1073,47 @@ export class Engine extends EventEmitter {
         bodyPath,
         `${task.summary}\n\n## Verification\n${task.checks.map((c: any) => "- " + c.command + ": exit " + c.code).join("\n")}\n\n## Independent review\n${task.review.summary}\n\nHuman approval is required in Looproom for commit ${sha}.\n`,
       );
-      url = await gh([
+      url = await this.createPrOrReuse(project, task, sha, bodyPath);
+    }
+    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha, prRepair: null });
+    const prRunId = await this.recordRunEvidence(task.id, { prEvidence: { url, headSha: sha, status: "awaiting_human" } });
+    this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
+      pr: url,
+      sha,
+      prRunId,
+      base: project.branch,
+    });
+    this.store.patch(task.id, { status: "awaiting_human" });
+    this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
+  }
+  async publicationPrInfo(project: RecordData, task: RecordData) {
+    const gate = this.store.all("gate", project.id).findLast(g => g.type === "pr" && g.taskId === task.id && g.pr === task.pr);
+    if (!gate) throw new Error("Existing PR has no matching durable task gate.");
+    const info = await this.prInfo(gate.id);
+    if (!this.closed) this.validateRemotePr(gate, project, info);
+    return { gate, info };
+  }
+  retireRepairPr(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    if (this.closed) return;
+    const observedAt = new Date().toISOString();
+    const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid,
+      base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
+    this.store.transaction(() => {
+      this.store.patch(gate.id, { remoteObservation: observation,
+        ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
+      this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
+        baseSha: task.prRepair?.baseSha ?? task.baseSha,
+        followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
+        feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
+      this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
+        text: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
+    });
+    if (info.state !== "MERGED") this.gate(project.id, "PR closed during integration", "Decide whether remaining work needs a fresh PR or should be discarded. The earlier PR was closed without merging.", "publication", task.id);
+    this.changed("repair-pr-retired", { taskId: task.id, ...observation }, project.id);
+  }
+  async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
+    try {
+      return await this.githubRunner([
         "pr",
         "create",
         "--repo",
@@ -686,38 +1127,339 @@ export class Engine extends EventEmitter {
         "--body-file",
         bodyPath,
       ]);
+    } catch (creationError) {
+      let existing: any;
+      try {
+        existing = JSON.parse(await this.githubRunner([
+          "pr", "view", task.branch, "--repo", project.github,
+          "--json", "url,headRefOid,baseRefName,state",
+        ]));
+      } catch {
+        throw creationError;
+      }
+      if (existing.state !== "OPEN" || existing.headRefOid !== sha ||
+          existing.baseRefName !== project.branch || typeof existing.url !== "string")
+        throw new Error("An existing PR does not match this task revision and base. Review it before retrying publication.");
+      return existing.url;
     }
-    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha });
-    this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
-      pr: url,
-      sha,
-    });
-    this.store.patch(task.id, { status: "awaiting_human" });
-    this.changed("pr-opened", { taskId: task.id, pr: url, sha }, project.id);
+  }
+  async syncProject(projectId: string) {
+    if (this.closed || this.syncingProjects.has(projectId)) return;
+    this.syncingProjects.add(projectId);
+    const project = this.store.get(projectId, "project");
+    let failed = false;
+    try {
+      const gates = this.store.all("gate", projectId).filter(g =>
+        g.type === "pr" && (["open", "merging"].includes(g.status) ||
+          (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id)));
+      for (const snapshot of gates) {
+        if (this.closed) return;
+        if (this.prDecisionBusy.has(snapshot.id)) continue;
+        this.prDecisionBusy.add(snapshot.id);
+        try {
+          const gate = this.store.get(snapshot.id);
+          if (!["open", "merging", "superseded"].includes(gate.status)) continue;
+          if (gate.mergeAttempt) { await this.reconcileMergeReserved(gate.id); continue; }
+          const info = await this.prInfo(gate.id);
+          if (this.closed) return;
+          this.validateRemotePr(gate, project, info);
+          if (info.url !== gate.pr || !info.url.startsWith(`https://github.com/${project.github}/pull/`) ||
+              info.baseRefName !== project.branch || !/^[a-f0-9]{40}$/.test(info.headRefOid ?? ""))
+            throw new Error("Remote PR identity, base or head does not match this project.");
+          const task = this.store.get(gate.taskId, "task");
+          if (task.projectId !== projectId) throw new Error("Remote PR task belongs to another project.");
+          if (gate.status === "superseded") {
+            const previous = gate.remoteObservation;
+            if (previous?.state !== info.state || previous?.headSha !== info.headRefOid || previous?.mergeable !== info.mergeable) {
+              const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt: new Date().toISOString() };
+              this.store.patch(gate.id, { remoteObservation: observation });
+              if (task.prRepair?.gateId === gate.id) this.store.patch(task.id, { prRepair: { ...task.prRepair, remoteObservation: observation } });
+              this.changed("repair-pr-observed", { gateId: gate.id, ...observation }, projectId);
+            }
+            continue;
+          }
+          if (this.busy.has("task:" + task.id) || this.store.all("run", projectId).some(r => r.taskId === task.id && r.status === "running")) continue;
+          const observedAt = new Date().toISOString();
+          const observation = { url: info.url, number: info.number, state: info.state,
+            headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable,
+            mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
+          if (info.state === "MERGED") {
+            if (!/^[a-f0-9]{40}$/.test(info.mergeCommit?.oid ?? "") || !info.mergedAt)
+              throw new Error("GitHub has not supplied complete merge evidence.");
+            this.store.transaction(() => {
+              const current = this.store.get(gate.id);
+              if (current.status !== "open" || current.mergeAttempt || current.sha !== gate.sha)
+                throw new Error("PR state changed during remote synchronization.");
+              this.store.patch(gate.id, { status: "reconciled", remoteObservation: observation,
+                mergedSha: info.mergeCommit.oid, resolvedAt: observedAt,
+                mergeRecovery: info.headRefOid === gate.sha
+                  ? "Merged externally on GitHub; merge actor unverified."
+                  : "Merged externally at a different head; the earlier review does not authorize that revision." });
+              this.store.patch(task.id, { status: "completed", prRepair: null });
+              this.store.put("message", { projectId, taskId: task.id, role: "coordinator",
+                text: `GitHub reports PR #${info.number} merged. ${info.headRefOid === gate.sha ? "Dependent work can continue." : "Its final head differs from the earlier review."}`,
+                createdAt: observedAt });
+              this.store.event("pr-merged-externally", { gateId: gate.id, ...observation, mergeActor: "unverified" }, projectId);
+            });
+            this.emit("change");
+            this.tick();
+            await this.repairReconciledEvidence(this.store.get(gate.id));
+          } else if (info.state === "OPEN" && (info.mergeable === "CONFLICTING" || info.headRefOid !== gate.sha)) {
+            this.store.transaction(() => {
+              const current = this.store.get(gate.id);
+              if (current.status !== "open" || current.mergeAttempt || current.sha !== gate.sha ||
+                  this.store.get(task.id).status !== "awaiting_human")
+                throw new Error("PR state changed during repair scheduling.");
+              this.store.patch(gate.id, { status: "superseded", remoteObservation: observation, resolvedAt: observedAt });
+              this.store.patch(task.id, { status: "ready", attempt: 0, judgeRetries: 0,
+                checks: [], review: null,
+                prRepair: { gateId: gate.id, pr: gate.pr, expectedHead: info.headRefOid, base: project.branch, stage: "queued" },
+                feedback: `GitHub PR #${info.number} ${info.mergeable === "CONFLICTING" ? "has merge conflicts" : "has a new remote head"}. Integrate the latest base and preserve both branches' intended behavior. Resolve conflict markers, then rerun full verification and independent review. Human merge approval is still required.` });
+              this.store.put("message", { projectId, taskId: task.id, role: "coordinator",
+                text: `PR #${info.number} needs integration. The agent will repair it and return a freshly verified revision for review.`, createdAt: observedAt });
+            });
+            this.changed("pr-repair-queued", { gateId: gate.id, ...observation }, projectId);
+            this.tick();
+          } else if (gate.remoteObservation?.state !== info.state || gate.remoteObservation?.mergeable !== info.mergeable) {
+            this.store.patch(gate.id, { remoteObservation: observation });
+            this.changed("pr-remote-observed", { gateId: gate.id, ...observation }, projectId);
+          }
+        } catch (error) {
+          if (this.closed) return;
+          failed = true;
+          this.changed("pr-sync-error", { gateId: snapshot.id, error: String(error) }, projectId);
+        } finally { this.prDecisionBusy.delete(snapshot.id); }
+      }
+      if (this.closed) return;
+      await this.gitRunner(project.path, ["fetch", "origin", project.branch]);
+      if (this.closed) return;
+      const baseSha = await this.gitRunner(project.path, ["rev-parse", "refs/remotes/origin/" + project.branch]);
+      if (this.closed) return;
+      const previous = this.store.get(projectId).remoteSync;
+      this.store.patch(projectId, { remoteSync: { baseSha, checkedAt: new Date().toISOString(), failures: failed ? (previous?.failures ?? 0) + 1 : 0 } });
+      if (previous?.baseSha && previous.baseSha !== baseSha) {
+        this.changed("remote-base-updated", { previousSha: previous.baseSha, baseSha }, projectId);
+        this.tick();
+      }
+    } catch (error) {
+      if (!this.closed) {
+        failed = true;
+        const previous = this.store.get(projectId).remoteSync;
+        this.store.patch(projectId, { remoteSync: { ...previous, error: String(error), failures: (previous?.failures ?? 0) + 1 } });
+        this.changed("project-sync-error", { error: String(error) }, projectId);
+      }
+    } finally {
+      if (!this.closed) {
+        const failures = this.store.get(projectId).remoteSync?.failures ?? 0;
+        this.nextRemoteSync.set(projectId, Date.now() + (failed ? Math.min(120_000, 15_000 * 2 ** Math.min(failures, 3)) : 15_000));
+      }
+      this.syncingProjects.delete(projectId);
+    }
+  }
+  async preparePrRepair(project: RecordData, task: RecordData) {
+    const repair = task.prRepair;
+    const current = await this.publicationPrInfo(project, task);
+    if (this.closed) return task;
+    if (current.info.state !== "OPEN") {
+      this.retireRepairPr(project, task, current.gate, current.info);
+      return this.store.get(task.id);
+    }
+    if (!task.worktree || !task.branch || repair.pr !== task.pr || repair.base !== project.branch)
+      throw new Error("PR repair has no matching preserved task worktree.");
+    if (await this.gitRunner(task.worktree, ["branch", "--show-current"]) !== task.branch)
+      throw new Error("PR repair worktree branch changed.");
+    const common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    if (await realpath(await this.gitRunner(task.worktree, common)) !== await realpath(await this.gitRunner(project.path, common)))
+      throw new Error("PR repair worktree belongs to another repository.");
+    const merging = await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+    if (repair.stage === "prepared") {
+      if (merging && merging !== repair.baseSha) throw new Error("PR repair merge target changed.");
+      return task;
+    }
+    if (merging && repair.stage === "preparing" && merging === repair.baseSha)
+      return this.store.patch(task.id, { prRepair: { ...repair, stage: "prepared" } });
+    if (merging || await this.gitRunner(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]))
+      throw new Error("Preserved worktree has local changes; resolve ownership before automatic integration.");
+    await this.gitRunner(task.worktree, ["fetch", "origin", project.branch, task.branch]);
+    const remoteHead = await this.gitRunner(task.worktree, ["rev-parse", "refs/remotes/origin/" + task.branch]);
+    if (remoteHead !== repair.expectedHead) throw new Error("PR head changed again; refresh repair evidence before integration.");
+    await this.gitRunner(task.worktree, ["merge", "--ff-only", remoteHead]);
+    const baseSha = await this.gitRunner(task.worktree, ["rev-parse", "refs/remotes/origin/" + project.branch]);
+    // Persist intent before Git mutates the index, so restart recovery recognizes our merge.
+    task = this.store.patch(task.id, { prRepair: { ...repair, baseSha, stage: "preparing" } });
+    try {
+      await this.gitRunner(task.worktree, ["merge", "--no-commit", "--no-ff", baseSha]);
+    } catch (error) {
+      const target = await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+      const conflicts = await this.gitRunner(task.worktree, ["diff", "--name-only", "--diff-filter=U"]);
+      if (target !== baseSha || !conflicts) throw error;
+    }
+    task = this.store.patch(task.id, { prRepair: { ...task.prRepair, stage: "prepared" } });
+    this.changed("pr-integration-prepared", { taskId: task.id, baseSha }, project.id);
+    return task;
+  }
+  async stagePrConflicts(task: RecordData) {
+    const files = (await this.gitRunner(task.worktree, ["diff", "--name-only", "--diff-filter=U", "-z"]))
+      .split("\0").filter(Boolean);
+    const changed = (await this.gitRunner(task.worktree, ["diff", task.prRepair?.baseSha ?? "HEAD", "--name-only", "-z", "--", ".", ":(top,exclude).looproom-verification"])).split("\0").filter(Boolean);
+    for (const file of new Set([...files, ...changed])) {
+      if ((await lstat(join(task.worktree, file)).catch(() => null))?.isSymbolicLink()) continue;
+      const content = await readFile(join(task.worktree, file), "utf8").catch((error) => {
+        if (error.code === "ENOENT") return ""; // A reviewed deletion can resolve a conflict.
+        throw error;
+      });
+      if (/^(<<<<<<< |=======$|>>>>>>> )/m.test(content))
+        throw new Error("Unresolved conflict markers in " + file);
+    }
+    if (files.length) await this.gitRunner(task.worktree, ["add", "--", ...files]);
   }
   async prInfo(gateId: string) {
     const gate = this.store.get(gateId);
     if (gate.type !== "pr") throw new Error("This gate is not a pull request.");
     return JSON.parse(
-      await gh([
+      await this.mergeBroker([
         "pr",
         "view",
         gate.pr,
         "--json",
-        "number,url,title,headRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName",
+        "number,url,title,headRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt",
       ]),
     );
   }
+  mergeTarget(pr: string, number: number) {
+    const match = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/([1-9]\d*)$/.exec(pr);
+    if (!match || Number(match[3]) !== number)
+      throw new Error("Pull request URL and number do not identify the same GitHub PR.");
+    return `repos/${match[1]}/${match[2]}/pulls/${number}/merge`;
+  }
+  validateRemotePr(gate: RecordData, project: RecordData, info: any) {
+    this.mergeTarget(info.url, info.number);
+    const base = gate.base ?? gate.mergeAttempt?.base ?? project.branch;
+    if (info.url !== gate.pr || !base || info.baseRefName !== base ||
+        !/^[a-f0-9]{40}$/.test(info.headRefOid ?? ""))
+      throw new Error("PR identity changed: URL, base or head mismatch; refresh before continuing.");
+    if (info.state === "MERGED" && (!/^[a-f0-9]{40}$/.test(info.mergeCommit?.oid ?? "") ||
+        !info.mergedAt || !Number.isFinite(Date.parse(info.mergedAt))))
+      throw new Error("GitHub has not supplied complete merge evidence.");
+  }
+  async reconcileMerge(gateId: string, releaseOpenAttempt = false) {
+    if (this.prDecisionBusy.has(gateId)) throw new Error("A decision on this PR is already being submitted.");
+    this.prDecisionBusy.add(gateId);
+    try { await this.reconcileMergeReserved(gateId, releaseOpenAttempt); }
+    finally { this.prDecisionBusy.delete(gateId); }
+  }
+  async reconcileMergeReserved(gateId: string, releaseOpenAttempt = false) {
+    const gate = this.store.get(gateId);
+    if (gate.type !== "pr" || !gate.mergeAttempt || !["merging", "open"].includes(gate.status))
+      throw new Error("No interrupted PR merge to reconcile.");
+    const attempt = gate.mergeAttempt;
+    this.mergeTarget(attempt.pr, attempt.number);
+    const info = await this.prInfo(gateId);
+    if (this.closed) return;
+    this.validateRemotePr(gate, this.store.get(gate.projectId), info);
+    if (info.url !== gate.pr || info.url !== attempt.pr || info.number !== attempt.number)
+      throw new Error("PR identity changed; inspect GitHub before continuing.");
+    if (info.state === "MERGED") {
+      this.store.transaction(() => {
+        const current = this.store.get(gateId);
+        if (current.mergeAttempt?.requestedAt !== attempt.requestedAt || !["merging", "open"].includes(current.status))
+          throw new Error("Merge attempt changed during reconciliation.");
+        this.store.patch(gateId, { status: "reconciled", mergeRecovery: info.headRefOid === attempt.reviewedSha
+            ? "Remote PR merged at the reviewed head; merge actor unverified."
+            : "Merged externally at a different head; the earlier review does not authorize that revision.", mergedSha: info.mergeCommit.oid, resolvedAt: new Date().toISOString(),
+          remoteObservation: { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid, base: info.baseRefName, mergeable: info.mergeable, mergedSha: info.mergeCommit.oid, mergedAt: info.mergedAt, observedAt: new Date().toISOString() } });
+        this.store.patch(gate.taskId, { status: "completed" });
+      });
+      this.changed("merge-reconciled", { gateId }, gate.projectId);
+      this.tick();
+      await this.repairReconciledEvidence(this.store.get(gateId));
+      return;
+    } else if (info.state === "OPEN" && info.headRefOid === attempt.reviewedSha) {
+      if (releaseOpenAttempt) {
+        this.store.transaction(() => {
+          const current = this.store.get(gateId);
+          if (current.status !== "open" || current.mergeAttempt?.requestedAt !== attempt.requestedAt)
+            throw new Error("Merge attempt changed during reconciliation.");
+          this.store.patch(gateId, {
+            mergeAttempt: null,
+            mergeAttempts: [...(current.mergeAttempts ?? []), attempt],
+            mergeRecovery: null,
+          });
+        });
+      } else {
+        this.store.patch(gateId, { status: "open", mergeRecovery: "Merge result uncertain. GitHub reports the reviewed PR still open; reconcile before another approval." });
+      }
+    } else {
+      const changedHead = info.state === "OPEN" && /^[0-9a-f]{40}$/i.test(info.headRefOid ?? "") && info.headRefOid !== attempt.reviewedSha;
+      const closedUnmerged = info.state === "CLOSED" && info.mergedAt === null;
+      const message = changedHead
+        ? "GitHub reports a different PR head. This attempt cannot authorize it. Request changes to verify and publish the new revision."
+        : closedUnmerged
+          ? "GitHub reports the PR closed without a merge. Request changes to retry the task."
+          : "Remote merge state is ambiguous; inspect GitHub before releasing this attempt.";
+      if (releaseOpenAttempt && (changedHead || closedUnmerged)) {
+        this.store.transaction(() => {
+          const current = this.store.get(gateId);
+          if (current.status !== "open" || current.mergeAttempt?.requestedAt !== attempt.requestedAt)
+            throw new Error("Merge attempt changed during reconciliation.");
+          this.store.patch(gateId, {
+            mergeAttempt: null,
+            mergeAttempts: [...(current.mergeAttempts ?? []), attempt],
+            mergeRecovery: message,
+          });
+        });
+      } else {
+        this.store.patch(gateId, { status: "open", mergeRecovery: message });
+      }
+    }
+    this.changed("merge-reconciled", { gateId }, gate.projectId);
+  }
+  async reconcileMerges() {
+    for (const gate of this.store.all("gate").filter((gate) => gate.type === "pr" && gate.mergeAttempt && gate.status === "merging")) {
+      try {
+        await this.reconcileMerge(gate.id);
+        if (this.closed) return;
+        if (this.store.get(gate.id).status === "merging") {
+          this.store.patch(gate.id, { status: "open", mergeRecovery: "Merge result uncertain. Reconcile the remote PR before another approval." });
+          this.changed("merge-reconciled", { gateId: gate.id }, gate.projectId);
+        }
+      } catch (error) {
+        // A derived wiki failure cannot undo an already committed remote fact.
+        const current = this.store.get(gate.id);
+        if (current.status === "reconciled") {
+          this.store.patch(gate.id, { evidenceRecovery: `Merged PR evidence needs replay: ${String(error)}` });
+        } else {
+          const message = `Could not inspect PR after interrupted merge: ${String(error)}`;
+          this.store.patch(gate.id, { status: "open", mergeRecovery: message });
+        }
+        this.changed("merge-reconciliation-error", { gateId: gate.id, error: String(error) }, gate.projectId);
+      }
+    }
+  }
   async approve(gateId: string, reviewedSha: string) {
+    if (this.prDecisionBusy.has(gateId)) throw new Error("A decision on this PR is already being submitted.");
+    this.prDecisionBusy.add(gateId);
+    try {
+      await this.approveReserved(gateId, reviewedSha);
+    } finally { this.prDecisionBusy.delete(gateId); }
+  }
+  async approveReserved(gateId: string, reviewedSha: string) {
     const gate = this.store.get(gateId);
     if (gate.status !== "open" || gate.type !== "pr")
       throw new Error("This PR approval is no longer open.");
+    if (gate.mergeAttempt)
+      throw new Error("A prior merge attempt needs manual reconciliation before another approval.");
     const info = await this.prInfo(gateId);
     if (reviewedSha !== gate.sha)
       throw new Error(
         "Review the currently displayed revision before approving.",
       );
     if (info.state !== "OPEN") throw new Error("Pull request is not open.");
+    if (info.url !== gate.pr || !Number.isInteger(info.number))
+      throw new Error("Pull request identity changed. Refresh and review.");
+    if (this.closed) throw new Error("Coordinator closed during PR approval.");
+    this.validateRemotePr(gate, this.store.get(gate.projectId), info);
+    const target = this.mergeTarget(gate.pr, info.number);
     checkApproval(
       reviewedSha,
       info.headRefOid,
@@ -725,21 +1467,56 @@ export class Engine extends EventEmitter {
       info.mergeable,
     );
     const project = this.store.get(gate.projectId);
-    const result = JSON.parse(
-      await gh([
+    const task = this.store.get(gate.taskId, "task");
+    if (task.projectId !== project.id || task.status !== "awaiting_human")
+      throw new Error("This PR task is no longer awaiting human review.");
+    const run = this.prEvidenceRun(gate, reviewedSha, true);
+    const intent = run && this.store.all("wiki-ingest", project.id).find((item) => item.runId === run.id && item.taskId === gate.taskId);
+    const existingPr = intent?.pendingEvidence?.prEvidence;
+    if (intent && (existingPr?.url !== gate.pr || existingPr?.headSha !== reviewedSha))
+      throw new Error("Wiki PR evidence does not match the approved revision.");
+    this.store.transaction(() => {
+      const current = this.store.get(gateId);
+      if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha)
+        throw new Error("This revision already has a merge attempt or is no longer open.");
+      this.store.patch(gateId, {
+        status: "merging",
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, base: info.baseRefName, prRunId: run?.id, requestedAt: new Date().toISOString() },
+      });
+    });
+    let result: any;
+    try {
+      result = JSON.parse(await this.mergeBroker([
+
         "api",
         "--method",
         "PUT",
-        `repos/${project.github}/pulls/${info.number}/merge`,
+        target,
         "-f",
         "sha=" + reviewedSha,
         "-f",
         "merge_method=squash",
-      ]),
-    );
-    if (!result.merged)
+      ]));
+    } catch (error) {
+      if (this.closed) throw error;
+      // A timeout or lost response can follow remote success. Never submit a second PUT.
+      if (this.store.get(gateId).status === "merging")
+        this.store.patch(gateId, { status: "open", mergeRecovery: `Merge result uncertain: ${String(error)}. Reconcile the remote PR before another approval.` });
+      this.changed("merge-result-uncertain", { gateId }, project.id);
+      throw error;
+    }
+    if (this.closed) return;
+    if (!result.merged || !/^[a-f0-9]{40}$/.test(result.sha ?? "")) {
+      if (this.store.get(gateId).status === "merging")
+        this.store.patch(gateId, { status: "open", mergeRecovery: result.message ?? "GitHub did not merge this revision. Reconcile before another approval." });
+      this.changed("merge-result-uncertain", { gateId }, project.id);
       throw new Error(result.message ?? "GitHub did not merge this revision.");
+    }
     this.store.transaction(() => {
+      const mergedPr = { ...existingPr, url: gate.pr, headSha: reviewedSha,
+        status: "merged", reviewedSha, mergedSha: result.sha };
+      if (run) this.store.patch(run.id, { prEvidence: mergedPr });
+      if (intent) this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence: mergedPr } });
       this.store.patch(gateId, {
         status: "approved",
         reviewedSha,
@@ -747,6 +1524,10 @@ export class Engine extends EventEmitter {
         resolvedAt: new Date().toISOString(),
       });
       this.store.patch(gate.taskId, { status: "completed" });
+      const page = run && this.store.all("memory", project.id).find((item) =>
+        item.runId === run.id && item.taskId === gate.taskId &&
+        item.prEvidence?.headSha === reviewedSha && item.prEvidence?.url === gate.pr);
+      if (page) this.store.patch(page.id, { prEvidence: mergedPr });
       this.store.recordGateResponse(
         gate,
         `Approved and merged revision ${reviewedSha}.`,
@@ -762,11 +1543,58 @@ export class Engine extends EventEmitter {
         createdAt: new Date().toISOString(),
       });
     });
+    const outcomePage = run && this.store.all("memory", project.id).find((item) =>
+      item.runId === run.id && item.taskId === gate.taskId &&
+      item.prEvidence?.headSha === reviewedSha && item.prEvidence?.url === gate.pr);
+    if (outcomePage) await this.atomicWrite(
+      join(this.dataDir, "wiki", project.id, outcomePage.id + ".md"), this.pageMarkdown(outcomePage));
     this.changed(
       "pr-merged",
       { gateId, reviewedSha, mergedSha: result.sha },
       project.id,
     );
+  }
+  async requestChanges(gateId: string, reviewedSha: string, answer: string) {
+    if (this.prDecisionBusy.has(gateId))
+      throw new Error("A decision on this PR is already being submitted.");
+    this.prDecisionBusy.add(gateId);
+    try {
+      const gate = this.store.get(gateId, "gate");
+      if (gate.status !== "open" || gate.type !== "pr" || gate.mergeAttempt)
+        throw new Error("This PR review is no longer open.");
+      const project = this.store.get(gate.projectId, "project");
+      const task = this.store.get(gate.taskId, "task");
+      if (task.projectId !== project.id || task.status !== "awaiting_human")
+        throw new Error("This PR task is no longer awaiting human review.");
+      if (reviewedSha !== gate.sha)
+        throw new Error("Review the currently displayed revision before requesting changes.");
+      const info = await this.prInfo(gateId);
+      if (this.closed) return;
+      this.validateRemotePr(gate, project, info);
+      if (info.state !== "OPEN") throw new Error("Pull request is not open.");
+      if (info.headRefOid !== reviewedSha)
+        throw new Error("PR revision changed. Refresh and review the new commit.");
+      const resolvedAt = new Date().toISOString();
+      this.store.transaction(() => {
+        const current = this.store.get(gateId, "gate");
+        const currentTask = this.store.get(gate.taskId, "task");
+        if (current.status !== "open" || currentTask.status !== "awaiting_human")
+          throw new Error("This PR review is no longer open.");
+        this.store.patch(gateId, {
+          status: "resolved", answer, resolvedBy: "human", resolvedAt,
+          reviewedSha,
+        });
+        this.store.recordGateResponse(gate, answer, "human", resolvedAt);
+        this.store.patch(task.id, {
+          status: "ready", attempt: 0, judgeRetries: 0,
+          feedback: `Human requested changes to revision ${reviewedSha}: ${answer}`,
+        });
+
+      });
+      this.changed("pr-changes-requested", { gateId, reviewedSha }, project.id);
+    } finally {
+      this.prDecisionBusy.delete(gateId);
+    }
   }
   async resolve(
     gateId: string,
@@ -775,10 +1603,14 @@ export class Engine extends EventEmitter {
     actor: "human" | "judge" = "human",
     runId?: string,
   ) {
-    const gate = this.store.get(gateId);
+    const gate = this.store.get(gateId, "gate");
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
-    if (actor === "judge" && gate.type === "pr")
-      throw new Error("Every PR merge requires human approval.");
+    if (actor === "judge" && gate.type === "interrupted")
+      throw new Error("Interrupted work requires explicit human resolution.");
+    if (gate.type === "pr" && gate.mergeAttempt)
+      throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
+    if (gate.type === "pr")
+      throw new Error("PR gates require human approval of the exact revision through Approve & merge.");
     if (gate.type === "github")
       this.store.patch(
         gate.projectId,
@@ -789,6 +1621,8 @@ export class Engine extends EventEmitter {
         project = this.store.get(gate.projectId);
       if (current.status !== "open")
         throw new Error("Gate is already resolved.");
+      if (current.type === "pr" && current.mergeAttempt)
+        throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
       if (
         actor === "judge" &&
         (escalationMode(project) === "human" || project.status !== "running")
@@ -819,17 +1653,26 @@ export class Engine extends EventEmitter {
           .some((task) => !["completed", "cancelled"].includes(task.status))
       )
         this.store.patch(gate.projectId, { planned: false });
-      this.store.patch(gate.projectId, { status: "running" });
+      if (!this.store.hasOpenInterruption(gate.projectId))
+        this.store.patch(gate.projectId, { status: "running" });
     });
     this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
-  async verify(project: RecordData, task: RecordData, commands: string[], cleanupFixtures = false) {
+  async verify(project: RecordData, task: RecordData, commands: string[], cleanupFixtures = false, runId?: string) {
+    const originatingRunId = runId ?? this.store.get(task.id).implementationRunId;
+    if (originatingRunId) {
+      const run = this.store.get(originatingRunId);
+      if (run.projectId !== project.id || run.taskId !== task.id || run.role !== "implementation" ||
+          task.projectId !== project.id)
+        throw new Error("Verification run does not match the implementation task.");
+    }
     const evaluatorHash = commands.includes("node --import tsx scripts/measure-refresh.ts")
       ? createHash("sha256").update(await readFile(join(task.worktree, "scripts/measure-refresh.ts"))).digest("hex")
       : undefined;
     const report = await this.verificationRunner({
       cwd: task.worktree,
       commands,
+      runId: originatingRunId,
       dataDir: this.dataDir,
       codexBinary: this.runtime.binary,
       protectedPorts: [4319, 5173, Number(process.env.PORT ?? 4319)],
@@ -845,6 +1688,13 @@ export class Engine extends EventEmitter {
         createdAt: report.createdAt,
       },
     });
+    if (originatingRunId) await this.recordRunEvidence(task.id, { checkEvidence: {
+      reportId: report.id,
+      sourceHash: report.sourceHash,
+      sourceUnchanged: report.sourceUnchanged,
+      results: report.results.map((result) => ({ command: result.command, code: result.code })),
+      createdAt: report.createdAt,
+    } }, originatingRunId);
     for (const result of report.results)
       this.changed(
         "check-completed",
@@ -978,6 +1828,7 @@ export class Engine extends EventEmitter {
       !task?.worktree ||
       this.store.get(gate.id).status !== "open" ||
       gate.type === "pr" ||
+      this.store.hasOpenInterruption(project.id) ||
       escalationMode(currentProject) !== "yolo" ||
       currentProject.status !== "running"
     )
@@ -1027,7 +1878,7 @@ export class Engine extends EventEmitter {
     }
   }
   async judge(project: RecordData, gate: RecordData) {
-    if (gate.status !== "open") return;
+    if (gate.status !== "open" || this.store.hasOpenInterruption(project.id)) return;
     const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
     if (
       escalationMode(project) === "yolo" &&
@@ -1105,7 +1956,9 @@ Action retry: your specific decision permits continuing within existing capabili
           if (commands.length) {
             this.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
             this.changed("judge-verification-started", { gateId: gate.id, taskId: task.id }, project.id);
-            report = await this.verify(project, task, commands, result.verificationRequests.includes("cleanup-test-fixtures"));
+            report = await this.verify(project, task, commands,
+              result.verificationRequests.includes("cleanup-test-fixtures"),
+              this.store.get(task.id).implementationRunId);
           }
         } catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
@@ -1301,9 +2154,16 @@ Action retry: your specific decision permits continuing within existing capabili
       });
   }
   tick() {
+    if (this.closed) return;
+    for (const project of this.store.all("project")) {
+      if (!project.github || !project.branch || this.syncingProjects.has(project.id) ||
+          (this.nextRemoteSync.get(project.id) ?? 0) > Date.now()) continue;
+      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" && (["open", "merging"].includes(g.status) || (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id))))
+        void this.syncProject(project.id);
+    }
     const limit = this.settings().concurrency;
     for (const project of this.store.all("project")) {
-      if (project.status !== "running") continue;
+      if (project.status !== "running" || this.store.hasOpenInterruption(project.id)) continue;
       const gates = this.store
         .all("gate", project.id)
         .filter((gate) => gate.status === "open");

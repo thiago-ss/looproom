@@ -8,18 +8,30 @@ export type RecordData = { id: string; [key: string]: any };
 export class Store {
   db: DatabaseSync;
   private allRecordsStatement: StatementSync;
+  revision = 0;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
-    this.db
-      .exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1);
-      CREATE INDEX IF NOT EXISTS record_kind ON records(kind);
-      CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
-      CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, project_id UNINDEXED, title, content);`);
-    this.allRecordsStatement = this.db.prepare(
-      "SELECT data FROM records WHERE kind=? ORDER BY rowid",
-    );
+    try {
+      // A failed integrity check must not be followed by schema writes or
+      // default-setting initialization on a damaged existing database.
+      const results = this.db.prepare("PRAGMA quick_check").all() as {
+        quick_check: string;
+      }[];
+      if (results.length !== 1 || results[0].quick_check !== "ok")
+        throw new Error("Looproom database integrity check failed.");
+      this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+        CREATE TABLE IF NOT EXISTS records (id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS record_kind ON records(kind);
+        CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, type TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED, project_id UNINDEXED, title, content);`);
+      this.allRecordsStatement = this.db.prepare(
+        "SELECT data FROM records WHERE kind=? ORDER BY rowid",
+      );
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
   all(kind: string, projectId?: string): RecordData[] {
     const rows = this.allRecordsStatement.all(kind) as { data: string }[];
@@ -27,11 +39,12 @@ export class Store {
       .map((row) => JSON.parse(row.data))
       .filter((row) => !projectId || row.projectId === projectId);
   }
-  get(id: string): RecordData {
+  get(id: string, kind?: string): RecordData {
     const row = this.db
-      .prepare("SELECT data FROM records WHERE id=?")
-      .get(id) as { data: string } | undefined;
+      .prepare("SELECT data,kind FROM records WHERE id=?")
+      .get(id) as { data: string; kind: string } | undefined;
     if (!row) throw new Error("Record not found");
+    if (kind && row.kind !== kind) throw new Error("Record not found");
     return JSON.parse(row.data);
   }
   put(
@@ -45,6 +58,7 @@ export class Store {
         "INSERT INTO records(id,kind,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data,version=records.version+1",
       )
       .run(id, kind, JSON.stringify(record));
+    this.revision++;
     return record;
   }
   patch(id: string, changes: Record<string, any>): RecordData {
@@ -52,6 +66,7 @@ export class Store {
     this.db
       .prepare("UPDATE records SET data=?,version=version+1 WHERE id=?")
       .run(JSON.stringify(record), id);
+    this.revision++;
     return record;
   }
   transaction<T>(fn: () => T): T {
@@ -76,6 +91,7 @@ export class Store {
         JSON.stringify(data),
         new Date().toISOString(),
       );
+    this.revision++;
   }
   events(projectId?: string) {
     const rows = this.db
@@ -85,20 +101,28 @@ export class Store {
       .all(projectId ?? null, projectId ?? null) as any[];
     return rows.map((row) => ({ ...row, data: JSON.parse(row.data) }));
   }
-  memory(projectId: string, title: string, content: string, sources: string[]) {
+  memory(projectId: string, title: string, content: string, sources: string[], runId?: string, claims: any[] = [], taskId?: string) {
+    const id = runId ? "memory:" + runId : randomUUID();
+    const existing = runId ? this.db.prepare("SELECT data FROM records WHERE id=?").get(id) as { data: string } | undefined : undefined;
+    if (existing) return JSON.parse(existing.data) as RecordData;
+    return this.transaction(() => {
     const record = this.put("memory", {
       projectId,
       title,
       content,
       sources,
+      runId,
+      taskId,
+      claims,
       createdAt: new Date().toISOString(),
-    });
+    }, id);
     this.db
       .prepare(
         "INSERT INTO memory_search(id,project_id,title,content) VALUES(?,?,?,?)",
       )
       .run(record.id, projectId, title, content);
     return record;
+    });
   }
   search(projectId: string, query: string) {
     const terms = query
@@ -220,6 +244,10 @@ export class Store {
         Number(b.kind === "escalation") - Number(a.kind === "escalation"),
     );
   }
+  hasOpenInterruption(projectId: string) {
+    return this.all("gate", projectId).some((gate) =>
+      gate.status === "open" && gate.type === "interrupted");
+  }
   recover() {
     this.transaction(() => {
       const interrupted = this.all("run").filter(
@@ -231,6 +259,22 @@ export class Store {
           projectId: run.projectId,
           taskId: run.taskId,
         }));
+      const openGates = this.all("gate").filter((gate) => gate.status === "open");
+      // A YOLO judgment may submit a reply or start worktree recovery. Its
+      // interrupted run needs a human gate even when the task was blocked.
+      for (const run of interrupted.filter((run) => run.role === "judge" && run.taskId)) {
+        if (escalationMode(this.get(run.projectId)) !== "yolo") continue;
+        if (openGates.some((gate) =>
+          gate.projectId === run.projectId && gate.taskId === run.taskId &&
+          gate.type !== "pr" && gate.judgeStatus === "running"))
+          recovery.push({ projectId: run.projectId, taskId: run.taskId });
+      }
+      const activeRecoveryGates = openGates.filter(
+        (gate) => gate.taskId &&
+          ["running", "verifying"].includes(gate.judgeRecoveryStatus),
+      );
+      for (const gate of activeRecoveryGates)
+        recovery.push({ projectId: gate.projectId, taskId: gate.taskId });
       for (const run of interrupted)
         this.patch(run.id, {
           status: "interrupted",
@@ -238,15 +282,20 @@ export class Store {
           finishedAt: new Date().toISOString(),
         });
       for (const gate of this.all("gate").filter(
-        (gate) => gate.status === "open" && gate.judgeStatus === "running",
+        (gate) => gate.status === "open" &&
+          (gate.judgeStatus === "running" || activeRecoveryGates.some((active) => active.id === gate.id)),
       ))
         this.patch(gate.id, {
           judgeStatus:
-            escalationMode(this.get(gate.projectId)) === "yolo" &&
-            (gate.judgeFailures ?? 0) < 3
-              ? "pending"
-              : "failed",
-          judgeError: "Coordinator restarted during judgment.",
+            gate.judgeStatus === "running"
+              ? escalationMode(this.get(gate.projectId)) === "yolo" &&
+                  (gate.judgeFailures ?? 0) < 3
+                ? "pending"
+                : "failed"
+              : gate.judgeStatus,
+          judgeError: gate.judgeStatus === "running"
+            ? "Coordinator restarted during judgment."
+            : gate.judgeError,
           judgeRecoveryStatus:
             ["running", "verifying"].includes(gate.judgeRecoveryStatus)
               ? "interrupted"
@@ -263,11 +312,9 @@ export class Store {
         seen.add(key);
         if (item.taskId) this.patch(item.taskId, { status: "blocked" });
         this.patch(item.projectId, { status: "paused" });
-        if (
-          this.all("gate", item.projectId).some(
-            (gate) => gate.status === "open" && gate.taskId === item.taskId,
-          )
-        )
+        if (this.all("gate", item.projectId).some(
+          (gate) => gate.status === "open" && gate.type === "interrupted" && gate.taskId === item.taskId,
+        ))
           continue;
         this.put("gate", {
           ...item,

@@ -40,9 +40,7 @@ import {
 } from "lucide-react";
 import { Button } from "./components/ui/button";
 import { Select } from "./components/ui/select";
-import { Checkbox } from "./components/ui/checkbox";
 import { Accordion } from "./components/arc/accordion/accordion";
-import FolderPicker from "./components/FolderPicker";
 
 import {
   NotificationCenter,
@@ -60,7 +58,6 @@ import { Input } from "./components/ui/input";
 import { Textarea } from "./components/ui/textarea";
 import { Dialog, DialogContent } from "./components/ui/dialog";
 import { DotmSquare3 } from "./components/ui/dotm-square-3";
-import Stepper, { Step } from "./components/ui/Stepper";
 import StatusMark from "./components/ui/StatusMark";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "./components/ui/tabs";
 import {
@@ -69,15 +66,17 @@ import {
   PopoverContent,
 } from "./components/ui/popover";
 import ConversationMessages from "./components/ConversationMessages";
+import LazyRouteBoundary from "./components/LazyRouteBoundary";
 import { Switch } from "./components/ui/switch";
 const Work = lazy(() => import("./components/Work"));
 import { frontierState, frontierLabel, waitingOnBlocker } from "./lib/work";
 import { api, type Data } from "./lib/api";
-import { createRefresh } from "./lib/refresh";
+import { createStateStream } from "./lib/state-stream";
 
 const Memory = lazy(() => import("./components/Memory"));
 const Room = lazy(() => import("./components/AgentRoom"));
 const AgentOrb = lazy(() => import("./components/AgentOrb"));
+const Onboarding = lazy(() => import("./components/Onboarding"));
 type View = "goal" | "work" | "room" | "review" | "memory" | "settings";
 const NAV = [
   { id: "goal", label: "Goal", icon: MessageSquare },
@@ -192,9 +191,8 @@ export default function App() {
   }
   const refreshRef = useRef<() => Promise<void>>(async () => {});
   useEffect(() => {
-    let alive = true;
-    let initialized = false;
-    const refresh = createRefresh(
+    let loaded = false;
+    const stateStream = createStateStream(
       () => {
         roomFetchRef.current = viewRef.current === "room";
         return api<Data>(roomFetchRef.current ? "/state?events=1" : "/state");
@@ -206,10 +204,8 @@ export default function App() {
           setRoomHistoryStatus("ready");
           setRoomHistoryError("");
         }
-        if (!initialized) {
-          initialized = true;
-          if (!state.projects.length) setOnboarding(true);
-        }
+        if (!loaded && !state.projects.length) setOnboarding(true);
+        loaded = true;
       },
       (error) => {
         setConnectionError(error.message);
@@ -218,21 +214,22 @@ export default function App() {
           setRoomHistoryError(error.message);
         }
       },
+      (onMessage, onError, onOpen) => {
+        const events = new EventSource("/api/events");
+        events.onmessage = onMessage;
+        events.onerror = onError;
+        events.onopen = onOpen;
+        return { close: () => events.close() };
+      },
     );
-    refreshRef.current = refresh.request;
-    void refresh.request();
-    const events = new EventSource("/api/events");
-    events.onmessage = () => {
-      if (alive) void refreshRef.current();
-    };
+    refreshRef.current = stateStream.refresh;
+    void stateStream.refresh();
     const timer = setInterval(() => {
-      if (alive) void refreshRef.current();
+      void stateStream.refresh();
     }, 15000);
     return () => {
-      alive = false;
-      refresh.dispose();
+      stateStream.stop();
       clearInterval(timer);
-      events.close();
     };
   }, []);
   useLayoutEffect(() => {
@@ -306,6 +303,8 @@ export default function App() {
     >
       <ToastStack position="bottom-right" />
       {onboarding ? (
+        <LazyRouteBoundary>
+        <Suspense fallback={<Pending label="Opening project setup" />}>
         <Onboarding
           data={data}
           onDone={(id) => {
@@ -317,6 +316,8 @@ export default function App() {
           onBack={data.projects.length ? () => setOnboarding(false) : undefined}
           refresh={() => refreshRef.current()}
         />
+        </Suspense>
+        </LazyRouteBoundary>
       ) : (
         <>
           <aside className="sidebar">
@@ -467,6 +468,7 @@ export default function App() {
                 </Button>
               </Empty>
             ) : (
+              <LazyRouteBoundary key={project.id + ":" + view}>
               <>
                 {view === "goal" ? (
                   <Goal
@@ -540,6 +542,7 @@ export default function App() {
                       pages={data.memory.filter(
                         (page) => page.projectId === project.id,
                       )}
+                      tasks={data.tasks.filter((task) => task.projectId === project.id)}
                     />
                   </Suspense>
                 ) : null}
@@ -553,6 +556,7 @@ export default function App() {
                   />
                 ) : null}
               </>
+              </LazyRouteBoundary>
             )}
           </main>
         </>
@@ -571,390 +575,6 @@ export default function App() {
   );
 }
 
-const initialDraft = {
-  step: 1,
-  mode: "existing",
-  path: "",
-  name: "",
-  goal: "",
-  constraints:
-    "Require human approval for every PR merge. Work only toward this goal.",
-  checks: "npm run build",
-  connectLater: false,
-};
-function Onboarding({
-  data,
-  onDone,
-  onBack,
-  refresh,
-}: {
-  data: Data;
-  onDone: (id: string) => void;
-  onBack?: () => void;
-  refresh: () => Promise<void>;
-}) {
-  const [draft, setDraft] = useState(() => {
-    try {
-      return {
-        ...initialDraft,
-        ...JSON.parse(localStorage.getItem("looproom.onboarding.v1") ?? "{}"),
-      };
-    } catch {
-      return initialDraft;
-    }
-  });
-  const [repo, setRepo] = useState<any>(null),
-    [pending, setPending] = useState(false),
-    [error, setError] = useState(""),
-    [authUrl, setAuthUrl] = useState("");
-  useEffect(
-    () => localStorage.setItem("looproom.onboarding.v1", JSON.stringify(draft)),
-    [draft],
-  );
-  const update = (key: string, value: string | boolean) => {
-    setDraft((draft: any) => ({ ...draft, [key]: value }));
-    if (["path", "mode"].includes(key)) setRepo(null);
-  };
-  async function inspect() {
-    setPending(true);
-    setError("");
-    try {
-      const result = await api("/repos/inspect", {
-        path: draft.path,
-        mode: draft.mode,
-      });
-      setRepo(result);
-      if (!draft.name) update("name", result.path.split("/").pop());
-    } catch (error) {
-      setError((error as Error).message);
-    } finally {
-      setPending(false);
-    }
-  }
-  async function connect() {
-    setPending(true);
-    setError("");
-    try {
-      const result = await api("/runtime/login", {});
-      const url = new URL(result.authUrl);
-      if (
-        !["auth.openai.com", "chatgpt.com", "auth.chatgpt.com"].includes(
-          url.hostname,
-        )
-      )
-        throw new Error("Unexpected sign-in address.");
-      setAuthUrl(url.href);
-      window.open(url.href, "_blank", "noopener,noreferrer");
-    } catch (error) {
-      setError((error as Error).message);
-    } finally {
-      setPending(false);
-    }
-  }
-  async function create() {
-    setPending(true);
-    setError("");
-    try {
-      const project = await api("/projects", {
-        ...draft,
-        checks: draft.checks
-          .split("\n")
-          .map((line: string) => line.trim())
-          .filter(Boolean),
-      });
-      localStorage.removeItem("looproom.onboarding.v1");
-      onDone(project.id);
-    } catch (error) {
-      setError((error as Error).message);
-    } finally {
-      setPending(false);
-    }
-  }
-  const account = data.runtime.account;
-  const disabled =
-    pending ||
-    (draft.step === 1 && !repo) ||
-    (draft.step === 2 && account?.type !== "chatgpt" && !draft.connectLater) ||
-    (draft.step === 3 && (draft.goal.trim().length < 5 || !draft.name.trim()));
-  return (
-    <main className="onboarding">
-      <header>
-        <a className="wordmark light" href="#">
-          <img src="/brand/looproom-mark.svg?v=3" alt="" />
-          looproom
-        </a>
-        {onBack ? (
-          <Button variant="ghost" onClick={onBack}>
-            <ArrowLeft size={14} />
-            Back to workspace
-          </Button>
-        ) : (
-          <span className="local-label">Your work. Your Mac.</span>
-        )}
-      </header>
-      <div className="onboarding-layout">
-        <section className="welcome">
-          <div className="welcome-copy">
-            <h1>
-              Give good work
-              <br />
-              room to happen.
-            </h1>
-            <p>
-              A clear goal. Agents that move it forward.
-              <br />
-              Your judgment at the moments that matter.
-            </p>
-          </div>
-          <img
-            className="brand-sculpture"
-            src="/brand/brand-sculpture.png"
-            alt="Two continuous loops meeting at a human gate"
-          />
-          <div className="onboarding-promise">
-            <ShieldCheck size={18} />
-            <p>
-              Code stays in isolated worktrees.
-              <br />
-              Every merge waits for your approval.
-            </p>
-          </div>
-        </section>
-        <section className="setup" aria-label="Project setup">
-          <Stepper
-            initialStep={draft.step}
-            onStepChange={(step) =>
-              setDraft((draft: any) => ({ ...draft, step }))
-            }
-            disableStepIndicators
-            stepCircleContainerClassName="setup-frame"
-            stepContainerClassName="setup-progress"
-            contentClassName="setup-content"
-            footerClassName="setup-footer"
-            nextButtonText="Continue"
-            finalButtonText="Create project"
-            nextButtonProps={{
-              disabled,
-              className: "setup-next",
-              ...(draft.step === 4 ? { onClick: create } : {}),
-            }}
-            backButtonProps={{ disabled: pending, className: "setup-back" }}
-          >
-            <Step>
-              <div className="step-heading">
-                <p>01 / Project</p>
-                <h2>Where will we work?</h2>
-                <p>Open a repository or start a new project.</p>
-              </div>
-              <div className="mode-picker">
-                <Button
-                  variant="ghost"
-                  className={draft.mode === "existing" ? "active" : ""}
-                  onClick={() => update("mode", "existing")}
-                >
-                  Existing repository
-                </Button>
-                <Button
-                  variant="ghost"
-                  className={draft.mode === "new" ? "active" : ""}
-                  onClick={() => update("mode", "new")}
-                >
-                  New project
-                </Button>
-              </div>
-
-              <FolderPicker
-                value={draft.path}
-                onChange={(path) => update("path", path)}
-                mode={draft.mode}
-              />
-              <Button
-                variant="outline"
-                onClick={inspect}
-                disabled={pending || !draft.path}
-              >
-                {pending ? "Checking folder…" : "Check folder"}
-                <ArrowRight size={14} />
-              </Button>
-              {repo ? (
-                <div className="repo-confirmed">
-                  <Check size={15} />
-                  <div>
-                    <strong>{repo.path.split("/").pop()}</strong>
-                    <span>
-                      {repo.branch}
-                      {repo.remote
-                        ? " · GitHub remote detected"
-                        : " · Connect GitHub when a PR is ready"}
-                    </span>
-                    {repo.dirty ? (
-                      <span>
-                        Agents will start from the committed revision.
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-              ) : null}
-            </Step>
-            <Step>
-              <div className="step-heading">
-                <p>02 / Runtime</p>
-                <h2>Connect your agents.</h2>
-                <p>Use your ChatGPT plan through the local Codex runtime.</p>
-              </div>
-              <div className="account-row">
-                <span
-                  className={
-                    "connection-dot " +
-                    (account?.type === "chatgpt" ? "connected" : "")
-                  }
-                />
-                <div>
-                  <strong>
-                    {account?.type === "chatgpt"
-                      ? "ChatGPT connected"
-                      : "ChatGPT account"}
-                  </strong>
-                  <span>
-                    {account?.email ?? "Sign in securely in your browser"}
-                  </span>
-                </div>
-              </div>
-              {account?.type !== "chatgpt" ? (
-                <Button onClick={connect} disabled={pending}>
-                  Continue with ChatGPT
-                  <ExternalLink size={14} />
-                </Button>
-              ) : (
-                <p className="success-text">
-                  <Check size={14} />
-                  Ready to connect your first goal
-                </p>
-              )}
-              {authUrl ? (
-                <p className="auth-help">
-                  <a href={authUrl} target="_blank" rel="noreferrer">
-                    Open sign-in again
-                  </a>
-                  <Button variant="ghost" onClick={refresh}>
-                    I’ve signed in · Refresh
-                  </Button>
-                </p>
-              ) : null}
-              <div className="model-summary">
-                <div>
-                  <span>Orchestrator</span>
-                  <strong>{data.settings.orchestrator.model}</strong>
-                  <small>{data.settings.orchestrator.effort} reasoning</small>
-                </div>
-                <div>
-                  <span>Workers</span>
-                  <strong>{data.settings.subagent.model}</strong>
-                  <small>{data.settings.subagent.effort} reasoning</small>
-                </div>
-              </div>
-              <p className="field-help">
-                Model access is confirmed by the first completed run. Change
-                defaults later in Settings.
-              </p>
-              {data.runtime.error ? (
-                <Alert tone="danger" title={data.runtime.error} />
-              ) : null}
-              {account?.type !== "chatgpt" ? (
-                <label className="connect-later">
-                  <Checkbox
-                    checked={draft.connectLater}
-                    onCheckedChange={(checked) =>
-                      update("connectLater", checked === true)
-                    }
-                  />
-                  Set up my account later
-                </label>
-              ) : null}
-            </Step>
-            <Step>
-              <div className="step-heading">
-                <p>03 / Goal</p>
-                <h2>What should get better?</h2>
-                <p>Describe the outcome. Agents will research the path.</p>
-              </div>
-              <Input
-                id="project-name"
-                label="Project name"
-                value={draft.name}
-                onChange={(event) => update("name", event.target.value)}
-              />
-              <Textarea
-                id="project-goal"
-                label="Your goal"
-                rows={5}
-                value={draft.goal}
-                onChange={(event) => update("goal", event.target.value)}
-                placeholder="Build a workshop booking app that feels clear, fast, and welcoming. Organizers should manage sessions; visitors should reserve a place."
-              />
-              <Textarea
-                id="project-constraints"
-                label="Boundaries"
-                rows={2}
-                value={draft.constraints}
-                onChange={(event) => update("constraints", event.target.value)}
-              />
-            </Step>
-            <Step>
-              <div className="step-heading">
-                <p>04 / Ready</p>
-                <h2>A useful first step.</h2>
-                <p>Start with a sourced plan. Then move into implementation.</p>
-              </div>
-              <dl className="setup-review">
-                <dt>Project</dt>
-                <dd>{draft.name}</dd>
-                <dt>Folder</dt>
-                <dd className="mono">{draft.path}</dd>
-                <dt>Goal</dt>
-                <dd>{draft.goal}</dd>
-              </dl>
-              <Textarea
-                id="setup-checks"
-                label="Acceptance checks · one command per line"
-                rows={2}
-                value={draft.checks}
-                onChange={(event) => update("checks", event.target.value)}
-              />
-              <p className="field-help">
-                These are commands you authorize in isolated worktrees. Leave
-                blank while researching; add before publishing code.
-              </p>
-              <p className="approval-note">
-                <Square size={12} />
-                Every PR is yours to review and merge.
-              </p>
-            </Step>
-          </Stepper>
-          {error ? (
-            <Alert
-              tone="danger"
-              title="Could not continue"
-              className="setup-error"
-            >
-              {error}
-            </Alert>
-          ) : null}
-          {pending ? (
-            <div className="setup-loading">
-              <Pending
-                label={
-                  draft.step === 4 ? "Creating your workspace" : "Connecting"
-                }
-              />
-            </div>
-          ) : null}
-        </section>
-      </div>
-      <footer>Continuous work, with a human point of rest.</footer>
-    </main>
-  );
-}
 
 function Goal({
   project,
@@ -1284,7 +904,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
     return () => {
       alive = false;
     };
-  }, [gate?.id, gate?.sha]);
+  }, [gate?.id, gate?.sha, gate?.mergeAttempt?.requestedAt]);
   if (!gates.length)
     return (
       <section className="page">
@@ -1314,13 +934,18 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
       <div className="response-actions">
         <Button
           variant="outline"
-          disabled={busy || !answer.trim()}
+          disabled={busy || !answer.trim() || (gate.type === "pr" && (!gate.sha || !!gate.mergeAttempt))}
           onClick={() =>
             act(() =>
-              api("/gates/" + gate.id + "/resolve", {
-                answer,
-                retry: true,
-              }),
+              gate.type === "pr"
+                ? api("/gates/" + gate.id + "/changes", {
+                    answer,
+                    sha: gate.sha,
+                  })
+                : api("/gates/" + gate.id + "/resolve", {
+                    answer,
+                    retry: true,
+                  }),
             )
           }
         >
@@ -1513,6 +1138,33 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                 <Pending label="Fetching the current PR revision and diff" />
               ) : null}
               {loadError ? <Alert tone="danger" title={loadError} /> : null}
+              {gate.mergeRecovery ? (
+                <Alert
+                  tone="warning"
+                  title={gate.mergeAttempt ? "Merge attempt needs reconciliation" : "Merge attempt reconciled"}
+                >
+                  {gate.mergeRecovery}
+                </Alert>
+              ) : null}
+              {gate.mergeAttempt ? (
+                <>
+                  <p className="muted">
+                    Reconcile rereads this PR without retrying the merge. If it
+                    merged at the reviewed commit, the task completes without a
+                    recorded approval. If it is still open at that commit, you
+                    can review it for a fresh approval. If its head changed or
+                    it closed unmerged, the attempt is preserved in history and
+                    the task waits for you to Request changes.
+                  </p>
+                  <Button
+                    variant="secondary"
+                    disabled={busy || loading}
+                    onClick={() => act(() => api("/gates/" + gate.id + "/reconcile-merge", {}))}
+                  >
+                    Reconcile merge attempt
+                  </Button>
+                </>
+              ) : null}
               {pr ? (
                 <>
                   <dl className="revision">
@@ -1525,8 +1177,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                   </dl>
                   {pr.headRefOid !== gate.sha ? (
                     <Alert tone="warning" title="Revision changed">
-                      Request changes so agents can verify and publish the new
-                      commit.
+                      {gate.mergeAttempt ? "Reconcile the interrupted merge attempt, then Request changes so agents can verify and publish the new commit." : "Request changes so agents can verify and publish the new commit."}
                     </Alert>
                   ) : null}
                   <h3>Verification</h3>
@@ -1587,6 +1238,7 @@ function ReviewInbox({ gates, tasks, act, busy }: any) {
                     className="merge-button"
                     disabled={
                       busy ||
+                      !!gate.mergeAttempt ||
                       pr.headRefOid !== gate.sha ||
                       pr.state !== "OPEN" ||
                       pr.mergeable !== "MERGEABLE"
@@ -1914,8 +1566,9 @@ function Settings({ data, project, act, busy, refresh }: any) {
           onChange={(event) => setChecks(event.target.value)}
         />
         <p className="field-help">
-          Commands run through the Codex workspace sandbox with direct network
-          disabled. Package installation may need a human step.
+          Checks run in disposable task worktree copies. Internet access is
+          disabled; local test servers are allowed. Dependencies must be
+          available locally.
         </p>
         <ActionButton
           disabled={busy}

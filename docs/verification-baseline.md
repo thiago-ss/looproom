@@ -423,3 +423,45 @@ bind `127.0.0.1` (`listen EPERM`); the coordinator's isolated check runner
 must execute the new test before handoff. The application endpoint sends a
 `connected` frame on each connection, which the existing `onmessage` handler
 routes through the serialized refresh path.
+
+## PR #7 base integration (2026-10-02)
+
+The current worktree combines the kept event-history query and prepared
+`Store.all` statement with the newer base branch's state snapshot cache,
+integrity check, and EventSource reconnect lifecycle. The cache now keeps
+separate entries for plain `/api/state` and `/api/state?events=1`, keyed by
+Store and runtime revisions. Agent room still requests event history on entry;
+other views request the smaller response. The API test checks both variants
+in sequence, including a return to the plain variant. No evaluator source,
+workload, acceptance threshold, dependency, or FTS5 retrieval path changed.
+
+**Integrated revision outcome: kept under the unchanged frozen rule.**
+Coordinator report
+`.looproom-verification/b269f9e8-90be-4799-8cd2-e5a11b1f6f7a.json`
+records source hash
+`99e70aa1805fcdb82300e0d57bc6b165b4626e75ef06218818a45f4ce5b65426`,
+`sourceUnchanged: true`, evaluator exit 0, and the same five-repetition
+workload. The local evaluator source still hashes to
+`ec72c39beda16d1906aa92fdea71e89c56125477c2ca986406e3d6bf68ca0858`.
+The matching-source report
+`.looproom-verification/11cc40aa-c6f5-47ac-ad58-9298978c7ebb.json`
+records build, tests and UI check exit 0: 137 tests passed, zero failed and
+one verifier-within-verifier case was skipped in the isolated runner. The
+native worker-denial and live EventSource reconnect tests passed.
+
+| Metric | Post-removal baseline median | Integrated observations, in run order | Integrated median | Change |
+|---|---:|---|---:|---:|
+| Refresh bytes | 19,393 | 8,504, 8,665, 8,827, 8,989, 9,151 | 8,827 | 54.5% lower |
+| Coordinator round trip (ms) | 2.947208 | 1.411916, 1.022875, 0.953167, 4.033458, 2.886667 | 1.411916 | 52.1% lower |
+| Update latency (ms) | 154.003709 | 159.589167, 152.474125, 153.364542, 154.444208, 153.809291 | 153.809291 | 0.1% lower |
+
+The byte reduction exceeds the frozen 10% threshold and the baseline's
+observed byte variation of 19,094–19,693. Neither latency median regressed.
+The judge directed a keep decision for this integrated revision. This
+supersedes the preceding provisional statement that the integrated source had
+no measurement; it does not change the earlier pre-integration candidate-2
+decision or the candidate-1 discard and contradictory repeats. The evaluator
+measures direct `/api/state` reads, not browser request count or reconnect
+latency. These reports fingerprint the application source before this record
+was updated; the coordinator's publication checks must cover this documentation
+change. No PR merge was approved.

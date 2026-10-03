@@ -30,7 +30,7 @@ import StatusMark from "./ui/StatusMark";
 import JudgePending from "./JudgePending";
 import DependencyGraph from "./DependencyGraph";
 import { frontierState, frontierGroup, frontierLabel } from "../lib/work";
-import { escalationMode } from "../lib/autonomy";
+import { escalationMode, taskOpenGate } from "../lib/autonomy";
 import "./work.css";
 
 const AgentOrb = lazy(() => import("./AgentOrb"));
@@ -122,9 +122,7 @@ export default function Work({
     visible.find((record) => record.group === "attention") ??
     visible[0];
   const task = selected?.task;
-  const gate = gates.find(
-    (gate) => gate.status === "open" && gate.taskId === task?.id,
-  );
+  const gate = taskOpenGate(gates, task?.id);
   const taskRuns = runs.filter((run) => run.taskId === task?.id);
   const active = taskRuns.find((run) => run.status === "running");
   const role =
@@ -438,6 +436,8 @@ export default function Work({
                           <strong>
                             {gate.type === "pr"
                               ? "Ready for your review"
+                              : gate.type === "interrupted"
+                                ? "Waiting for your review"
                               : gate.awaitingCapability
                                 ? "Judge replied · still blocked"
                                 : "A decision is holding this task"}
@@ -462,6 +462,8 @@ export default function Work({
                           <span>
                             {gate.type === "pr"
                               ? "You approve the merge"
+                              : gate.type === "interrupted"
+                                ? "Waiting for human review"
                               : mode === "yolo"
                                 ? gate.judgeNextAttemptAt
                                   ? `Next check ${new Date(gate.judgeNextAttemptAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
@@ -472,12 +474,12 @@ export default function Work({
                             variant="ghost"
                             size="sm"
                             onClick={
-                              gate.type === "pr" || mode !== "yolo"
+                              gate.type === "pr" || gate.type === "interrupted" || mode !== "yolo"
                                 ? onReview
                                 : onGoal
                             }
                           >
-                            {gate.type === "pr" || mode !== "yolo"
+                            {gate.type === "pr" || gate.type === "interrupted" || mode !== "yolo"
                               ? "Review"
                               : "Conversation"}
                             <ArrowUpRight size={14} />
