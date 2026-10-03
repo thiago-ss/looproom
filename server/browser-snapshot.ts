@@ -54,8 +54,8 @@ function validReview(binding: PrReviewBinding, review: FrozenPrReview) {
     review.baseSha === binding.baseSha &&
     review.info?.url === binding.pr && review.info?.headRefOid === binding.sha &&
     review.info?.baseRefName === binding.base && review.info?.number === number && review.info?.state === "OPEN" &&
-    /^[a-f0-9]{40}$/.test(review.info?.baseRefOid ?? "") &&
-    (binding.baseSha == null || review.info.baseRefOid === binding.baseSha) &&
+    (binding.baseSha == null ||
+      (/^[a-f0-9]{40}$/.test(review.info?.baseRefOid ?? "") && review.info.baseRefOid === binding.baseSha)) &&
     typeof review.diff === "string" && !!review.diff.trim() &&
     Buffer.byteLength(review.diff, "utf8") <= 2_000_000 &&
     Buffer.byteLength(JSON.stringify(review.info), "utf8") <= 500_000;
