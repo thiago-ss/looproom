@@ -104,6 +104,8 @@ export function validateDependencies(tasks: { dependencies: number[] }[]) {
 }
 const WORKFLOW = `Use Looproom's versioned adaptation of Matt Pocock's Wayfinder -> primary-source research -> spec/tickets -> implement. Routine questions are answered from repository evidence with assumptions recorded. Never impersonate a human in original HITL steps. Ponytail: reuse existing behavior, standard library and native features before adding code/dependencies. Preserve accessibility and validation. Cite repo files and primary sources. Karpathy LLM Wiki: source-backed outcomes, explicit contradictions; your own previous output is not independent evidence. Where the output schema offers claims, use a stable subject key, precise statement, and source references; explicitly mark contradictions or supersession. An earlier agent report is never independent support. Omit claims if no specific sourced claim can be extracted. Autoresearch: bounded changes, frozen acceptance criteria, measurable baseline/candidate, keep or discard; never change the evaluator to improve the score. Jev retrieval is a candidate to compare against FTS5, not a claim of proven savings. UI requirements: Arc primitives installed through shadcn, selective ReactBits, DotMatrix pending states, Orbkit idle/thinking based on events; retain supplied brand if this is a UI project. No fake data, activity or metrics.`;
 
+const PUBLICATION_WAIT = "GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.";
+
 function autonomyPolicy(project: RecordData) {
   if (escalationMode(project) !== "yolo")
     return `Autonomy mode: ${escalationMode(project)}. Preserve the configured human/draft submission rules.`;
@@ -948,7 +950,9 @@ export class Engine extends EventEmitter {
       Review,
       task,
     );
-    this.store.patch(task.id, { review });
+    const reviewRun = this.store.all("run", project.id).findLast(run =>
+      run.taskId === task.id && run.role === "review" && run.status === "completed");
+    this.store.patch(task.id, { review, reviewRunId: reviewRun?.id ?? null });
     if (review.verdict === "changes") {
       this.repairOrGate(
         project,
@@ -1120,13 +1124,28 @@ export class Engine extends EventEmitter {
         "A commit hook or concurrent edit changed checked source. Repeat verification and full task review before pushing.", "check");
       return;
     }
-    await git(task.worktree, ["push", "origin", task.branch]);
     const sha = await git(task.worktree, ["rev-parse", "HEAD"]);
+    const publicationIntent = {
+      sha, pr: task.pr ?? null, gateId: task.prRepair?.gateId ?? null,
+      branch: task.branch, base: project.branch, tree: task.reviewedSource.tree,
+      sourceHash: task.reviewedSource.sourceHash, reviewedHead: task.reviewedSource.head,
+      parents: await git(task.worktree, ["show", "-s", "--format=%P", "HEAD"]),
+      verificationReportId: task.verification?.id ?? null,
+      reviewRunId: task.reviewRunId ?? null, implementationRunId: task.implementationRunId ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.store.patch(task.id, { publicationIntent });
+    await git(task.worktree, ["push", "origin", task.branch]);
     if (task.pr) {
       const { gate, info } = await this.publicationPrInfo(project, task);
       if (this.closed) return;
       if (info.state !== "OPEN") { this.retireRepairPr(project, task, gate, info); return; }
-      if (info.headRefOid !== sha) throw new Error("GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.");
+      if (info.headRefOid !== sha) {
+        const wait = this.gate(project.id, "Work needs attention", PUBLICATION_WAIT, "runtime", task.id,
+          { awaitingCapability: true, publicationIntentSha: sha });
+        this.store.patch(task.id, { publicationIntent: { ...publicationIntent, waitGateId: wait.id } });
+        return;
+      }
     }
     let url = task.pr;
     if (!url) {
@@ -1137,7 +1156,7 @@ export class Engine extends EventEmitter {
       );
       url = await this.createPrOrReuse(project, task, sha, bodyPath);
     }
-    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha, prRepair: null });
+    this.store.patch(task.id, { status: "awaiting_human", pr: url, sha, prRepair: null, publicationIntent: null });
     const prRunId = await this.recordRunEvidence(task.id, { prEvidence: { url, headSha: sha, status: "awaiting_human" } });
     this.gate(project.id, "Review pull request", task.summary, "pr", task.id, {
       pr: url,
@@ -1221,6 +1240,169 @@ export class Engine extends EventEmitter {
     this.tick();
     await this.repairReconciledEvidence(this.store.get(gate.id));
   }
+  async confirmPublishedRepair(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    const active = () => this.busy.has("task:" + task.id) || this.busy.has("judge:" + project.id) ||
+      this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" &&
+        (g.judgeStatus === "running" || ["running", "verifying"].includes(g.judgeRecoveryStatus))) ||
+      this.store.all("run", project.id).some(run => run.taskId === task.id && run.status === "running");
+    if (this.closed || this.store.get(project.id).status !== "running" ||
+        this.store.hasOpenInterruption(project.id) || info.state !== "OPEN" ||
+        info.mergeable !== "MERGEABLE" || gate.status !== "superseded" ||
+        !["blocked", "verifying"].includes(task.status) || !task.worktree || !task.branch ||
+        active()) return;
+    const repair = task.prRepair;
+    if (repair?.gateId !== gate.id || repair.pr !== gate.pr || repair.base !== project.branch ||
+        repair.stage !== "prepared" || task.pr !== gate.pr || task.projectId !== project.id) return;
+    const waits = this.store.all("gate", project.id).filter(wait =>
+      wait.taskId === task.id && wait.status === "open" && wait.type === "runtime" &&
+      wait.detail === PUBLICATION_WAIT && wait.awaitingCapability === true);
+    const recorded = task.publicationIntent;
+    if (waits.length > 1 || (!recorded && waits.length !== 1) ||
+        (recorded && !waits.length && this.store.all("gate", project.id).some(g =>
+          g.taskId === task.id && g.status === "open"))) return;
+    const wait = waits[0];
+    if (this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" && g.id !== wait?.id)) return;
+    if (recorded && (recorded.gateId !== gate.id || recorded.pr !== gate.pr ||
+        (wait && (recorded.waitGateId && recorded.waitGateId !== wait.id ||
+          wait.publicationIntentSha !== recorded.sha)))) return;
+    if (!recorded && wait.publicationIntentSha) return; // Legacy recovery requires its exact machine wait.
+    const reviewed = task.reviewedSource;
+    if (!reviewed?.sourceHash || !reviewed.tree || !reviewed.head ||
+        task.review?.verdict !== "pass" || !task.verification?.id ||
+        !task.verification.sourceUnchanged || task.verification.sourceHash !== reviewed.sourceHash ||
+        !task.checks?.length || task.checks.some((check: any) => check.code !== 0 || check.timedOut))
+      throw new Error("Publication confirmation lacks matching checks and independent review.");
+    const reportId = task.verification.id;
+    if (!/^[a-f0-9-]{36}$/.test(reportId)) throw new Error("Invalid publication check report identity.");
+    const reportPath = join(await realpath(this.dataDir), "verification", reportId + ".json");
+    if (await realpath(reportPath).catch(() => null) !== reportPath)
+      throw new Error("Publication check report is missing or linked.");
+    const report = JSON.parse(await readFile(reportPath, "utf8"));
+    if (report.id !== reportId || report.sourceHash !== reviewed.sourceHash ||
+        report.sourceUnchanged !== true || report.results?.length !== task.checks.length ||
+        report.createdAt !== task.verification.createdAt ||
+        (report.runId && report.runId !== task.implementationRunId) ||
+        report.results.some((result: any, index: number) => result.code !== 0 || result.timedOut ||
+          result.command !== task.checks[index].command || result.code !== task.checks[index].code))
+      throw new Error("Publication check report does not match the reviewed source and task checks.");
+    const implementationRun = this.store.get(task.implementationRunId, "run");
+    if (implementationRun.projectId !== project.id || implementationRun.taskId !== task.id ||
+        implementationRun.role !== "implementation" || implementationRun.status !== "completed")
+      throw new Error("Publication implementation run identity changed.");
+    const reviewRuns = this.store.all("run", project.id).filter(run => {
+      if (run.taskId !== task.id || run.role !== "review" || run.status !== "completed") return false;
+      try { const output = JSON.parse(run.output); return output.verdict === "pass" && output.summary === task.review.summary; }
+      catch { return false; }
+    });
+    const reviewRun = task.reviewRunId
+      ? reviewRuns.find(run => run.id === task.reviewRunId)
+      : reviewRuns.at(-1);
+    if (!reviewRun || (task.reviewRunId && reviewRun.id !== task.reviewRunId) ||
+        !Number.isFinite(Date.parse(report.createdAt)) ||
+        !Number.isFinite(Date.parse(reviewRun.finishedAt)) ||
+        Date.parse(reviewRun.finishedAt) < Date.parse(report.createdAt) ||
+        (implementationRun.finishedAt && reviewRun.finishedAt &&
+        Date.parse(reviewRun.finishedAt) < Date.parse(implementationRun.finishedAt)))
+      throw new Error("Publication independent review run does not match this task revision.");
+    const common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    const owned = await realpath(await this.gitRunner(task.worktree, common)) ===
+      await realpath(await this.gitRunner(project.path, common));
+    if (!owned) throw new Error("Publication worktree belongs to another repository.");
+    const local = async () => ({
+      head: await this.gitRunner(task.worktree, ["rev-parse", "HEAD"]),
+      tree: await this.gitRunner(task.worktree, ["rev-parse", "HEAD^{tree}"]),
+      parents: await this.gitRunner(task.worktree, ["show", "-s", "--format=%P", "HEAD"]),
+      branch: await this.gitRunner(task.worktree, ["branch", "--show-current"]),
+      mergeHead: await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => ""),
+      dirty: await this.gitRunner(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]),
+      sourceHash: await sourceFingerprint(task.worktree),
+    });
+    const first = await local();
+    const expectedHead = recorded?.sha ?? first.head;
+    const validLocal = (item: Awaited<ReturnType<typeof local>>) => item.head === expectedHead &&
+      item.head === info.headRefOid && item.tree === reviewed.tree &&
+      item.sourceHash === reviewed.sourceHash && item.branch === task.branch &&
+      !item.mergeHead && !item.dirty &&
+      (recorded
+        ? recorded.tree === reviewed.tree && recorded.sourceHash === reviewed.sourceHash &&
+          recorded.reviewedHead === reviewed.head && recorded.parents === item.parents &&
+          recorded.branch === task.branch && recorded.base === project.branch &&
+          recorded.verificationReportId === reportId && recorded.reviewRunId === reviewRun.id &&
+          recorded.implementationRunId === implementationRun.id
+        : item.head === reviewed.head || item.parents === reviewed.head);
+    if (!validLocal(first)) throw new Error("Publication commit, lineage or reviewed source changed.");
+    const confirmed = await this.prInfo(gate.id);
+    this.validateRemotePr(gate, project, confirmed);
+    if (confirmed.state !== "OPEN" || confirmed.mergeable !== "MERGEABLE" ||
+        confirmed.url !== gate.pr || confirmed.baseRefName !== project.branch ||
+        confirmed.headRefOid !== expectedHead)
+      throw new Error("GitHub publication confirmation changed before registration.");
+    const second = await local();
+    if (!validLocal(second) || JSON.stringify(second) !== JSON.stringify(first))
+      throw new Error("Publication source changed during confirmation.");
+    if (this.closed || this.store.get(project.id).status !== "running" ||
+        this.store.hasOpenInterruption(project.id) || active()) return;
+    const answer = `GitHub confirmed the reviewed PR revision ${expectedHead}. It is ready for human review; no merge was approved.`;
+    let newGate: RecordData | undefined;
+    let evidencePage: RecordData | undefined;
+    const resolvedAt = new Date().toISOString();
+    this.store.transaction(() => {
+      const currentProject = this.store.get(project.id), current = this.store.get(task.id),
+        currentGate = this.store.get(gate.id), currentWait = wait && this.store.get(wait.id),
+        currentRun = this.store.get(implementationRun.id), currentReviewRun = this.store.get(reviewRun.id);
+      if (this.closed || currentProject.status !== "running" ||
+          currentProject.branch !== project.branch || currentProject.path !== project.path ||
+          currentProject.github !== project.github || this.store.hasOpenInterruption(project.id) || active() ||
+          current.status !== task.status || current.projectId !== project.id ||
+          current.pr !== gate.pr || current.branch !== task.branch ||
+          current.worktree !== task.worktree || current.implementationRunId !== implementationRun.id ||
+          JSON.stringify(current.reviewedSource) !== JSON.stringify(reviewed) ||
+          JSON.stringify(current.review) !== JSON.stringify(task.review) ||
+          JSON.stringify(current.checks) !== JSON.stringify(task.checks) ||
+          JSON.stringify(current.verification) !== JSON.stringify(task.verification) ||
+          current.reviewRunId !== task.reviewRunId || current.verification?.id !== reportId ||
+          currentRun.status !== "completed" || currentRun.taskId !== task.id ||
+          currentRun.projectId !== project.id || currentRun.role !== "implementation" ||
+          currentReviewRun.status !== "completed" || currentReviewRun.taskId !== task.id ||
+          currentReviewRun.projectId !== project.id || currentReviewRun.role !== "review" ||
+          currentReviewRun.output !== reviewRun.output ||
+          JSON.stringify(current.prRepair) !== JSON.stringify(repair) ||
+          JSON.stringify(current.publicationIntent ?? null) !== JSON.stringify(recorded ?? null) ||
+          currentGate.status !== "superseded" || currentGate.projectId !== project.id ||
+          currentGate.taskId !== task.id || currentGate.pr !== gate.pr ||
+          currentGate.sha !== gate.sha || currentGate.base !== gate.base ||
+          (wait && (currentWait?.status !== "open" || currentWait.projectId !== project.id ||
+            currentWait.taskId !== task.id || currentWait.type !== "runtime" ||
+            currentWait.detail !== PUBLICATION_WAIT || currentWait.awaitingCapability !== true ||
+            currentWait.publicationIntentSha !== wait.publicationIntentSha)) ||
+          this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" && g.id !== wait?.id))
+        throw new Error("Publication gate or task changed during confirmation.");
+      const prEvidence = { url: gate.pr, headSha: expectedHead, status: "awaiting_human" };
+      this.store.patch(implementationRun.id, { prEvidence });
+      const intent = this.store.all("wiki-ingest", project.id).find(item => item.runId === implementationRun.id);
+      if (intent) this.store.patch(intent.id, { pendingEvidence: { ...intent.pendingEvidence, prEvidence } });
+      const page = this.store.all("memory", project.id).find(item => item.runId === implementationRun.id);
+      if (page) evidencePage = this.store.patch(page.id, { prEvidence });
+      newGate = this.store.put("gate", { projectId: project.id, taskId: task.id,
+        title: "Review pull request", detail: task.summary, type: "pr", status: "open",
+        createdAt: resolvedAt, scope: "task", authorRole: "coordinator",
+        pr: gate.pr, sha: expectedHead, prRunId: implementationRun.id, base: project.branch });
+      this.store.recordEscalation(newGate);
+      if (wait) {
+        this.store.patch(wait.id, { status: "resolved", answer, resolvedBy: "coordinator", resolvedAt,
+          awaitingCapability: false, judgeNextAttemptAt: null,
+          brokerEvidence: { url: confirmed.url, number: confirmed.number, state: confirmed.state,
+            headSha: confirmed.headRefOid, base: confirmed.baseRefName, mergeable: confirmed.mergeable, observedAt: resolvedAt } });
+        this.store.recordGateResponse(wait, answer, "coordinator", resolvedAt);
+      }
+      this.store.patch(task.id, { status: "awaiting_human", sha: expectedHead, prRepair: null,
+        publicationIntent: null, publicationConfirmation: { pr: gate.pr, headSha: expectedHead,
+          waitGateId: wait?.id ?? null, reviewGateId: newGate.id, legacy: !recorded, observedAt: resolvedAt } });
+    });
+    if (evidencePage) await this.writeIfChanged(join(this.dataDir, "wiki", project.id, evidencePage.id + ".md"), this.pageMarkdown(evidencePage));
+    this.changed("publication-confirmed", { taskId: task.id, waitGateId: wait?.id ?? null,
+      reviewGateId: newGate!.id, headSha: expectedHead }, project.id);
+  }
   async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
     try {
       return await this.githubRunner([
@@ -1287,6 +1469,7 @@ export class Engine extends EventEmitter {
               this.changed("repair-pr-observed", { gateId: gate.id, ...observation }, projectId);
             }
             await this.settleMergedRepair(project, this.store.get(task.id), this.store.get(gate.id), info);
+            await this.confirmPublishedRepair(project, this.store.get(task.id), this.store.get(gate.id), info);
             continue;
           }
           if (this.busy.has("task:" + task.id) || this.store.all("run", projectId).some(r => r.taskId === task.id && r.status === "running")) continue;

@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { readFile, writeFile, rm } from "node:fs/promises";
+import { readFile, writeFile, rm, mkdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { Engine } from "./engine.ts";
 import { Store } from "./store.ts";
@@ -204,6 +205,175 @@ test("real Git integration preserves dirty primary checkout, resolves markers an
     assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 1);
     assert.equal(f.store.all("approval").length, 0);
   } finally { await f.close(); }
+});
+
+async function publicationFixture() {
+  const f = await fixture();
+  const repo = await createRepo(join(f.dir, "publication-repo"));
+  await git(repo.path, ["config", "user.name", "Fixture"]);
+  await git(repo.path, ["config", "user.email", "fixture@localhost"]);
+  await writeFile(join(repo.path, "source.txt"), "base\n");
+  await git(repo.path, ["add", "."]); await git(repo.path, ["commit", "-m", "Base"]);
+  const origin = join(f.dir, "publication-origin.git");
+  await git(repo.path, ["clone", "--bare", repo.path, origin]);
+  await git(repo.path, ["remote", "add", "origin", origin]);
+  const tree = await createWorktree(repo.path, f.dir, f.task.id);
+  await writeFile(join(tree.path, "source.txt"), "old PR\n");
+  await git(tree.path, ["add", "."]); await git(tree.path, ["commit", "-m", "Old PR"]);
+  await git(tree.path, ["push", "origin", tree.branch]);
+  const oldHead = await git(tree.path, ["rev-parse", "HEAD"]);
+  await writeFile(join(tree.path, "source.txt"), "reviewed repair\n");
+  await git(tree.path, ["add", "."]);
+  const sourceHash = await sourceFingerprint(tree.path), sourceTree = await git(tree.path, ["write-tree"]);
+  const reportId = randomUUID();
+  const reportCreatedAt = new Date(Date.now() - 1000).toISOString();
+  const checks = [{ command: "fixture-check", code: 0, output: "ok" }];
+  await mkdir(join(f.dir, "verification"), { recursive: true });
+  await writeFile(join(f.dir, "verification", reportId + ".json"), JSON.stringify({
+    id: reportId, sourceHash, sourceUnchanged: true, results: checks, createdAt: reportCreatedAt,
+  }));
+  const impl = f.store.put("run", { projectId: f.project.id, taskId: f.task.id, role: "implementation",
+    status: "completed", finishedAt: new Date(Date.now() - 2000).toISOString() });
+  const review = { verdict: "pass", summary: "Fixture independent review", sources: ["source.txt"], claims: [] };
+  const reviewRun = f.store.put("run", { projectId: f.project.id, taskId: f.task.id, role: "review",
+    status: "completed", finishedAt: new Date().toISOString(), output: JSON.stringify(review) });
+  f.store.patch(f.project.id, { path: repo.path });
+  f.store.patch(f.gate.id, { status: "superseded", sha: oldHead, base: "main" });
+  f.store.patch(f.task.id, { status: "verifying", kind: "implementation", pr: url, sha: oldHead,
+    worktree: tree.path, branch: tree.branch, summary: "Reviewed repair", checks, review,
+    reviewRunId: reviewRun.id, implementationRunId: impl.id,
+    verification: { id: reportId, sourceHash, sourceUnchanged: true, createdAt: reportCreatedAt },
+    reviewedSource: { head: oldHead, tree: sourceTree, sourceHash, mergeHead: "" },
+    prRepair: { gateId: f.gate.id, pr: url, base: "main", stage: "prepared", expectedHead: oldHead } });
+  f.engine.gitRunner = git;
+  f.engine.githubRunner = async args => { assert.equal(args[0], "auth"); return "fixture"; };
+  const remote = (headRefOid: string) => ({ number: 1, url, baseRefName: "main", state: "OPEN",
+    headRefOid, mergeable: "MERGEABLE" });
+  let observed = oldHead;
+  f.engine.prInfo = async () => remote(observed);
+  f.engine.mergeBroker = async () => JSON.stringify(remote(observed));
+  return { ...f, repo, tree, oldHead, impl, reviewRun, setObserved(sha: string) { observed = sha; } };
+}
+
+test("stale post-push observation later registers exactly one human gate without another worker", async () => {
+  const f = await publicationFixture();
+  try {
+    await f.engine.publish(f.store.get(f.project.id), f.store.get(f.task.id));
+    const published = await git(f.tree.path, ["rev-parse", "HEAD"]);
+    assert.notEqual(published, f.oldHead);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    assert.equal(f.store.get(f.task.id).publicationIntent.sha, published);
+    assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 0);
+    f.setObserved(published);
+    let workers = 0;
+    f.engine.implement = async () => { workers++; };
+    await f.engine.syncProject(f.project.id);
+    const task = f.store.get(f.task.id);
+    const fresh = f.store.all("gate").filter(g => g.type === "pr" && g.status === "open");
+    assert.equal(workers, 0);
+    assert.equal(task.status, "awaiting_human");
+    assert.equal(task.sha, published);
+    assert.equal(fresh.length, 1);
+    assert.equal(fresh[0].sha, published);
+    assert.equal(fresh[0].prRunId, f.impl.id);
+    assert.equal(f.store.get(f.impl.id).prEvidence.headSha, published);
+    assert.equal(f.store.all("approval").length, 0);
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 1);
+  } finally { await f.close(); }
+});
+
+test("durable intent recovers push-before-wait crash but late ownership changes leave no false evidence", async () => {
+  const f = await publicationFixture();
+  try {
+    await f.engine.publish(f.store.get(f.project.id), f.store.get(f.task.id));
+    const pushed = await git(f.tree.path, ["rev-parse", "HEAD"]);
+    const intent = f.store.get(f.task.id).publicationIntent;
+    const wait = f.store.all("gate").find(g => g.type === "runtime" && g.status === "open")!;
+    f.store.patch(wait.id, { status: "resolved" });
+    f.store.patch(f.task.id, { status: "verifying", publicationIntent: { ...intent, waitGateId: null } });
+    f.setObserved(pushed);
+    const original = f.engine.prInfo;
+    f.engine.prInfo = async gateId => { const result = await original.call(f.engine, gateId);
+      f.store.patch(f.gate.id, { taskId: randomUUID() }); return result; };
+    await assert.rejects(f.engine.confirmPublishedRepair(f.store.get(f.project.id), f.store.get(f.task.id),
+      f.store.get(f.gate.id), { number: 1, url, baseRefName: "main", state: "OPEN", headRefOid: pushed, mergeable: "MERGEABLE" }), /changed during confirmation/);
+    assert.equal(f.store.get(f.impl.id).prEvidence, undefined);
+    assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 0);
+    f.store.patch(f.gate.id, { taskId: f.task.id });
+    f.engine.prInfo = original;
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+    assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 1);
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("paused, remote drift and unrelated task gates hold publication confirmation", async () => {
+  const f = await publicationFixture();
+  try {
+    await f.engine.publish(f.store.get(f.project.id), f.store.get(f.task.id));
+    const pushed = await git(f.tree.path, ["rev-parse", "HEAD"]);
+    f.setObserved(pushed);
+    f.store.patch(f.project.id, { status: "paused" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    f.store.patch(f.project.id, { status: "running" });
+    f.setObserved("c".repeat(40));
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    f.setObserved(pushed);
+    const wait = f.store.all("gate").find(g => g.type === "runtime" && g.status === "open")!;
+    f.store.patch(wait.id, { judgeStatus: "running" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    f.store.patch(wait.id, { judgeStatus: "answered" });
+    f.engine.busy.add("judge:" + f.project.id);
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    f.engine.busy.delete("judge:" + f.project.id);
+    const unrelated = f.store.put("gate", { projectId: f.project.id, taskId: f.task.id,
+      type: "review", status: "open", detail: "Unrelated human decision" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "blocked");
+    assert.equal(f.store.get(unrelated.id).status, "open");
+    assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 0);
+    f.store.patch(unrelated.id, { status: "resolved" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("restart retains publication intent and a changed source cannot gain a review gate", async () => {
+  const f = await publicationFixture();
+  let resumed: Engine | undefined;
+  let reopened: Store | undefined;
+  try {
+    await f.engine.publish(f.store.get(f.project.id), f.store.get(f.task.id));
+    const pushed = await git(f.tree.path, ["rev-parse", "HEAD"]);
+    f.engine.close(); f.store.close();
+    reopened = new Store(join(f.dir, "db"));
+    resumed = new Engine(reopened, Object.assign(new EventEmitter(), { close() {} }) as Runtime, f.dir);
+    resumed.gitRunner = git;
+    resumed.prInfo = async () => ({ number: 1, url, baseRefName: "main", state: "OPEN",
+      headRefOid: pushed, mergeable: "MERGEABLE" });
+    resumed.mergeBroker = async () => JSON.stringify({ number: 1, url, baseRefName: "main", state: "OPEN",
+      headRefOid: pushed, mergeable: "MERGEABLE" });
+    assert.equal(reopened.get(f.task.id).publicationIntent.sha, pushed);
+    await writeFile(join(f.tree.path, "source.txt"), "unreviewed source\n");
+    await resumed.syncProject(f.project.id);
+    assert.equal(reopened.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 0);
+    assert.equal(reopened.get(f.impl.id).prEvidence, undefined);
+    await writeFile(join(f.tree.path, "source.txt"), "reviewed repair\n");
+    await resumed.syncProject(f.project.id);
+    assert.equal(reopened.get(f.task.id).status, "awaiting_human");
+    assert.equal(reopened.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 1);
+    assert.equal(reopened.all("approval").length, 0);
+  } finally {
+    resumed?.close(); reopened?.close();
+    await rm(f.dir, { recursive: true, force: true });
+  }
 });
 
 test("retargeted approvals and incomplete interrupted merge facts fail closed without a merge PUT", async () => {
