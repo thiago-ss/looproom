@@ -4,18 +4,26 @@ import { mkdir, readFile, writeFile, realpath, rename, rm, link, lstat } from "n
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
+import { startExperiment, reserveCandidate, reportCandidate, finalizeCandidate, abandonUnmeasuredCandidate, authorizeNextRound } from "./experiments.ts";
 import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
 import { runVerification, sourceFingerprint } from "./verification.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
+const ExperimentContract = z.object({
+  evaluator: z.string().trim().min(1), workload: z.string().trim().min(1),
+  runtimeBudget: z.string().trim().min(1),
+  thresholds: z.record(z.string(), z.union([z.string(), z.number()])),
+  candidateLimit: z.number().int().min(1).max(3),
+});
 const TaskPlan = z.object({
   title: z.string(),
   description: z.string(),
   acceptance: z.array(z.string()),
   dependencies: z.array(z.number().int()),
   kind: z.enum(["implementation", "research"]),
+  experiment: z.object({ hypothesis: z.string().trim().min(1), contract: ExperimentContract }).optional(),
 });
 const Claims = z.array(z.object({
   key: z.string().trim().min(1),
@@ -35,6 +43,12 @@ const Result = z.object({
   sources: z.array(z.string()),
   humanQuestion: z.string(),
   claims: Claims,
+  experimentCandidate: z.object({
+    outcome: z.enum(["keep", "discard"]), measurement: z.string().trim().min(1),
+    evidence: z.array(z.string().trim().min(1)).min(1),
+    evaluator: z.string(), workload: z.string(), runtimeBudget: z.string(),
+    thresholds: z.record(z.string(), z.union([z.string(), z.number()])),
+  }).optional(),
 });
 const Review = z.object({
   verdict: z.enum(["pass", "changes", "gate"]),
@@ -54,6 +68,11 @@ const Judgment = z.object({
   answer: z.string().trim().min(1).max(6000),
   summary: z.string(),
   sources: z.array(z.string()),
+  nextRound: z.object({
+    hypothesis: z.string().trim().min(1),
+    retryInstruction: z.string().trim().min(1),
+    contract: ExperimentContract,
+  }).optional(),
   verificationRequests: z
     .array(z.enum(["configured-checks", "refresh-baseline", "cleanup-test-fixtures"]))
     .max(3)
@@ -195,6 +214,7 @@ export class Engine extends EventEmitter {
     task?: RecordData,
     write = false,
   ) {
+    if (task) task = this.store.get(task.id, "task");
     if (task?.worktree) await this.handoffBaselineEvidence(project, task);
     const settings = this.settings(),
       profile =
@@ -212,21 +232,32 @@ export class Engine extends EventEmitter {
         role,
         createdAt: new Date().toISOString(),
       });
-    const run = this.store.put("run", {
-      agentId: agent.id,
-      projectId: project.id,
-      taskId: task?.id,
-      role,
-      model: profile.model,
-      effort: profile.effort,
-      status: "running",
-      workflowVersion: "looproom-v1",
-      requestedProfile: profile,
-      output: "",
-      createdAt: new Date().toISOString(),
+    const run = this.store.transaction(() => {
+      if (task) task = this.store.get(task.id, "task");
+      const created = this.store.put("run", {
+        agentId: agent.id,
+        projectId: project.id,
+        taskId: task?.id,
+        role,
+        ...(role === "implementation" && task?.experimentRoundId
+          ? { experimentRoundId: task.experimentRoundId } : {}),
+        model: profile.model,
+        effort: profile.effort,
+        status: "running",
+        workflowVersion: "looproom-v1",
+        requestedProfile: profile,
+        output: "",
+        createdAt: new Date().toISOString(),
+      });
+      if (role === "implementation" && task) {
+        if (task.experimentRoundId) {
+          const slot = reserveCandidate(this.store, task.experimentRoundId, created.id);
+          this.store.patch(created.id, { experimentCandidateId: slot.id });
+        }
+        this.store.patch(task.id, { implementationRunId: created.id });
+      }
+      return created;
     });
-    if (role === "implementation" && task)
-      this.store.patch(task.id, { implementationRunId: run.id });
     this.changed(
       "run-started",
       { runId: run.id, role, taskId: task?.id },
@@ -286,6 +317,9 @@ export class Engine extends EventEmitter {
       });
       const parsed = schema.parse(JSON.parse(output));
       this.store.transaction(() => {
+        const slotId = role === "implementation" ? this.store.get(run.id).experimentCandidateId : undefined;
+        if (slotId && parsed.experimentCandidate)
+          reportCandidate(this.store, slotId, parsed.experimentCandidate);
         this.store.patch(run.id, {
           status: "completed",
           output,
@@ -367,10 +401,14 @@ export class Engine extends EventEmitter {
     if (canonical !== join(await realpath(this.dataDir), "verification", baseline.reportId + ".json"))
       throw new Error("Baseline report must not be a symlink.");
     const bytes = await readFile(source, "utf8"), report = JSON.parse(bytes);
-    if (report.id !== baseline.reportId || report.sourceHash !== baseline.measurementSourceHash ||
+    const baselineSourceHash = baseline.measurementSourceHash ?? owner.baselineVerification?.sourceHash;
+    if (!baselineSourceHash || report.id !== baseline.reportId || report.sourceHash !== baselineSourceHash ||
         report.sourceUnchanged !== true || !report.results?.some((result: any) =>
           result.command === "node --import tsx scripts/measure-refresh.ts" && result.code === 0 && !result.timedOut))
       throw new Error("Baseline report does not match the frozen measurement evidence.");
+    this.store.put("verification-report", { projectId: project.id,
+      report: { ...report, evaluatorHash: baseline.evaluatorHash } },
+      `verification-report:${report.id}`);
     const directory = join(task.worktree, ".looproom-verification");
     await mkdir(directory, { recursive: true });
     if (await realpath(directory) !== join(await realpath(task.worktree), ".looproom-verification"))
@@ -711,7 +749,7 @@ export class Engine extends EventEmitter {
     const plan = await this.run(
       project,
       "orchestrator",
-      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. Dependencies are zero-based task indices and must reflect actual required inputs, not a preferred execution order. Keep independent research, usability and implementation work available while another task waits at a gate. Never bypass a genuine dependency or fabricate a completed prerequisite. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
+      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. For a measured optimization task, supply experiment with a concrete hypothesis and frozen evaluator/workload identity, runtime budget, acceptance thresholds and candidateLimit of at most three; omit experiment for ordinary tasks. Dependencies are zero-based task indices and must reflect actual required inputs, not a preferred execution order. Keep independent research, usability and implementation work available while another task waits at a gate. Never bypass a genuine dependency or fabricate a completed prerequisite. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
       Plan,
     );
     validateDependencies(plan.tasks);
@@ -739,6 +777,14 @@ export class Engine extends EventEmitter {
           ),
         }),
       );
+      tasks.forEach((task: any, i: number) => {
+        const experiment = plan.tasks[i].experiment;
+        if (experiment) {
+          if (task.kind !== "implementation") throw new Error("Experiment rounds require implementation tasks.");
+          startExperiment(this.store, project.id, task.id,
+            experiment.hypothesis, experiment.contract, true);
+        }
+      });
       this.store.patch(project.id, {
         planned: true,
         ...(tasks.length || plan.gate ? {} : { status: "idle" }),
@@ -760,6 +806,36 @@ export class Engine extends EventEmitter {
     );
   }
   async implement(project: RecordData, task: RecordData) {
+    task = this.store.get(task.id, "task");
+    const recordedRound = task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
+    if (recordedRound?.status === "active") {
+      const pending = recordedRound.candidateIds.map((id: string) => this.store.get(id))
+        .find((candidate: RecordData) => ["reserved", "measured"].includes(candidate.status));
+      if (pending) {
+        if (pending.status === "measured")
+          this.rejectExperimentCandidate(project, task, recordedRound, pending.id, [],
+            "Candidate interrupted", "Verification and review did not complete before restart.");
+        else abandonUnmeasuredCandidate(this.store, pending.id,
+          "Implementation run interrupted before reporting a measurement.");
+        this.gateExhaustedExperiment(project, task, recordedRound);
+        if (!this.store.all("gate", project.id).some((gate) => gate.taskId === task.id && gate.status === "open"))
+          this.gate(project.id, "Reconcile interrupted experiment",
+            "The reserved implementation run was interrupted. Inspect its preserved work and measurement before another dispatch.",
+            "interrupted", task.id);
+        return;
+      }
+    }
+    if (recordedRound?.status === "kept" && !task.prRepair) {
+      if (!task.reviewedSource || !await this.reviewedSourceMatches(task)) {
+        this.gate(project.id, "Kept experiment source changed",
+          "The kept candidate no longer matches its verified source. Review the preserved work before publication; do not count another candidate in the closed round.",
+          "check", task.id);
+        return;
+      }
+      await this.freezeBaseline(project, task);
+      await this.publish(project, task);
+      return;
+    }
     if (task.prRepair) task = await this.preparePrRepair(project, task);
     if (this.closed || task.status === "blocked" || this.store.get(project.id).status !== "running") return;
     if (!task.worktree) {
@@ -786,6 +862,14 @@ export class Engine extends EventEmitter {
         { taskId: task.id, method: "matching-lockfile-local-copy" },
         project.id,
       );
+    if (recordedRound?.status === "active" &&
+        (recordedRound.candidateIds.length > 0 || recordedRound.previousRoundId) &&
+        (task.experimentPreparedRoundId !== recordedRound.id ||
+          task.experimentPreparedCandidateCount !== recordedRound.candidateIds.length)) {
+      await this.clearDiscardedExperimentWork(task);
+      task = this.store.patch(task.id, { experimentPreparedRoundId: recordedRound.id,
+        experimentPreparedCandidateCount: recordedRound.candidateIds.length });
+    }
     this.store.patch(task.id, { status: "running", attempt: task.attempt + 1 });
     const context = this.store
       .conversation(project.id)
@@ -797,7 +881,10 @@ export class Engine extends EventEmitter {
       .slice(-6)
       .map((m) => `${m.role}: ${m.text}`)
       .join("\n");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\nWorktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    const round = recordedRound?.status === "kept" ? undefined :
+      task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
+    if (round && round.status !== "active") throw new Error("Experiment round is not active.");
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
     const result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
@@ -806,11 +893,26 @@ export class Engine extends EventEmitter {
       task,
       task.kind !== "research",
     );
+    const slotId = round ? this.store.get(this.store.get(task.id).implementationRunId).experimentCandidateId : undefined;
+    const slot = slotId ? this.store.get(slotId, "experiment-candidate") : undefined;
+    if (round && !slot) throw new Error("Experiment implementation run has no reserved candidate slot.");
+    const rejectMeasured = (title: string, detail: string, evidence: string[] = []) => {
+      if (round && slot?.status === "measured")
+        this.rejectExperimentCandidate(project, task, round, slot.id, evidence, title, detail);
+    };
     if (this.store.get(project.id).status !== "running") {
+      rejectMeasured("Candidate interrupted", "Project stopped before verification and review completed.");
+      if (round && slot?.status === "reserved") abandonUnmeasuredCandidate(this.store, slot.id,
+        "Project stopped before the run reported a measurement.");
+      if (round) this.gateExhaustedExperiment(project, task, round);
       this.store.patch(task.id, { status: "ready" });
       return;
     }
     if (result.humanQuestion) {
+      rejectMeasured("Candidate needs a decision", result.humanQuestion, result.sources ?? []);
+      if (round && slot?.status === "reserved") abandonUnmeasuredCandidate(this.store, slot.id,
+        "Implementation run requested a decision without reporting a measurement.");
+      if (round && this.gateExhaustedExperiment(project, task, round, `Task needs your input: ${result.humanQuestion}`)) return;
       this.gate(
         project.id,
         "Task needs your input",
@@ -823,6 +925,33 @@ export class Engine extends EventEmitter {
       );
       return;
     }
+    if (round) {
+      if (!result.experimentCandidate) {
+        abandonUnmeasuredCandidate(this.store, slotId,
+          "Implementation run completed without reporting a measurement.");
+        if (!this.gateExhaustedExperiment(project, task, round,
+          "The implementation run reported no measured candidate."))
+          this.gate(project.id, "Experiment run has no measurement",
+            "The implementation run reported no measured candidate. Reconcile its reserved slot and work before another dispatch.",
+            "decision", task.id, { experimentRoundId: round.id });
+        return;
+      }
+      if (result.experimentCandidate.outcome === "discard") {
+        const candidate = finalizeCandidate(this.store, slotId, "discard");
+        const currentRound = this.store.get(round.id);
+        this.store.patch(task.id, { status: currentRound.status === "exhausted" ? "blocked" : "ready",
+          feedback: `Candidate ${candidate.number} discarded: ${candidate.measurement}. ${result.summary}` });
+        if (currentRound.status === "exhausted")
+          this.gateExhaustedExperiment(project, task, round,
+            `Candidate ${candidate.number} reported discard: ${candidate.measurement}. ${result.summary}`);
+        return;
+      }
+    }
+    const repairMeasuredCandidate = (title: string, detail: string, type: string, evidence: string[] = []) => {
+      if (round) this.rejectExperimentCandidate(project, task, round,
+        slotId, evidence, title, detail);
+      else this.repairOrGate(project, task, title, detail, type);
+    };
     if (task.kind === "research") {
       this.store.patch(task.id, {
         status: "completed",
@@ -842,32 +971,29 @@ export class Engine extends EventEmitter {
       : undefined;
     const checks = report?.results ?? [];
     if (this.store.get(project.id).status !== "running") {
+      rejectMeasured("Candidate interrupted", "Project stopped during verification.",
+        report ? [`verification:${report.id}`] : []);
       this.store.patch(task.id, { status: "ready" });
       return;
     }
     if (report && !report.sourceUnchanged) {
-      this.repairOrGate(
-        project,
-        task,
-        "Source changed during verification",
-        "Re-run checks against the current source; the snapshot is stale.",
-        "check",
-      );
+      repairMeasuredCandidate("Source changed during verification",
+        "Re-run checks against the current source; the snapshot is stale.", "check",
+        [`verification:${report.id}`]);
       return;
     }
     for (const result of checks) {
       if (result.code !== 0) {
-        this.repairOrGate(
-          project,
-          task,
-          "Verification failed",
-          result.command + "\n" + result.output.slice(-6000),
-          "check",
-        );
+        repairMeasuredCandidate("Verification failed",
+          result.command + "\n" + result.output.slice(-6000), "check",
+          report ? [`verification:${report.id}`] : []);
         return;
       }
     }
     if (!checks.length) {
+      rejectMeasured("Acceptance checks missing", "No automated check is configured.");
+      if (round && this.gateExhaustedExperiment(project, task, round,
+        "Acceptance checks missing: No automated check is configured.")) return;
       this.gate(
         project.id,
         "Set acceptance checks",
@@ -888,16 +1014,19 @@ export class Engine extends EventEmitter {
     );
     this.store.patch(task.id, { review });
     if (review.verdict === "changes") {
-      this.repairOrGate(
-        project,
-        task,
-        "Review needs changes",
-        review.summary,
-        "review",
-      );
+      const reviewRun = this.store.all("run", project.id).findLast((run) =>
+        run.taskId === task.id && run.role === "review");
+      repairMeasuredCandidate("Review needs changes", review.summary, "review",
+        [...review.sources, ...(reviewRun ? [`review-run:${reviewRun.id}`] : [])]);
       return;
     }
     if (review.verdict === "gate") {
+      const reviewRun = this.store.all("run", project.id).findLast((run) =>
+        run.taskId === task.id && run.role === "review");
+      rejectMeasured("Review needs a decision", review.summary,
+        [...review.sources, ...(reviewRun ? [`review-run:${reviewRun.id}`] : [])]);
+      if (round && this.gateExhaustedExperiment(project, task, round,
+        `Review needs a decision: ${review.summary}. Evidence: ${[...review.sources, ...(reviewRun ? [`review-run:${reviewRun.id}`] : [])].join(", ")}`)) return;
       this.gate(
         project.id,
         "Review needs your decision",
@@ -910,13 +1039,52 @@ export class Engine extends EventEmitter {
     }
     if (await sourceFingerprint(task.worktree) !== checkedSource.sourceHash ||
         await git(task.worktree, ["write-tree"]) !== checkedSource.tree) {
-      this.repairOrGate(project, task, "Source changed after verification or review",
-        "Repeat checks and independent review against the current source.", "check");
+      repairMeasuredCandidate("Source changed after verification or review",
+        "Repeat checks and independent review against the current source.", "check",
+        report ? [`verification:${report.id}`] : []);
       return;
     }
     this.store.patch(task.id, { reviewedSource: checkedSource });
+    if (round) {
+      const candidate = finalizeCandidate(this.store, slotId, "keep", undefined,
+        [...(report ? [`verification:${report.id}`] : []), ...review.sources]);
+      if (candidate.outcome !== "keep") return;
+    }
     await this.freezeBaseline(project, this.store.get(task.id));
     await this.publish(project, this.store.get(task.id));
+  }
+  async clearDiscardedExperimentWork(task: RecordData) {
+    if (!task.worktree) throw new Error("Experiment task has no worktree to reset.");
+    if (await git(task.worktree, ["ls-files", "-z"]))
+      await git(task.worktree, ["restore", "--source=HEAD", "--staged", "--worktree", "--", "."]);
+    await git(task.worktree, ["clean", "-fd", "-e", ".looproom-verification", "--", "."]);
+    const remaining = await git(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]);
+    if (remaining) throw new Error("Discarded candidate left changes in the task worktree: " + remaining.slice(0, 500));
+  }
+  rejectExperimentCandidate(
+    project: RecordData, task: RecordData, round: RecordData, candidateId: string,
+    failureEvidence: string[], title: string, detail: string,
+  ) {
+    const candidate = finalizeCandidate(this.store, candidateId, "discard", title, failureEvidence);
+    const currentRound = this.store.get(round.id);
+    const feedback = `${title}\n${detail}\nCandidate ${candidate.number} (${candidate.measurement}) was discarded.`;
+    if (currentRound.status === "exhausted") {
+      this.gateExhaustedExperiment(project, task, round, feedback);
+    } else {
+      this.store.patch(task.id, { status: "ready", feedback });
+      this.changed("repair-requested", { taskId: task.id, title, attempt: this.store.get(task.id).attempt }, project.id);
+    }
+  }
+  gateExhaustedExperiment(project: RecordData, task: RecordData, round: RecordData, detail = "") {
+    if (this.store.get(round.id).status === "exhausted") {
+      if (this.store.all("gate", project.id).some((gate) => gate.taskId === task.id &&
+          gate.experimentRoundId === round.id && gate.type === "experiment" && gate.status === "open")) return true;
+      this.gate(project.id, "Experiment round exhausted",
+        `Round ${round.number} exhausted ${round.contract.candidateLimit} reserved slots. Preserve measured outcomes and unmeasured run records. ${detail} Judge may authorize a distinct next round with unchanged contract and a specific retry instruction.`,
+        "experiment", task.id, { experimentRoundId: round.id, authorRole: "coordinator" });
+      return true;
+    }
+    return false;
   }
   repairOrGate(
     project: RecordData,
@@ -1611,16 +1779,29 @@ export class Engine extends EventEmitter {
       throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
     if (gate.type === "pr")
       throw new Error("PR gates require human approval of the exact revision through Approve & merge.");
+    if (gate.type === "experiment" && retry)
+      throw new Error("An exhausted experiment requires judge authorization of a distinct round before retry.");
     if (gate.type === "github")
       this.store.patch(
         gate.projectId,
         await inspectRepo(this.store.get(gate.projectId).path),
       );
-    this.store.transaction(() => {
+    this.store.transaction(() => this.resolveGateTransaction(gate, answer, retry, actor, runId));
+    this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
+  }
+  private resolveGateTransaction(
+    gate: RecordData, answer: string, retry: boolean,
+    actor: "human" | "judge", runId?: string, authorizedRoundId?: string,
+  ) {
+    const gateId = gate.id;
       const current = this.store.get(gateId),
         project = this.store.get(gate.projectId);
       if (current.status !== "open")
         throw new Error("Gate is already resolved.");
+      if (current.type === "experiment" && retry &&
+          (!authorizedRoundId || current.experimentRoundId !== this.store.get(authorizedRoundId, "experiment-round").previousRoundId ||
+           this.store.get(current.taskId, "task").experimentRoundId !== authorizedRoundId))
+        throw new Error("An exhausted experiment requires judge authorization of a distinct round before retry.");
       if (current.type === "pr" && current.mergeAttempt)
         throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
       if (
@@ -1644,7 +1825,7 @@ export class Engine extends EventEmitter {
           status: retry ? "ready" : "cancelled",
           attempt: actor === "human" ? 0 : task.attempt,
           judgeRetries:
-            actor === "human" ? 0 : (task.judgeRetries ?? 0) + Number(retry),
+            actor === "human" || authorizedRoundId ? 0 : (task.judgeRetries ?? 0) + Number(retry),
           feedback: `${actor === "judge" ? "Judge" : "Human"} answered escalation: ${gate.detail}\n${answer}`,
         });
       } else if (
@@ -1655,8 +1836,6 @@ export class Engine extends EventEmitter {
         this.store.patch(gate.projectId, { planned: false });
       if (!this.store.hasOpenInterruption(gate.projectId))
         this.store.patch(gate.projectId, { status: "running" });
-    });
-    this.changed("gate-resolved", { gateId, retry, actor }, gate.projectId);
   }
   async verify(project: RecordData, task: RecordData, commands: string[], cleanupFixtures = false, runId?: string) {
     const originatingRunId = runId ?? this.store.get(task.id).implementationRunId;
@@ -1678,6 +1857,8 @@ export class Engine extends EventEmitter {
       protectedPorts: [4319, 5173, Number(process.env.PORT ?? 4319)],
       cleanupFixtures,
     });
+    this.store.put("verification-report", { projectId: project.id,
+      report: { ...report, evaluatorHash } }, `verification-report:${report.id}`);
     this.store.patch(task.id, {
       checks: report.results,
       verification: {
@@ -1734,7 +1915,9 @@ export class Engine extends EventEmitter {
     const hash = createHash("sha256").update(await readFile(join(task.worktree, "scripts/measure-refresh.ts"))).digest("hex");
     if (hash !== baseline.evaluatorHash || task.baselineVerification?.evaluatorHash !== hash)
       throw new Error("The baseline needs successful verification of its current evaluator before publication.");
-    this.store.patch(project.id, { refreshBaseline: { ...baseline, phase: "frozen", reportId: task.baselineVerification.reportId } });
+    this.store.patch(project.id, { refreshBaseline: { ...baseline, phase: "frozen",
+      reportId: task.baselineVerification.reportId,
+      measurementSourceHash: task.baselineVerification.sourceHash } });
     this.changed("baseline-frozen", { taskId: task.id, evaluatorHash: hash, reportId: task.baselineVerification.reportId }, project.id);
   }
   async evaluatorSnapshot(hash: string, source?: Buffer) {
@@ -1933,6 +2116,7 @@ Repository: ${project.path}
 Authorized checks: ${JSON.stringify(project.checks ?? [])}
 Escalation: ${JSON.stringify({ id: gate.id, title: gate.title, detail: gate.detail, type: gate.type, scope: gate.scope, authorRole: gate.authorRole, lastVerificationError: gate.judgeRecoveryError ?? gate.judgeError })}
 Refresh baseline state: ${JSON.stringify(this.store.get(project.id).refreshBaseline ?? null)}. During initial setup, a revised evaluator needs independent review of unchanged measurement rules and a fresh baseline. Once reviewed and frozen, candidate evaluator edits are refused. Scores from different evaluator versions are never comparable.
+Experiment round: ${JSON.stringify(gate.experimentRoundId ? this.store.get(gate.experimentRoundId, "experiment-round") : null)}. For an exhausted experiment round in YOLO, return action retry and nextRound with a new concrete hypothesis, exact unchanged contract and a specific instruction for the originating task. For other gates omit nextRound. Candidate limits never reset inside a round.
 Task and dependency frontier: ${JSON.stringify(relatedTasks)}
 Originating run: ${JSON.stringify(origin ? { role: origin.role, output: String(origin.output ?? "").slice(-16000), error: origin.error } : null)}
 Relevant conversation, including earlier responses: ${JSON.stringify(context)}
@@ -2001,6 +2185,36 @@ Action retry: your specific decision permits continuing within existing capabili
       if (current.status !== "open") return;
       let action = gate.type === "pr" ? "wait" : result.action,
         answer = result.answer;
+      if (result.nextRound) {
+        if (gate.type !== "experiment" || !gate.experimentRoundId ||
+            action !== "retry" || escalationMode(currentProject) !== "yolo" ||
+            currentProject.status !== "running")
+          throw new Error("Next round authorization requires an active YOLO experiment gate and retry decision.");
+        const next = this.store.transaction(() => {
+          if (this.store.get(gate.id).status !== "open")
+            throw new Error("Gate is already resolved.");
+          const round = authorizeNextRound(this.store, gate.experimentRoundId!, run.id,
+            result.nextRound!.hypothesis, result.nextRound!.retryInstruction,
+            result.nextRound!.contract, true);
+          answer = `${answer}\nRound ${round.number} (${round.id}) retry instruction: ${result.nextRound!.retryInstruction}`;
+          this.store.patch(gate.id, {
+            judgeStatus: "answered", judgeAnswer: answer, judgeAction: "retry",
+            judgeRunId: run.id, judgeSummary: result.summary, judgeSources: result.sources,
+            judgeFailures: 0, judgeNextAttemptAt: null,
+          });
+          this.store.recordGateResponse(gate, answer, "judge", new Date().toISOString(),
+            run.id, "escalation_draft");
+          this.resolveGateTransaction(gate, answer, true, "judge", run.id, round.id);
+          return round;
+        });
+        this.changed("experiment-round-authorized", { priorRoundId: gate.experimentRoundId, roundId: next.id, taskId: task!.id }, project.id);
+        this.changed("gate-resolved", { gateId: gate.id, retry: true, actor: "judge" }, project.id);
+        this.changed("judge-answered", { gateId: gate.id, action: "retry", applied: true }, project.id);
+        return;
+      } else if (gate.type === "experiment" && action === "retry") {
+        action = "wait";
+        answer += "\nA distinct round requires an explicit hypothesis, unchanged contract and specific retry instruction.";
+      }
       if (
         action === "retry" &&
         task &&
