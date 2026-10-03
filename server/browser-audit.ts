@@ -125,11 +125,13 @@ async function focus(page: Page) { return page.evaluate(() => {
 }); }
 async function keyboardReach(page: Page, locator: Locator, label: string, sample: BrowserSample): Promise<boolean> {
   if (await locator.count() !== 1) { const f = await focus(page); sample.keyboard.push({ checkpoint: label, focused: f.focused, focusVisible: f.visible, clipped: f.clipped, reached: false }); sample.unavailable.push(`Keyboard target ambiguous or missing: ${label}`); return false; }
-  if (await locator.evaluate(e => e === document.activeElement)) {
+  const target = await locator.elementHandle({ timeout: 1000 }).catch(() => null);
+  if (!target) { const f = await focus(page); sample.keyboard.push({ checkpoint: label, focused: f.focused, focusVisible: f.visible, clipped: f.clipped, reached: false }); return false; }
+  if (await page.evaluate(element => element === document.activeElement && element.isConnected, target)) {
     const f = await focus(page); sample.keyboard.push({ checkpoint: label, focused: f.focused, focusVisible: f.visible, clipped: f.clipped, reached: true });
+    await target.dispose();
     return true;
   }
-  const target = await locator.elementHandle();
   const route = await page.evaluate(element => {
     const candidates = [...document.querySelectorAll<HTMLElement>('a[href],button,input,select,textarea,[tabindex]')].filter(node => {
       const style = getComputedStyle(node);
@@ -146,17 +148,31 @@ async function keyboardReach(page: Page, locator: Locator, label: string, sample
     const backward = from >= 0 && to >= 0 ? (from - to + candidates.length) % candidates.length : Infinity;
     const current = document.activeElement;
     const targetPrecedesDetachedFocus = from < 0 && current?.isConnected && current !== document.body && !!((element as Element).compareDocumentPosition(current) & Node.DOCUMENT_POSITION_FOLLOWING);
-    return { key: to >= 0 && (backward < forward || targetPrecedesDetachedFocus) ? 'Shift+Tab' : 'Tab', limit: Math.min(1200, candidates.length * 2 + 16) };
+    const reverse = to >= 0 && (backward < forward || targetPrecedesDetachedFocus);
+    return { key: reverse ? 'Shift+Tab' : 'Tab', steps: reverse ? backward : forward, limit: Math.min(1200, candidates.length * 2 + 16) };
   }, target);
-  await target?.dispose();
   const limit = route.limit;
-  for (let i = 0; i < limit; i++) {
-    await page.keyboard.press(route.key);
-    const f = await focus(page);
-    if (await locator.evaluate(e => e === document.activeElement)) {
+  try {
+    // The first Tab from the Goal viewport may scroll a rich message into view,
+    // hiding Latest before the next observer round trip. Send the known native
+    // sequence without per-key inspection, then prove which element has focus.
+    const nativeBurst = label === "Latest messages" && route.steps > 0 && route.steps <= 4 ? route.steps : 0;
+    for (let i = 0; i < nativeBurst; i++) await page.keyboard.press(route.key);
+    if (nativeBurst && await page.evaluate(element => element === document.activeElement && element.isConnected, target)) {
+      const f = await focus(page);
       sample.keyboard.push({ checkpoint: label, focused: f.focused, focusVisible: f.visible, clipped: f.clipped, reached: true });
       return true;
     }
+    for (let i = nativeBurst; i < limit; i++) {
+      await page.keyboard.press(route.key);
+      const f = await focus(page);
+      if (await page.evaluate(element => element === document.activeElement && element.isConnected, target)) {
+        sample.keyboard.push({ checkpoint: label, focused: f.focused, focusVisible: f.visible, clipped: f.clipped, reached: true });
+        return true;
+      }
+    }
+  } finally {
+    await target?.dispose();
   }
   const f = await focus(page); sample.keyboard.push({ checkpoint: label, focused: f.focused, focusVisible: f.visible, clipped: f.clipped, reached: false });
   return false;
@@ -171,6 +187,32 @@ async function activate(page: Page, locator: Locator, label: string, sample: Bro
   await page.evaluate(() => performance.mark("looproom-activation"));
   if (reached) await page.keyboard.press("Enter");
   else if (await locator.count() === 1 && await locator.isEnabled()) await locator.click();
+}
+async function activateLatest(page: Page, locator: Locator, sample: BrowserSample) {
+  await page.evaluate(() => {
+    (window as any).__looproomLatestNative = { keydown: false, click: false, topAtEnter: null, visibleAtEnter: false };
+    document.addEventListener("keydown", event => {
+      if (event.key !== "Enter" || !event.isTrusted) return;
+      const button = (event.target as Element).closest?.(".conversation .latest-message") as HTMLElement | null;
+      if (!button || document.activeElement !== button) return;
+      const viewport = document.querySelector<HTMLElement>('.conversation-scroll .messages');
+      const style = getComputedStyle(button);
+      const state = (window as any).__looproomLatestNative;
+      state.keydown = true;
+      state.topAtEnter = viewport?.scrollTop ?? null;
+      state.visibleAtEnter = button.isConnected && button.getClientRects().length > 0 && style.visibility === "visible" && style.display !== "none";
+      performance.mark("looproom-activation");
+    }, true);
+    document.addEventListener("click", event => {
+      if (event.isTrusted && event.detail === 0 && (event.target as Element).closest?.(".conversation .latest-message"))
+        (window as any).__looproomLatestNative.click = true;
+    }, true);
+  });
+  if (!await keyboardReach(page, locator, "Latest messages", sample)) throw new Error("Latest messages cannot be reached by native keyboard");
+  await page.keyboard.press("Enter");
+  const event = await page.evaluate(() => (window as any).__looproomLatestNative);
+  if (!event.keydown || !event.click || !event.visibleAtEnter || event.topAtEnter === null || event.topAtEnter > 1)
+    throw new Error(`Latest messages native Enter did not activate the visible button from the settled top: ${JSON.stringify(event)}`);
 }
 async function activateRovingTab(page: Page, active: Locator, target: Locator, label: string, sample: BrowserSample, key: "ArrowRight" | "ArrowLeft") {
   if (await active.count() !== 1 || await target.count() !== 1) throw new Error(`Tab target missing or ambiguous: ${label}`);
@@ -290,7 +332,13 @@ export async function runBrowserSample(page: Page, sample: BrowserSample, snapsh
   });
   const latestButton = page.locator('.conversation .latest-message');
   try {
-    await measure(page, sample, "goal.latest", () => activate(page, latestButton, "Latest messages", sample), async () => { await latestButton.waitFor({ state: "hidden", timeout: 1500 }); });
+    await measure(page, sample, "goal.latest", () => activateLatest(page, latestButton, sample), async () => {
+      await latestButton.waitFor({ state: "hidden", timeout: 1500 });
+      await page.waitForFunction(() => {
+        const viewport = document.querySelector<HTMLElement>('.conversation-scroll .messages');
+        return !!viewport && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 64;
+      }, null, { timeout: 1500 });
+    });
   } catch (error) {
     sample.errors.push(`Latest messages activation did not settle: ${errorText(error)}`);
     sample.unavailable.push("goal.latest activation-to-settled timing unavailable");
