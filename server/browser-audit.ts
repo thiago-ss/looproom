@@ -499,20 +499,24 @@ export async function runBrowserSample(page: Page, sample: BrowserSample, snapsh
 
 // Capture public PR evidence through the coordinator's existing gh login.
 // Pin both compare revisions; never expose the broker or merge methods to the viewer.
-async function capturePrReview(binding: { gateId: string; projectId: string; pr: string; sha: string; base: string }) {
+async function capturePrReview(binding: { gateId: string; projectId: string; pr: string; sha: string; base: string; baseSha?: string }) {
   const target = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/([1-9]\d*)$/.exec(binding.pr);
-  if (!target || !/^[a-f0-9]{40}$/.test(binding.sha)) throw new Error("PR snapshot binding invalid");
+  if (!target || !/^[a-f0-9]{40}$/.test(binding.sha) ||
+      (binding.baseSha !== undefined && !/^[a-f0-9]{40}$/.test(binding.baseSha)))
+    throw new Error("PR snapshot binding invalid");
   const fields = "number,url,title,headRefOid,baseRefName,baseRefOid,statusCheckRollup,mergeable,state,body,files";
   const readInfo = async () => JSON.parse((await execFileAsync("gh", ["pr", "view", binding.pr, "--json", fields], { timeout: 20_000, maxBuffer: 1024 * 1024 })).stdout);
   const info = await readInfo();
-  if (info.url !== binding.pr || info.number !== Number(target[3]) || info.headRefOid !== binding.sha || info.baseRefName !== binding.base || info.state !== "OPEN" || !/^[a-f0-9]{40}$/.test(info.baseRefOid ?? "") || !Array.isArray(info.files) || info.files.length > 300)
+  if (info.url !== binding.pr || info.number !== Number(target[3]) || info.headRefOid !== binding.sha || info.baseRefName !== binding.base || info.state !== "OPEN" || !/^[a-f0-9]{40}$/.test(info.baseRefOid ?? "") ||
+      (binding.baseSha && info.baseRefOid !== binding.baseSha) || !Array.isArray(info.files) || info.files.length > 300)
     throw new Error("PR snapshot revision, base or file scope differs from its gate");
   const compare = `repos/${target[1]}/${target[2]}/compare/${info.baseRefOid}...${binding.sha}`;
   // Snapshot validation permits 2,000,000 UTF-8 bytes. Keep the child-process
   // buffer just above that ceiling, then reject larger responses explicitly.
   const diff = (await execFileAsync("gh", ["api", "--method", "GET", compare, "--header", "Accept: application/vnd.github.diff"], { timeout: 20_000, maxBuffer: 2_000_001 })).stdout;
   const after = await readInfo();
-  if (after.url !== info.url || after.headRefOid !== info.headRefOid || after.baseRefOid !== info.baseRefOid || after.baseRefName !== info.baseRefName || after.state !== "OPEN")
+  if (after.url !== info.url || after.headRefOid !== info.headRefOid || after.baseRefOid !== info.baseRefOid ||
+      (binding.baseSha && after.baseRefOid !== binding.baseSha) || after.baseRefName !== info.baseRefName || after.state !== "OPEN")
     throw new Error("PR changed while its frozen evidence was captured");
   if (!diff.trim() || Buffer.byteLength(diff, "utf8") > 2_000_000) throw new Error("PR snapshot diff unavailable or exceeds capture limit");
   return { info, diff };
