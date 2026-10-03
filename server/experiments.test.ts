@@ -27,10 +27,10 @@ const refreshContract = {
     requiredChecks: "npm test" }, candidateLimit: 3,
 };
 function refreshReport(store: Store, projectId: string, runId: string, values: number[],
-  options: { workload?: string; evaluatorHash?: string; checks?: boolean } = {}) {
+  options: { workload?: string; evaluatorHash?: string; checks?: boolean; sourceHash?: string } = {}) {
   const id = randomUUID();
   store.put("verification-report", { projectId, report: { id, runId,
-    evaluatorHash: options.evaluatorHash ?? refreshHash, sourceHash: "source-fixed",
+    evaluatorHash: options.evaluatorHash ?? refreshHash, sourceHash: options.sourceHash ?? "source-fixed",
     sourceUnchanged: true,
     results: [{ command: "node --import tsx scripts/measure-refresh.ts", code: 0,
       timedOut: false, durationMs: 1000, output: JSON.stringify({ repetitions: 5,
@@ -41,9 +41,51 @@ function refreshReport(store: Store, projectId: string, runId: string, values: n
   return `verification:${id}`;
 }
 
+test("planning rejects unkeepable experiments before writing tasks and accepts a frozen refresh recipe", async () => {
+  const dir = await testFixture("looproom-experiment-plan-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, Object.assign(new EventEmitter(), { close() {} }) as unknown as Runtime, dir);
+  try {
+    const project = store.put("project", { status: "running", goal: "Improve refresh" });
+    const ordinary = { title: "Independent usability work", description: "Inspect local flow",
+      acceptance: ["Record findings"], dependencies: [], kind: "research" };
+    const measured = { title: "Measure refresh", description: "Reduce refresh bytes",
+      acceptance: ["Compare frozen medians"], dependencies: [], kind: "implementation",
+      experiment: { hypothesis: "Cache unchanged records", contract: refreshContract } };
+    let tasks: any[] = [];
+    engine.run = async () => ({ summary: "Plan", gate: "", sources: ["scripts/measure-refresh.ts"],
+      claims: [], tasks }) as any;
+    const counts = () => [store.all("task", project.id).length,
+      store.all("experiment-round", project.id).length];
+    tasks = [ordinary, { ...measured, experiment: { ...measured.experiment,
+      contract: { ...refreshContract, evaluator: "scripts/other.ts#sha256:arbitrary",
+        thresholds: { latencyMs: 100 } } } }];
+    await assert.rejects(engine.plan(project), /Planning rejected experiment: Only the frozen refresh evaluator/);
+    assert.deepEqual(counts(), [0, 0]);
+    tasks = [ordinary, measured];
+    await assert.rejects(engine.plan(project), /Planning rejected experiment: Only the frozen refresh evaluator/);
+    assert.deepEqual(counts(), [0, 0]);
+    const baselineRun = store.put("run", { projectId: project.id, role: "implementation" });
+    const source = refreshReport(store, project.id, baselineRun.id, [100, 100, 100]);
+    const reportId = source.slice("verification:".length);
+    store.patch(project.id, { refreshBaseline: { phase: "frozen", evaluatorHash: refreshHash,
+      reportId, measurementSourceHash: "wrong-source" } });
+    await assert.rejects(engine.plan(project), /Planning rejected experiment: Frozen refresh baseline needs/);
+    assert.deepEqual(counts(), [0, 0]);
+    store.patch(project.id, { refreshBaseline: { phase: "frozen", evaluatorHash: refreshHash,
+      reportId, measurementSourceHash: "source-fixed" } });
+    await engine.plan(project);
+    assert.deepEqual(counts(), [2, 1]);
+    assert.equal(store.all("task", project.id).find((task) => task.title === ordinary.title)?.status, "ready");
+    assert.deepEqual(store.all("experiment-round", project.id)[0].contract, refreshContract);
+    assert.equal(store.all("approval", project.id).length, 0);
+  } finally { engine.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
 for (const pathKind of ["record", "finalize"] as const) {
   for (const scenario of ["passing", "below threshold", "other metric regresses",
-    "missing report", "mismatched evaluator", "mismatched workload", "missing checks"] as const) {
+    "missing report", "mismatched evaluator", "mismatched workload", "missing checks",
+    "stale source", "missing reviewed source"] as const) {
     test(`${pathKind} keep decision rejects unsupported evidence: ${scenario}`, async () => {
       const dir = await testFixture(`looproom-refresh-keep-${pathKind}-`);
       const db = join(dir, "db");
@@ -58,6 +100,8 @@ for (const pathKind of ["record", "finalize"] as const) {
           reportId: baselineSource.slice("verification:".length),
           measurementSourceHash: "source-fixed" } });
         const round = startExperiment(store, project.id, task.id, "Reduce refresh bytes", refreshContract);
+        if (scenario !== "missing reviewed source")
+          store.patch(task.id, { reviewedSource: { sourceHash: "source-fixed" } });
         const run = store.put("run", { projectId: project.id, taskId: task.id,
           role: "implementation", experimentRoundId: round.id });
         const values = scenario === "below threshold" ? [95, 100, 100] :
@@ -66,7 +110,8 @@ for (const pathKind of ["record", "finalize"] as const) {
           refreshReport(store, project.id, run.id, values,
             { checks: scenario !== "missing checks",
               workload: scenario === "mismatched workload" ? "different" : undefined,
-              evaluatorHash: scenario === "mismatched evaluator" ? "b".repeat(64) : undefined });
+              evaluatorHash: scenario === "mismatched evaluator" ? "b".repeat(64) : undefined,
+              sourceHash: scenario === "stale source" ? "source-old" : undefined });
         let candidate;
         if (pathKind === "record") {
           candidate = recordCandidate(store, round.id, { runId: run.id, outcome: "keep",
@@ -82,6 +127,8 @@ for (const pathKind of ["record", "finalize"] as const) {
         assert.equal(store.get(round.id).status, scenario === "passing" ? "kept" : "active");
         if (scenario !== "passing") {
           assert.ok(candidate.rejection);
+          if (["stale source", "missing reviewed source"].includes(scenario))
+            assert.match(candidate.rejection, /reviewed source/);
           assert.equal(store.get(task.id).status, "ready");
           assert.equal(store.all("gate", project.id).length, 0);
         }
@@ -102,6 +149,77 @@ for (const pathKind of ["record", "finalize"] as const) {
       } finally { store.close(); await rm(dir, { recursive: true, force: true }); }
     });
   }
+}
+
+for (const pathKind of ["record", "finalize"] as const) {
+  test(`${pathKind} rejected final keep retains its round gate and authorizes a successor after restart`, async () => {
+    const dir = await testFixture(`looproom-refresh-exhausted-${pathKind}-`);
+    const db = join(dir, "db");
+    let store = new Store(db);
+    let engine: Engine | undefined;
+    const runtime = Object.assign(new EventEmitter(), { close() {},
+      async run() { return JSON.stringify({ action: "retry", answer: "Try a source cache",
+        summary: "One new bounded round", sources: ["docs/workflows/looproom-v1.md"],
+        nextRound: { hypothesis: "Cache unchanged source revisions",
+          retryInstruction: `Implement source revision caching and measure with ${refreshWorkload}`,
+          contract: refreshContract }, verificationRequests: [] }); },
+    }) as unknown as Runtime;
+    try {
+      store.put("settings", { orchestrator: { model: "fixture", effort: "high" },
+        subagent: { model: "fixture", effort: "medium" },
+        judge: { model: "fixture", effort: "medium" } }, "settings");
+      const project = store.put("project", { path: dir, goal: "Improve refresh", constraints: "",
+        status: "running", planned: true, escalationMode: "yolo" });
+      const task = store.put("task", { projectId: project.id, status: "ready",
+        title: "Measure refresh", dependencies: [], acceptance: [] });
+      const independent = store.put("task", { projectId: project.id, status: "ready",
+        title: "Independent work", dependencies: [] });
+      const baselineRun = store.put("run", { projectId: project.id, role: "implementation" });
+      const baselineSource = refreshReport(store, project.id, baselineRun.id, [100, 100, 100]);
+      store.patch(project.id, { refreshBaseline: { phase: "frozen", evaluatorHash: refreshHash,
+        reportId: baselineSource.slice("verification:".length),
+        measurementSourceHash: "source-fixed" } });
+      const round = startExperiment(store, project.id, task.id, "Reduce refresh bytes", refreshContract);
+      store.patch(task.id, { reviewedSource: { sourceHash: "source-fixed" } });
+      for (let i = 0; i < 2; i++) {
+        const run = store.put("run", { projectId: project.id, taskId: task.id,
+          role: "implementation", experimentRoundId: round.id });
+        recordCandidate(store, round.id, { runId: run.id, outcome: "discard",
+          measurement: `${100 - i} ms`, evidence: [`measurement:prior:${i}`], ...refreshContract });
+      }
+      const run = store.put("run", { projectId: project.id, taskId: task.id,
+        role: "implementation", experimentRoundId: round.id });
+      const source = refreshReport(store, project.id, run.id, [95, 100, 100], { checks: true });
+      const input = { runId: run.id, outcome: "keep" as const, measurement: "worker claimed improvement",
+        evidence: [source], ...refreshContract };
+      const candidate = pathKind === "record" ? recordCandidate(store, round.id, input) : (() => {
+        const slot = reserveCandidate(store, round.id, run.id);
+        reportCandidate(store, slot.id, input);
+        return finalizeCandidate(store, slot.id, "keep");
+      })();
+      assert.equal(candidate.outcome, "discard");
+      assert.match(candidate.rejection, /10% threshold/);
+      store.close(); store = new Store(db);
+      const gates = store.all("gate", project.id).filter((gate) => gate.status === "open" && gate.taskId === task.id);
+      assert.equal(gates.length, 1);
+      assert.equal(gates[0].type, "experiment");
+      assert.equal(gates[0].experimentRoundId, round.id);
+      assert.equal(store.get(round.id).status, "exhausted");
+      assert.equal(store.get(task.id).status, "blocked");
+      assert.equal(store.get(candidate.id).measurement, input.measurement);
+      engine = new Engine(store, runtime, dir);
+      await engine.judge(store.get(project.id), gates[0]);
+      assert.equal(store.get(gates[0].id).status, "resolved", store.get(gates[0].id).judgeError);
+      const successor = store.get(store.get(round.id).nextRoundId, "experiment-round");
+      assert.deepEqual(successor.contract, refreshContract);
+      assert.equal(store.get(task.id).experimentRoundId, successor.id);
+      assert.equal(store.get(task.id).status, "ready");
+      assert.equal(store.get(round.id).candidateIds.length, 3);
+      assert.equal(store.get(candidate.id).outcome, "discard");
+      assert.equal(store.get(independent.id).status, "ready");
+      assert.equal(store.all("approval", project.id).length, 0);
+    } finally { engine?.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
 }
 
 test("below-threshold measured run stays ready for another slot and cannot publish", async () => {
@@ -136,7 +254,7 @@ test("below-threshold measured run stays ready for another slot and cannot publi
       reportCandidate(store, slot.id, result);
       return { summary: "Candidate", sources: [source], humanQuestion: "", experimentCandidate: result } as any;
     };
-    engine.verify = async () => ({ id: randomUUID(), sourceHash: "source-fixed",
+    engine.verify = async () => ({ id: randomUUID(), sourceHash: await sourceFingerprint(tree.path),
       sourceUnchanged: true, results: [{ command: "npm test", code: 0 }] }) as any;
     let publications = 0;
     engine.publish = async () => { publications++; };
@@ -149,6 +267,82 @@ test("below-threshold measured run stays ready for another slot and cannot publi
     assert.equal(store.all("approval", project.id).length, 0);
   } finally { engine.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
 });
+
+for (const finalCheckSource of ["reviewed", "stale"] as const) {
+  test(`source A measurement cannot publish source B with ${finalCheckSource} final checks`, async () => {
+    const dir = await testFixture(`looproom-refresh-source-binding-${finalCheckSource}-`);
+    const repo = await createRepo(join(dir, "repo"));
+    const db = join(dir, "db");
+    let store = new Store(db);
+    let engine: Engine | undefined;
+    try {
+      const project = store.put("project", { path: repo.path, branch: repo.branch,
+        status: "running", goal: "Refresh faster", constraints: "", checks: ["npm test"] });
+      const task = store.put("task", { projectId: project.id, status: "ready", kind: "implementation",
+        title: "Measure candidate", description: "", acceptance: [], dependencies: [], attempt: 0 });
+      const independent = store.put("task", { projectId: project.id, status: "ready", dependencies: [] });
+      const tree = await createWorktree(repo.path, dir, task.id);
+      store.patch(task.id, { worktree: tree.path });
+      const baselineRun = store.put("run", { projectId: project.id, role: "implementation" });
+      const baselineSource = refreshReport(store, project.id, baselineRun.id, [100, 100, 100]);
+      store.patch(project.id, { refreshBaseline: { phase: "frozen", evaluatorHash: refreshHash,
+        reportId: baselineSource.slice("verification:".length), measurementSourceHash: "source-fixed" } });
+      const round = startExperiment(store, project.id, task.id, "Reduce refresh bytes", refreshContract);
+      engine = new Engine(store, Object.assign(new EventEmitter(), { close() {} }) as Runtime, dir);
+      let measuredSourceHash = "";
+      let reviewCount = 0, publications = 0;
+      engine.run = async (_project, role) => {
+        if (role === "review") {
+          reviewCount++;
+          return { verdict: "pass", summary: "Reviewed source B", sources: [] } as any;
+        }
+        const run = store.put("run", { projectId: project.id, taskId: task.id,
+          role: "implementation", experimentRoundId: round.id, status: "completed" });
+        const slot = reserveCandidate(store, round.id, run.id);
+        store.patch(run.id, { experimentCandidateId: slot.id });
+        store.patch(task.id, { implementationRunId: run.id });
+        await writeFile(join(tree.path, "candidate.txt"), "source A");
+        measuredSourceHash = await sourceFingerprint(tree.path);
+        const source = refreshReport(store, project.id, run.id, [89, 100, 100],
+          { checks: true, sourceHash: measuredSourceHash });
+        const measured = { outcome: "keep" as const, measurement: "89 bytes",
+          evidence: [source], ...refreshContract };
+        reportCandidate(store, slot.id, measured);
+        await writeFile(join(tree.path, "candidate.txt"), "source B");
+        return { summary: "Measured A, submitted B", sources: [source],
+          humanQuestion: "", experimentCandidate: measured } as any;
+      };
+      engine.verify = async () => ({ id: randomUUID(),
+        sourceHash: finalCheckSource === "stale" ? measuredSourceHash : await sourceFingerprint(tree.path),
+        sourceUnchanged: true, results: [{ command: "npm test", code: 0 }] }) as any;
+      engine.publish = async () => { publications++; };
+      await engine.implement(store.get(project.id), store.get(task.id));
+      const candidateId = store.get(round.id).candidateIds[0];
+      const candidate = store.get(candidateId);
+      assert.equal(candidate.outcome, "discard");
+      assert.equal(candidate.reportedOutcome, "keep");
+      assert.equal(candidate.measurement, "89 bytes");
+      assert.equal(store.get(candidate.runId).experimentCandidateId, candidateId);
+      assert.notEqual(await sourceFingerprint(tree.path), measuredSourceHash);
+      assert.match(candidate.rejection, finalCheckSource === "stale"
+        ? /Source changed during verification/ : /reviewed source/);
+      assert.equal(reviewCount, finalCheckSource === "reviewed" ? 1 : 0);
+      assert.equal(publications, 0);
+      assert.equal(store.get(task.id).status, "ready");
+      assert.equal(store.get(independent.id).status, "ready");
+      assert.deepEqual(store.get(round.id).contract, refreshContract);
+      assert.equal(store.all("approval", project.id).length, 0);
+      engine.close(); engine = undefined;
+      store.close(); store = new Store(db);
+      assert.equal(store.get(candidateId).outcome, "discard");
+      assert.equal(store.get(candidateId).evidence[0], candidate.evidence[0]);
+      assert.equal(store.get(`verification-report:${candidate.evidence[0].slice("verification:".length)}`).report.sourceHash,
+        measuredSourceHash);
+      assert.equal(store.get(round.id).status, "active");
+      assert.equal(store.all("approval", project.id).length, 0);
+    } finally { engine?.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
 
 test("experiment rounds persist across restart and keep exhausted outcomes immutable", async () => {
   const dir = await testFixture("looproom-experiment-restart-");
@@ -428,11 +622,13 @@ test("kept candidate resumes publication without consuming another candidate aft
       measurementSourceHash: "source-fixed" } });
     const round = startExperiment(store, project.id, task.id, "Measure refresh", refreshContract);
     const run = store.put("run", { projectId: project.id, taskId: task.id, role: "implementation", experimentRoundId: round.id });
-    const candidateSource = refreshReport(store, project.id, run.id, [89, 100, 100], { checks: true });
+    const sourceHash = await sourceFingerprint(repo.path);
+    const candidateSource = refreshReport(store, project.id, run.id, [89, 100, 100],
+      { checks: true, sourceHash });
+    store.patch(task.id, { reviewedSource: { sourceHash,
+      tree: await git(repo.path, ["write-tree"]), head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" } });
     recordCandidate(store, round.id, { runId: run.id, outcome: "keep", measurement: "89 bytes",
       evidence: [candidateSource], ...refreshContract });
-    store.patch(task.id, { reviewedSource: { sourceHash: await sourceFingerprint(repo.path),
-      tree: await git(repo.path, ["write-tree"]), head: await git(repo.path, ["rev-parse", "HEAD"]), mergeHead: "" } });
     store.close();
     store = new Store(join(dir, "db"));
     const engine = new Engine(store, Object.assign(new EventEmitter(), { close() {} }) as Runtime, dir);
@@ -489,6 +685,151 @@ test("discarded files are cleared before the next candidate without changing its
   } finally { engine.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
+for (const finalSlot of [false, true]) {
+  test(`failed worker settles ${finalSlot ? "final" : "nonfinal"} experiment slot across restart`, async () => {
+    const dir = await testFixture(`looproom-failed-worker-${finalSlot}-`);
+    const repo = await createRepo(join(dir, "repo"));
+    const db = join(dir, "db");
+    let store = new Store(db);
+    let engine: Engine | undefined;
+    try {
+      store.put("settings", { subagent: { model: "fixture", effort: "medium" } }, "settings");
+      const project = store.put("project", { path: repo.path, branch: repo.branch,
+        status: "running", goal: "Measure", constraints: "", checks: [], escalationMode: "yolo" });
+      const task = store.put("task", { projectId: project.id, status: "ready", kind: "implementation",
+        title: "Candidate", description: "", acceptance: [], dependencies: [], attempt: 0 });
+      const independent = store.put("task", { projectId: project.id, status: "ready", dependencies: [] });
+      const tree = await createWorktree(repo.path, dir, task.id);
+      store.patch(task.id, { worktree: tree.path });
+      const round = startExperiment(store, project.id, task.id, "Reduce latency", contract);
+      if (finalSlot) for (let i = 0; i < 2; i++) {
+        const run = store.put("run", { projectId: project.id, taskId: task.id,
+          role: "implementation", experimentRoundId: round.id });
+        recordCandidate(store, round.id, { runId: run.id, outcome: "discard",
+          measurement: `${120 - i} ms`, evidence: [`report:${i}`], ...contract });
+      }
+      const separate = finalSlot ? store.put("gate", { projectId: project.id, taskId: task.id,
+        type: "decision", status: "open", detail: "Separate consequential choice" }) : undefined;
+      const runtime = Object.assign(new EventEmitter(), { close() {}, async run() {
+        const run = store.get(store.get(task.id).implementationRunId);
+        if (finalSlot) reportCandidate(store, run.experimentCandidateId, {
+          outcome: "keep", measurement: "90 ms", evidence: ["report:failed-run"], ...contract });
+        throw new Error("worker process failed");
+      } }) as unknown as Runtime;
+      engine = new Engine(store, runtime, dir);
+      await engine.implement(store.get(project.id), store.get(task.id));
+      const failedRun = store.get(store.get(task.id).implementationRunId);
+      const candidate = store.get(failedRun.experimentCandidateId);
+      assert.equal(failedRun.status, "failed");
+      assert.match(failedRun.error, /worker process failed/);
+      assert.equal(candidate.status, finalSlot ? "finalized" : "unmeasured");
+      if (finalSlot) {
+        assert.equal(candidate.outcome, "discard");
+        assert.deepEqual(candidate.evidence, ["report:failed-run"]);
+      }
+      engine.close(); engine = undefined;
+      store.close(); store = new Store(db);
+      assert.equal(store.get(candidate.id).status, candidate.status);
+      if (separate) assert.equal(store.get(separate.id).status, "open");
+      assert.equal(store.get(independent.id).status, "ready");
+      assert.equal(store.get(task.id).status, finalSlot ? "blocked" : "ready");
+      const experimentGates = store.all("gate", project.id).filter(g => g.type === "experiment" && g.status === "open");
+      assert.equal(experimentGates.length, finalSlot ? 1 : 0);
+      assert.equal(store.get(round.id).status, finalSlot ? "exhausted" : "active");
+      assert.equal(store.all("gate", project.id).filter(g => g.type === "runtime").length, 0);
+      assert.equal(store.all("approval", project.id).length, 0);
+      if (!finalSlot) {
+        const next = store.put("run", { projectId: project.id, taskId: task.id,
+          role: "implementation", experimentRoundId: round.id });
+        assert.equal(reserveCandidate(store, round.id, next.id).number, 2);
+      }
+    } finally { engine?.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+}
+
+for (const failureStage of ["staging", "review"] as const) {
+  for (const finalSlot of [false, true]) {
+    test(`${failureStage} throw after report discards ${finalSlot ? "final" : "available"} slot across restart`, async () => {
+      const dir = await testFixture(`looproom-post-report-${failureStage}-${finalSlot}-`);
+      const repo = await createRepo(join(dir, "repo"));
+      const db = join(dir, "db");
+      let store = new Store(db);
+      let engine: Engine | undefined;
+      try {
+        store.put("settings", { subagent: { model: "fixture", effort: "medium" } }, "settings");
+        const project = store.put("project", { path: repo.path, branch: repo.branch,
+          status: "running", goal: "Measure", constraints: "",
+          checks: ["fixture-check"], escalationMode: "yolo" });
+        const task = store.put("task", { projectId: project.id, status: "ready",
+          kind: "implementation", title: "Candidate", description: "", acceptance: [],
+          dependencies: [], attempt: 0 });
+        const independent = store.put("task", { projectId: project.id,
+          status: "ready", dependencies: [] });
+        const tree = await createWorktree(repo.path, dir, task.id);
+        store.patch(task.id, { worktree: tree.path });
+        const round = startExperiment(store, project.id, task.id, "Reduce latency", contract);
+        if (finalSlot) for (let i = 0; i < 2; i++) {
+          const prior = store.put("run", { projectId: project.id, taskId: task.id,
+            role: "implementation", experimentRoundId: round.id, status: "completed" });
+          recordCandidate(store, round.id, { runId: prior.id, outcome: "discard",
+            measurement: `${120 - i} ms`, evidence: [`report:${i}`], ...contract });
+        }
+        const separate = finalSlot ? store.put("gate", { projectId: project.id,
+          taskId: task.id, type: "decision", status: "open",
+          detail: "Separate consequential choice" }) : undefined;
+        const runtime = Object.assign(new EventEmitter(), { close() {}, async run(options: any) {
+          if (options.prompt.includes("Independently inspect")) {
+            throw new Error("review transport failed");
+          }
+          await writeFile(join(options.cwd, "candidate.txt"), "measured source");
+          return JSON.stringify({ summary: "Measured candidate", sources: ["report:measured"],
+            humanQuestion: "", experimentCandidate: { outcome: "keep", measurement: "90 ms",
+              evidence: ["report:measured"], ...contract } });
+        } }) as unknown as Runtime;
+        engine = new Engine(store, runtime, dir);
+        if (failureStage === "staging")
+          engine.stageProduct = async () => { throw new Error("staging failed"); };
+        else engine.verify = async () => ({ id: "check-post-report",
+          sourceHash: await sourceFingerprint(tree.path), sourceUnchanged: true,
+          results: [{ command: "fixture-check", code: 0 }] }) as any;
+        await engine.implement(store.get(project.id), store.get(task.id));
+        const candidateId = store.get(round.id).candidateIds.at(-1)!;
+        const candidate = store.get(candidateId);
+        const run = store.get(candidate.runId);
+        assert.equal(run.status, "completed");
+        assert.equal(candidate.status, "finalized");
+        assert.equal(candidate.outcome, "discard");
+        assert.equal(candidate.reportedOutcome, "keep");
+        assert.equal(candidate.measurement, "90 ms");
+        assert.ok(candidate.evidence.includes("report:measured"));
+        assert.match(candidate.rejection, new RegExp(failureStage));
+        assert.match(candidate.rejection, failureStage === "staging"
+          ? /staging failed/ : /review transport failed/);
+        if (failureStage === "review") {
+          const failedReview = store.all("run", project.id).find((item) =>
+            item.taskId === task.id && item.role === "review");
+          assert.equal(failedReview?.status, "failed");
+          assert.match(failedReview!.error, /review transport failed/);
+          assert.ok(candidate.evidence.includes(`review-run:${failedReview!.id}`));
+        }
+        engine.close(); engine = undefined;
+        store.close(); store = new Store(db);
+        assert.equal(store.get(candidateId).outcome, "discard");
+        assert.equal(store.get(candidateId).measurement, "90 ms");
+        assert.equal(store.get(round.id).candidateIds.length, finalSlot ? 3 : 1);
+        if (separate) assert.equal(store.get(separate.id).status, "open");
+        assert.equal(store.get(round.id).status, finalSlot ? "exhausted" : "active");
+        assert.equal(store.get(task.id).status, finalSlot ? "blocked" : "ready");
+        assert.equal(store.get(independent.id).status, "ready");
+        assert.equal(store.all("gate", project.id).filter((gate) =>
+          gate.type === "experiment" && gate.status === "open").length, finalSlot ? 1 : 0);
+        assert.equal(store.all("gate", project.id).filter((gate) => gate.type === "runtime").length, 0);
+        assert.equal(store.all("approval", project.id).length, 0);
+      } finally { engine?.close(); store.close(); await rm(dir, { recursive: true, force: true }); }
+    });
+  }
+}
+
 for (const failure of ["check", "review"] as const) {
   test(`${failure} failure discards measured candidates across restart and exhausts only their task`, async () => {
     const dir = await testFixture(`looproom-experiment-${failure}-recovery-`);
@@ -530,8 +871,8 @@ for (const failure of ["check", "review"] as const) {
           return { verdict: "changes", summary: `Review rejected candidate ${attempt}`,
             sources: [`review:${attempt}`] } as any;
         };
-        engine.verificationRunner = async () => ({ id: `check-${attempt}`,
-          sourceHash: `source-${attempt}`, sourceUnchanged: true, reportPath: `check-${attempt}.json`,
+        engine.verificationRunner = async ({ cwd }) => ({ id: `check-${attempt}`,
+          sourceHash: await sourceFingerprint(cwd), sourceUnchanged: true, reportPath: `check-${attempt}.json`,
           createdAt: new Date().toISOString(),
           results: [{ command: "fixture-check", code: failure === "check" ? 1 : 0,
             output: failure === "check" ? "check rejected candidate" : "passed",
@@ -614,7 +955,7 @@ for (const exit of ["question", "missing-checks", "review-decision"] as const) {
           humanQuestion: exit === "question" ? "Choose a dependency" : "",
           experimentCandidate: reported } as any;
       };
-      engine.verificationRunner = async () => ({ id: "check-slot", sourceHash: "source",
+      engine.verificationRunner = async ({ cwd }) => ({ id: "check-slot", sourceHash: await sourceFingerprint(cwd),
         sourceUnchanged: true, reportPath: "check-slot.json", createdAt: new Date().toISOString(),
         results: [{ command: "fixture-check", code: 0, output: "passed", timedOut: false, durationMs: 1 }] });
       await engine.implement(store.get(project.id), store.get(task.id));

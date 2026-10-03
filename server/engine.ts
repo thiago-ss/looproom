@@ -4,7 +4,7 @@ import { mkdir, readFile, writeFile, realpath, rename, rm, link, lstat } from "n
 import { join } from "node:path";
 import { z } from "zod";
 import { Store, type RecordData } from "./store.ts";
-import { startExperiment, reserveCandidate, reportCandidate, finalizeCandidate, abandonUnmeasuredCandidate, authorizeNextRound } from "./experiments.ts";
+import { startExperiment, reserveCandidate, reportCandidate, finalizeCandidate, abandonUnmeasuredCandidate, authorizeNextRound, refreshContractError } from "./experiments.ts";
 import { prepareDependencies } from "./dependencies.ts";
 import { Runtime } from "./runtime.ts";
 import { escalationMode } from "../src/lib/autonomy.ts";
@@ -42,6 +42,7 @@ const Result = z.object({
   summary: z.string(),
   sources: z.array(z.string()),
   humanQuestion: z.string(),
+  repairWait: z.object({ gateId: z.string(), pr: z.string() }).optional(),
   claims: Claims,
   experimentCandidate: z.object({
     outcome: z.enum(["keep", "discard"]), measurement: z.string().trim().min(1),
@@ -362,9 +363,32 @@ export class Engine extends EventEmitter {
         });
       if (paused && task && role !== "judge")
         this.store.patch(task.id, { status: "ready" });
+      else if (!paused && this.store.get(run.id).status === "failed" &&
+          role === "implementation" && task?.experimentRoundId &&
+          this.store.get(run.id).experimentCandidateId) {
+        const slot = this.store.get(this.store.get(run.id).experimentCandidateId);
+        const round = this.store.get(task.experimentRoundId);
+        if (slot.status === "measured")
+          this.rejectExperimentCandidate(project, task, round, slot.id, [],
+            "Implementation run failed", message);
+        else if (slot.status === "reserved") {
+          abandonUnmeasuredCandidate(this.store, slot.id,
+            `Implementation run failed before reporting a measurement: ${message}`);
+          if (!this.gateExhaustedExperiment(project, task, round))
+            this.store.patch(task.id, { status: "ready", feedback: message });
+        }
+        if (this.store.all("gate", project.id).some(g => g.taskId === task!.id &&
+            g.status === "open" && g.type !== "experiment"))
+          this.store.patch(task.id, { status: "blocked" });
+      }
       else if (
         !paused &&
         role !== "judge" &&
+        !(role === "review" && task?.implementationRunId &&
+          (() => {
+            const slotId = this.store.get(task!.implementationRunId).experimentCandidateId;
+            return slotId && this.store.get(slotId).status === "measured";
+          })()) &&
         !this.store
           .all("gate", project.id)
           .some((gate) => gate.status === "open" && gate.taskId === task?.id)
@@ -749,10 +773,17 @@ export class Engine extends EventEmitter {
     const plan = await this.run(
       project,
       "orchestrator",
-      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. For a measured optimization task, supply experiment with a concrete hypothesis and frozen evaluator/workload identity, runtime budget, acceptance thresholds and candidateLimit of at most three; omit experiment for ordinary tasks. Dependencies are zero-based task indices and must reflect actual required inputs, not a preferred execution order. Keep independent research, usability and implementation work available while another task waits at a gate. Never bypass a genuine dependency or fabricate a completed prerequisite. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
+      `Read the repository without modifying it. Goal: ${project.goal}\nScope/exclusions: ${project.constraints}\nConversation:\n${replies}\nPrior memory (unverified until source checked):\n${memory}\nFrozen refresh baseline: ${JSON.stringify(this.store.get(project.id, "project").refreshBaseline ?? null)}.\nProduce a concise evidence-linked plan and up to six useful bounded tasks, each with acceptance criteria. The only supported measured optimization recipe uses evaluator scripts/measure-refresh.ts#sha256:<frozen baseline evaluatorHash>, workload "4 paused projects, 48 completed tasks, 80 events, 5 message updates", runtimeBudget "30 seconds", thresholds {minMedianImprovementPercent:10,maxOtherMedianRegressionPercent:5,requiredChecks:"npm test"}, and candidateLimit 1 to 3. Its baseline must already be frozen with a recorded coordinator report and source identity. If that prerequisite is absent, plan baseline setup separately; for other evaluators plan research separately before a candidate task. Never remove experiment from a measured optimization merely to pass planning. Omit experiment for ordinary tasks. Dependencies are zero-based task indices and must reflect actual required inputs, not a preferred execution order. Keep independent research, usability and implementation work available while another task waits at a gate. Never bypass a genuine dependency or fabricate a completed prerequisite. The first result is research/planning only. Missing GitHub remote/auth does not block planning or local implementation; gate only publication when it is ready. Empty gate unless a consequential decision cannot be resolved from evidence. Do not generate busywork if the goal is satisfied; use zero tasks and explain why.`,
       Plan,
     );
     validateDependencies(plan.tasks);
+    for (const task of plan.tasks) {
+      if (!task.experiment) continue;
+      if (task.kind !== "implementation")
+        throw new Error("Planning rejected experiment: rounds require implementation tasks.");
+      const reason = refreshContractError(this.store, project.id, task.experiment.contract);
+      if (reason) throw new Error(`Planning rejected experiment: ${reason}`);
+    }
     this.store.transaction(() => {
       this.store.put("message", {
         projectId: project.id,
@@ -884,15 +915,24 @@ export class Engine extends EventEmitter {
     const round = recordedRound?.status === "kept" ? undefined :
       task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
     if (round && round.status !== "active") throw new Error("Experiment round is not active.");
-    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
-    const result = await this.run(
+    const prompt = `Goal: ${project.goal}\nScope: ${project.constraints}\nTask: ${task.title}\n${task.description}\nAcceptance:\n${task.acceptance.join("\n")}\nAttributed conversation: ${context}\nPrevious verification feedback: ${task.feedback ?? "None"}\n${round ? `Experiment round ${round.number} (${round.id}); hypothesis: ${round.hypothesis}; frozen contract: ${JSON.stringify(round.contract)}; prior rounds: ${JSON.stringify(this.store.all("experiment-round", project.id).filter((item) => item.taskId === task.id && item.number < round.number))}; retry instruction: ${round.retryInstruction ?? "initial round"}. Return experimentCandidate with measured outcome, evidence and exact contract fields only after a candidate is actually measured.\n` : ""}Worktree: ${task.worktree}\nCoordinator PR evidence: ${JSON.stringify({ pr: task.pr, sha: task.sha, repair: task.prRepair, followupPr: task.followupPr })}. The coordinator observes GitHub and handles publication; do not ask for worker network/broker permissions solely to check PR state.\nImplement and verify only this task, or research without editing if kind is research. The coordinator runs the configured checks in an isolated verification snapshot after your turn; you do not need to invoke a host broker from the worker shell. Read .looproom-verification/latest.json and matching <report-id>.json files for recorded check evidence if they exist. If worker sandbox denials alone prevent running build/tests, describe proposed checks and leave humanQuestion empty so coordinator verification can proceed. Report genuine missing dependencies/capabilities or unresolved choices. If humanQuestion specifically waits for the current PR repair to merge, include its exact PR URL in humanQuestion and return repairWait with the supplied repair gateId and pr; omit repairWait for any other blocker. Do not commit, change Git metadata, push or merge. Direct network access is disabled. If dependency installation/access is required, report the exact blocker in humanQuestion. Return summary, evidence sources and humanQuestion (empty if none).`;
+    let result: z.infer<typeof Result>;
+    try { result = await this.run(
       project,
       task.kind === "research" ? "research" : "implementation",
       prompt,
       Result,
       task,
       task.kind !== "research",
-    );
+    ); } catch (error) {
+      const failedRun = this.store.get(task.id).implementationRunId;
+      const slotId = failedRun && this.store.get(failedRun).experimentCandidateId;
+      if (round && slotId && this.store.get(failedRun).status === "failed" &&
+          (this.store.get(slotId).status === "unmeasured" ||
+           (this.store.get(slotId).status === "finalized" &&
+            this.store.get(slotId).outcome === "discard"))) return;
+      throw error;
+    }
     const slotId = round ? this.store.get(this.store.get(task.id).implementationRunId).experimentCandidateId : undefined;
     const slot = slotId ? this.store.get(slotId, "experiment-candidate") : undefined;
     if (round && !slot) throw new Error("Experiment implementation run has no reserved candidate slot.");
@@ -913,14 +953,21 @@ export class Engine extends EventEmitter {
       if (round && slot?.status === "reserved") abandonUnmeasuredCandidate(this.store, slot.id,
         "Implementation run requested a decision without reporting a measurement.");
       if (round && this.gateExhaustedExperiment(project, task, round, `Task needs your input: ${result.humanQuestion}`)) return;
+      const repair = this.store.get(task.id).prRepair;
+      const repairGate = repair && this.store.get(repair.gateId);
+      const linkedRepair = result.repairWait && repairGate?.status === "superseded" &&
+        result.repairWait.gateId === repair.gateId && result.repairWait.pr === repair.pr &&
+        repairGate.pr === repair.pr && repairGate.taskId === task.id &&
+        repairGate.projectId === project.id && result.humanQuestion.includes(repair.pr);
       this.gate(
         project.id,
-        "Task needs your input",
+        linkedRepair ? "Wait for PR repair merge" : "Task needs your input",
         result.humanQuestion,
         "decision",
         task.id,
         {
           authorRole: task.kind === "research" ? "research" : "implementation",
+          ...(linkedRepair ? { mergedRepairGateId: repair.gateId } : {}),
         },
       );
       return;
@@ -960,15 +1007,20 @@ export class Engine extends EventEmitter {
       this.changed("task-completed", { taskId: task.id }, project.id);
       return;
     }
+    let failedStage = "staging";
+    let verificationReportId: string | undefined;
+    try {
     await this.stageProduct(task);
     if (task.prRepair) await this.stagePrConflicts(task);
     const checkedSource = { sourceHash: await sourceFingerprint(task.worktree),
       tree: await git(task.worktree, ["write-tree"]), head: await git(task.worktree, ["rev-parse", "HEAD"]),
       mergeHead: await git(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "") };
     this.store.patch(task.id, { status: "verifying", summary: result.summary, reviewedSource: null });
+    failedStage = "verification";
     const report = project.checks.length
       ? await this.verify(project, task, project.checks, false, this.store.get(task.id).implementationRunId)
       : undefined;
+    verificationReportId = report?.id;
     const checks = report?.results ?? [];
     if (this.store.get(project.id).status !== "running") {
       rejectMeasured("Candidate interrupted", "Project stopped during verification.",
@@ -976,7 +1028,8 @@ export class Engine extends EventEmitter {
       this.store.patch(task.id, { status: "ready" });
       return;
     }
-    if (report && !report.sourceUnchanged) {
+    if (report && (!report.sourceUnchanged || !report.sourceHash ||
+        report.sourceHash !== checkedSource.sourceHash)) {
       repairMeasuredCandidate("Source changed during verification",
         "Re-run checks against the current source; the snapshot is stale.", "check",
         [`verification:${report.id}`]);
@@ -1003,6 +1056,7 @@ export class Engine extends EventEmitter {
       );
       return;
     }
+    failedStage = "independent review";
     const reviewBase = task.prRepair?.baseSha ?? task.baseSha ??
       await git(task.worktree, ["merge-base", "HEAD", project.branch]).catch(() => "");
     const review = await this.run(
@@ -1045,6 +1099,7 @@ export class Engine extends EventEmitter {
       return;
     }
     this.store.patch(task.id, { reviewedSource: checkedSource });
+    failedStage = "keep finalization";
     if (round) {
       const candidate = finalizeCandidate(this.store, slotId, "keep", undefined,
         [...(report ? [`verification:${report.id}`] : []), ...review.sources]);
@@ -1052,6 +1107,27 @@ export class Engine extends EventEmitter {
     }
     await this.freezeBaseline(project, this.store.get(task.id));
     await this.publish(project, this.store.get(task.id));
+    } catch (error) {
+      // The implementation run completed before this work. Preserve it and
+      // settle only its still-measured slot; publication after keep is separate.
+      const currentRun = round && this.store.get(task.id).implementationRunId &&
+        this.store.get(this.store.get(task.id).implementationRunId);
+      const currentSlot = currentRun?.experimentCandidateId &&
+        this.store.get(currentRun.experimentCandidateId);
+      if (!round || currentRun?.status !== "completed" ||
+          currentSlot?.runId !== currentRun.id || currentSlot.status !== "measured")
+        throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      const reviewRun = this.store.all("run", project.id).findLast((run) =>
+        run.taskId === task.id && run.role === "review" && run.status === "failed");
+      this.rejectExperimentCandidate(project, task, round, currentSlot.id,
+        [...(verificationReportId ? [`verification:${verificationReportId}`] : []),
+          ...(reviewRun ? [`review-run:${reviewRun.id}`] : [])],
+        `${failedStage} failed`, message);
+      if (this.store.all("gate", project.id).some((gate) =>
+        gate.taskId === task.id && gate.status === "open" && gate.type !== "experiment"))
+        this.store.patch(task.id, { status: "blocked" });
+    }
   }
   async clearDiscardedExperimentWork(task: RecordData) {
     if (!task.worktree) throw new Error("Experiment task has no worktree to reset.");
@@ -1065,7 +1141,7 @@ export class Engine extends EventEmitter {
     project: RecordData, task: RecordData, round: RecordData, candidateId: string,
     failureEvidence: string[], title: string, detail: string,
   ) {
-    const candidate = finalizeCandidate(this.store, candidateId, "discard", title, failureEvidence);
+    const candidate = finalizeCandidate(this.store, candidateId, "discard", `${title}: ${detail}`, failureEvidence);
     const currentRound = this.store.get(round.id);
     const feedback = `${title}\n${detail}\nCandidate ${candidate.number} (${candidate.measurement}) was discarded.`;
     if (currentRound.status === "exhausted") {
@@ -1261,23 +1337,76 @@ export class Engine extends EventEmitter {
     if (!this.closed) this.validateRemotePr(gate, project, info);
     return { gate, info };
   }
-  retireRepairPr(project: RecordData, task: RecordData, gate: RecordData, info: any) {
-    if (this.closed) return;
+  retireRepairPrRecords(project: RecordData, task: RecordData, gate: RecordData, info: any, message?: string) {
     const observedAt = new Date().toISOString();
     const observation = { url: info.url, number: info.number, state: info.state, headSha: info.headRefOid,
-      base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
-    this.store.transaction(() => {
-      this.store.patch(gate.id, { remoteObservation: observation,
-        ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
-      this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
-        baseSha: task.prRepair?.baseSha ?? task.baseSha,
-        followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
-        feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
-      this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
-        text: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
-    });
+    base: info.baseRefName, mergedSha: info.mergeCommit?.oid, mergedAt: info.mergedAt, observedAt };
+    this.store.patch(gate.id, { remoteObservation: observation,
+      ...(["open", "superseded"].includes(gate.status) ? { status: info.state === "MERGED" ? "reconciled" : "closed", resolvedAt: observedAt, mergedSha: info.mergeCommit?.oid } : {}) });
+    this.store.patch(task.id, { status: "ready", pr: null, prRepair: null, reviewedSource: null,
+      baseSha: task.prRepair?.baseSha ?? task.baseSha,
+      followupPr: observation, prHistory: [...(task.prHistory ?? []), observation],
+      feedback: `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} during repair. Preserve the current work. Reverify against the latest base. If additional changes remain, publish a fresh PR for human approval; never claim those changes were included in the earlier merge.` });
+    this.store.put("message", { projectId: project.id, taskId: task.id, role: "coordinator",
+      text: message ?? `PR #${info.number} ${info.state === "MERGED" ? "merged" : "closed"} while integration was underway. Preserved changes will be rechecked and any remaining work will receive a fresh PR.`, createdAt: observedAt });
+    return observation;
+  }
+  retireRepairPr(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    if (this.closed) return;
+    const observation = this.store.transaction(() => this.retireRepairPrRecords(project, task, gate, info));
     if (info.state !== "MERGED") this.gate(project.id, "PR closed during integration", "Decide whether remaining work needs a fresh PR or should be discarded. The earlier PR was closed without merging.", "publication", task.id);
     this.changed("repair-pr-retired", { taskId: task.id, ...observation }, project.id);
+  }
+  async settleMergedRepair(project: RecordData, task: RecordData, gate: RecordData, info: any) {
+    // A repair may be waiting for a broker fact rather than running a worker.
+    // Observe even unchanged facts again: ownership can have become idle since the last poll.
+    const active = () => this.busy.has("task:" + task.id) ||
+      this.store.all("gate", project.id).some(g => g.taskId === task.id && g.status === "open" &&
+        (g.judgeStatus === "running" || ["running", "verifying"].includes(g.judgeRecoveryStatus))) ||
+      this.store.all("run", project.id).some(r => r.taskId === task.id && r.status === "running");
+    if (info.state !== "MERGED" || active() || this.store.hasOpenInterruption(project.id)) return;
+    if (!task.worktree || !task.branch || task.prRepair?.gateId !== gate.id ||
+        task.prRepair.pr !== info.url || task.prRepair.base !== project.branch)
+      throw new Error("Merged repair has no matching owned task worktree.");
+    const common = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    if (await realpath(await this.gitRunner(task.worktree, common)) !==
+        await realpath(await this.gitRunner(project.path, common)) ||
+        await this.gitRunner(task.worktree, ["branch", "--show-current"]) !== task.branch)
+      throw new Error("Merged repair worktree ownership changed.");
+    const head = await this.gitRunner(task.worktree, ["rev-parse", "HEAD"]);
+    const mergeHead = await this.gitRunner(task.worktree, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+    const dirty = await this.gitRunner(task.worktree, ["status", "--porcelain", "--", ".", ":(top,exclude).looproom-verification"]);
+    if (this.closed || active() || this.store.hasOpenInterruption(project.id)) return;
+    const current = this.store.get(task.id), currentGate = this.store.get(gate.id);
+    if (currentGate.status !== "superseded" || current.prRepair?.gateId !== gate.id ||
+        JSON.stringify(current.prRepair) !== JSON.stringify(task.prRepair)) return;
+    const included = head === info.headRefOid && !mergeHead && !dirty;
+    const answer = included
+      ? `GitHub reports PR #${info.number} merged at ${info.mergeCommit.oid}. Its final head ${info.headRefOid} exactly matches the clean owned worktree; no additional work remains. Merge actor is unverified; no approval was created.`
+      : `GitHub reports PR #${info.number} merged at ${info.mergeCommit.oid}. Preserve remaining work and reverify it against the latest base for a fresh PR; the earlier merge does not approve unpublished changes.`;
+    const resolvedAt = new Date().toISOString();
+    this.store.transaction(() => {
+      this.retireRepairPrRecords(project, current, currentGate, info, answer);
+      // A capability wait is not necessarily about this PR. Only an explicitly
+      // linked wait can be satisfied by this particular merged revision.
+      for (const wait of this.store.all("gate", project.id).filter(g => g.taskId === task.id &&
+        g.status === "open" && g.awaitingCapability && g.judgeSubmittedAt &&
+        g.resolvedBy === "judge" && g.mergedRepairGateId === gate.id &&
+        !["pr", "interrupted"].includes(g.type))) {
+        this.store.patch(wait.id, { status: "resolved", answer, resolvedBy: "coordinator", resolvedAt,
+          awaitingCapability: false, judgeNextAttemptAt: null, brokerEvidence: this.store.get(gate.id).remoteObservation });
+        this.store.recordGateResponse(wait, answer, "coordinator", resolvedAt);
+      }
+      const stillGated = this.store.all("gate", project.id).some(g =>
+        g.taskId === task.id && g.status === "open");
+      this.store.patch(task.id, included && !stillGated
+        ? { status: "completed", completedReason: "Clean owned worktree matches the externally merged final head.",
+            mergedBaseEvidence: { pr: info.url, headSha: head, mergedSha: info.mergeCommit.oid } }
+        : { status: stillGated ? "blocked" : "ready", attempt: 0, judgeRetries: 0 });
+    });
+    this.changed("merged-repair-settled", { taskId: task.id, included, headSha: head, mergedSha: info.mergeCommit.oid }, project.id);
+    this.tick();
+    await this.repairReconciledEvidence(this.store.get(gate.id));
   }
   async createPrOrReuse(project: RecordData, task: RecordData, sha: string, bodyPath: string) {
     try {
@@ -1344,6 +1473,7 @@ export class Engine extends EventEmitter {
               if (task.prRepair?.gateId === gate.id) this.store.patch(task.id, { prRepair: { ...task.prRepair, remoteObservation: observation } });
               this.changed("repair-pr-observed", { gateId: gate.id, ...observation }, projectId);
             }
+            await this.settleMergedRepair(project, this.store.get(task.id), this.store.get(gate.id), info);
             continue;
           }
           if (this.busy.has("task:" + task.id) || this.store.all("run", projectId).some(r => r.taskId === task.id && r.status === "running")) continue;
@@ -2099,6 +2229,9 @@ export class Engine extends EventEmitter {
               baselineVerification: t.baselineVerification,
               verificationEvaluatorHash: t.verificationEvaluatorHash,
               judgeRetries: t.judgeRetries,
+              pr: t.pr, sha: t.sha, prRepair: t.prRepair,
+              remotePrEvidence: this.store.all("gate", project.id).filter(g => g.type === "pr" && g.taskId === t.id)
+                .map(g => ({ id: g.id, pr: g.pr, sha: g.sha, status: g.status, remoteObservation: g.remoteObservation })),
             }
           : {}),
       }));

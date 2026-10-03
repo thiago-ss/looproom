@@ -20,6 +20,44 @@ function sameContract(a: ExperimentContract, b: ExperimentContract) {
 const refreshCommand = "node --import tsx scripts/measure-refresh.ts";
 const refreshWorkload = "4 paused projects, 48 completed tasks, 80 events, 5 message updates";
 const metricNames = ["baselineRefreshBytes", "baselineCoordinatorRoundTripMs", "baselineUpdateLatencyMs"] as const;
+const refreshThresholds = { minMedianImprovementPercent: 10,
+  maxOtherMedianRegressionPercent: 5, requiredChecks: "npm test" };
+
+function parseRefreshReport(value: any) {
+  const result = value?.results?.find((entry: any) => entry.command === refreshCommand &&
+    entry.code === 0 && !entry.timedOut && entry.durationMs <= 30_000);
+  if (!result) return undefined;
+  try {
+    const parsed = JSON.parse(result.output);
+    if (parsed.workload !== refreshWorkload || parsed.repetitions !== 5 ||
+        !metricNames.every((name) => typeof parsed[name] === "number" &&
+          Number.isFinite(parsed[name]) && parsed[name] > 0)) return undefined;
+    return parsed;
+  } catch { return undefined; }
+}
+
+export function refreshContractError(store: Store, projectId: string,
+  contract: ExperimentContract): string | undefined {
+  validateExperimentContract(contract);
+  const baseline = store.get(projectId, "project").refreshBaseline;
+  const sorted = (value: Record<string, string | number>) =>
+    JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
+  if (!baseline || baseline.phase !== "frozen" || !baseline.evaluatorHash ||
+      contract.evaluator !== `scripts/measure-refresh.ts#sha256:${baseline.evaluatorHash}` ||
+      contract.workload !== refreshWorkload || contract.runtimeBudget !== "30 seconds" ||
+      sorted(contract.thresholds) !== sorted(refreshThresholds))
+    return "Only the frozen refresh evaluator, exact workload, 30-second budget, and 10% improvement / 5% regression / npm test thresholds can be kept. Establish and freeze a refresh baseline first, or plan evaluator research separately.";
+  const sourceHash = baseline.measurementSourceHash ??
+    store.all("task", projectId).find((task) => task.id === baseline.ownerTaskId)
+      ?.baselineVerification?.sourceHash;
+  const report = store.all("verification-report", projectId)
+    .find((record) => record.report.id === baseline.reportId)?.report;
+  if (!baseline.reportId || !sourceHash || !report || report.id !== baseline.reportId ||
+      report.evaluatorHash !== baseline.evaluatorHash || report.sourceHash !== sourceHash ||
+      !report.sourceUnchanged || !parseRefreshReport(report))
+    return "Frozen refresh baseline needs its recorded coordinator report ID, evaluator hash, and matching source identity before planning candidates. Complete baseline setup separately.";
+  return undefined;
+}
 
 // Only the refresh recipe has defined machine comparison semantics. Evidence
 // comes from coordinator verification records, never from worker prose.
@@ -27,15 +65,8 @@ function keepDecision(store: Store, round: any, candidate: any): string | undefi
   const contract = round.contract as ExperimentContract;
   const project = store.get(round.projectId, "project");
   const baseline = project.refreshBaseline;
-  const expected = { minMedianImprovementPercent: 10, maxOtherMedianRegressionPercent: 5,
-    requiredChecks: "npm test" };
-  const sorted = (value: Record<string, string | number>) =>
-    JSON.stringify(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
-  if (sorted(contract.thresholds) !== sorted(expected) ||
-      contract.workload !== refreshWorkload || contract.runtimeBudget !== "30 seconds" ||
-      !baseline || baseline.phase !== "frozen" ||
-      contract.evaluator !== `scripts/measure-refresh.ts#sha256:${baseline.evaluatorHash}`)
-    return "Frozen experiment thresholds or refresh evaluator identity cannot be evaluated.";
+  const contractError = refreshContractError(store, round.projectId, contract);
+  if (contractError) return contractError;
   const ids = candidate.evidence.filter((source: string) => /^verification:[a-f0-9-]{36}$/.test(source))
     .map((source: string) => source.slice("verification:".length));
   const report = ids.map((id: string) => store.all("verification-report", round.projectId)
@@ -50,19 +81,10 @@ function keepDecision(store: Store, round: any, candidate: any): string | undefi
       !report.sourceUnchanged || !baselineReport.sourceUnchanged ||
       !baselineSourceHash || baselineReport.sourceHash !== baselineSourceHash)
     return "Matching coordinator candidate and frozen baseline evaluator reports are missing.";
-  const parse = (value: any) => {
-    const result = value.results?.find((entry: any) => entry.command === refreshCommand &&
-      entry.code === 0 && !entry.timedOut && entry.durationMs <= 30_000);
-    if (!result) return undefined;
-    try {
-      const parsed = JSON.parse(result.output);
-      if (parsed.workload !== refreshWorkload || parsed.repetitions !== 5 ||
-          !metricNames.every((name) => typeof parsed[name] === "number" &&
-            Number.isFinite(parsed[name]) && parsed[name] > 0)) return undefined;
-      return parsed;
-    } catch { return undefined; }
-  };
-  const base = parse(baselineReport), measured = parse(report);
+  const reviewedSourceHash = store.get(round.taskId, "task").reviewedSource?.sourceHash;
+  if (!reviewedSourceHash || !report.sourceHash || report.sourceHash !== reviewedSourceHash)
+    return "Candidate evaluator source does not match the reviewed source.";
+  const base = parseRefreshReport(baselineReport), measured = parseRefreshReport(report);
   if (!base || !measured) return "Exact evaluator output or comparable numeric medians are missing.";
   if (!report.results.length || report.results.some((entry: any) => entry.code !== 0 || entry.timedOut) ||
       !report.results.some((entry: any) => entry.command === "npm test" && entry.code === 0 && !entry.timedOut))
