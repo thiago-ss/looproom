@@ -468,12 +468,21 @@ app.get(
     res.json(await engine.prInfo(String(req.params.id)));
   }),
 );
+app.post(
+  "/api/projects/:id/pull-requests/import",
+  route(async (req, res) => {
+    const { url } = z.object({ url: z.string().url().max(500) }).parse(req.body);
+    res.json(await engine.importExternalPr(String(req.params.id), url));
+  }),
+);
 app.get(
   "/api/gates/:id/diff",
   route(async (req, res) => {
     const gate = store.get(String(req.params.id), "gate");
     if (gate.type !== "pr") throw new Error("Not a PR gate.");
-    res.json({ diff: await gh(["pr", "diff", gate.pr]) });
+    res.json(gate.importedFromGitHub
+      ? await engine.importedPrDiff(gate.id)
+      : { diff: await gh(["pr", "diff", gate.pr]) });
   }),
 );
 app.post(

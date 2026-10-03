@@ -229,6 +229,7 @@ export class Engine extends EventEmitter {
     task?: RecordData,
     write = false,
     purpose?: "pr-repair" | "merged-pr-followup",
+    cwdOverride?: string,
   ) {
     if (task) task = this.store.get(task.id, "task");
     let browserBaselineIntegrityError: string | undefined;
@@ -329,7 +330,7 @@ export class Engine extends EventEmitter {
       const output = await this.runtime.run({
         model: profile.model,
         effort: profile.effort,
-        cwd: task?.worktree ?? project.path,
+        cwd: cwdOverride ?? task?.worktree ?? project.path,
         write,
         prompt: WORKFLOW + "\n\n" + autonomyPolicy(project) + "\n\n" + prompt,
         schema: strictModelOutputSchema(originalOutputSchema),
@@ -955,6 +956,8 @@ export class Engine extends EventEmitter {
   }
   async implement(project: RecordData, task: RecordData) {
     task = this.store.get(task.id, "task");
+    if (task.kind === "external-pr")
+      throw new Error("Imported GitHub PRs are human Review records, not implementation work.");
     if (["completed", "awaiting_human"].includes(task.status)) return;
     const recordedRound = task.experimentRoundId ? this.store.get(task.experimentRoundId, "experiment-round") : undefined;
     if (recordedRound && (recordedRound.taskId !== task.id || recordedRound.projectId !== project.id))
@@ -1761,6 +1764,7 @@ export class Engine extends EventEmitter {
     try {
       const gates = this.store.all("gate", projectId).filter(g =>
         g.type === "pr" && (["open", "merging"].includes(g.status) ||
+          (g.importedFromGitHub && g.status === "resolved" && this.store.get(g.taskId).externalPr?.awaitingUpdate) ||
           (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id)));
       for (const snapshot of gates) {
         if (this.closed) return;
@@ -1768,7 +1772,8 @@ export class Engine extends EventEmitter {
         this.prDecisionBusy.add(snapshot.id);
         try {
           const gate = this.store.get(snapshot.id);
-          if (!["open", "merging", "superseded"].includes(gate.status)) continue;
+          if (!["open", "merging", "superseded"].includes(gate.status) &&
+              !(gate.importedFromGitHub && gate.status === "resolved")) continue;
           if (gate.mergeAttempt) { await this.reconcileMergeReserved(gate.id); continue; }
           const info = await this.prInfo(gate.id);
           if (this.closed) return;
@@ -1778,6 +1783,58 @@ export class Engine extends EventEmitter {
             throw new Error("Remote PR identity, base or head does not match this project.");
           const task = this.store.get(gate.taskId, "task");
           if (task.projectId !== projectId) throw new Error("Remote PR task belongs to another project.");
+          if (gate.importedFromGitHub) {
+            if (task.kind !== "external-pr" || task.externalPr?.url !== gate.pr ||
+                gate.base !== project.branch || !/^[a-f0-9]{40}$/.test(gate.baseSha ?? ""))
+              throw new Error("Imported PR provenance no longer matches its project and task.");
+            const observedAt = new Date().toISOString();
+            const observation = { url: info.url, number: info.number, state: info.state,
+              headSha: info.headRefOid, baseSha: info.baseRefOid, base: info.baseRefName,
+              mergeable: info.mergeable, mergedSha: info.mergeCommit?.oid,
+              mergedAt: info.mergedAt, observedAt };
+            if (info.state === "MERGED") {
+              this.store.transaction(() => {
+                const current = this.store.get(gate.id, "gate");
+                const currentTask = this.store.get(task.id, "task");
+                if (!current.importedFromGitHub || current.pr !== gate.pr || current.sha !== gate.sha ||
+                    current.baseSha !== gate.baseSha || !["open", "resolved"].includes(current.status) ||
+                    currentTask.kind !== "external-pr" || currentTask.externalPr?.url !== gate.pr)
+                  throw new Error("Imported PR changed during merge observation.");
+                this.store.patch(gate.id, { status: "reconciled", remoteObservation: observation,
+                  mergedSha: info.mergeCommit.oid, resolvedAt: observedAt,
+                  mergeRecovery: "Merged externally on GitHub; merge actor unverified." });
+                this.store.patch(task.id, { status: "completed", externalPr: { ...currentTask.externalPr,
+                  finalHeadSha: info.headRefOid, mergedSha: info.mergeCommit.oid, mergedAt: info.mergedAt } });
+                this.store.put("message", { projectId, taskId: task.id, role: "coordinator",
+                  text: `GitHub reports imported PR #${info.number} merged. Merge actor is unverified.`, createdAt: observedAt });
+              });
+              this.changed("external-pr-merged", { gateId: gate.id, ...observation }, projectId);
+              this.tick();
+            } else if (info.state === "CLOSED") {
+              this.store.transaction(() => {
+                const current = this.store.get(gate.id, "gate");
+                const currentTask = this.store.get(task.id, "task");
+                if (!current.importedFromGitHub || current.pr !== gate.pr || current.sha !== gate.sha ||
+                    current.baseSha !== gate.baseSha || !["open", "resolved"].includes(current.status) ||
+                    currentTask.kind !== "external-pr" || currentTask.externalPr?.url !== gate.pr)
+                  throw new Error("Imported PR changed during close observation.");
+                this.store.patch(gate.id, { status: "reconciled", remoteObservation: observation,
+                  resolvedAt: observedAt, mergeRecovery: "GitHub closed this PR without a merge." });
+                this.store.patch(task.id, { status: "cancelled", externalPr: { ...currentTask.externalPr,
+                  closedAt: observedAt, closedWithoutMerge: true } });
+              });
+              this.changed("external-pr-closed", { gateId: gate.id, ...observation }, projectId);
+            } else if (info.state === "OPEN" &&
+                       (info.headRefOid !== gate.sha || info.baseRefOid !== gate.baseSha)) {
+              await this.importExternalPr(projectId, gate.pr);
+            } else if (info.state === "OPEN" &&
+                       (gate.remoteObservation?.mergeable !== info.mergeable ||
+                        gate.remoteObservation?.state !== info.state)) {
+              this.store.patch(gate.id, { remoteObservation: observation });
+              this.changed("external-pr-observed", { gateId: gate.id, ...observation }, projectId);
+            }
+            continue;
+          }
           if (gate.status === "superseded") {
             const previous = gate.remoteObservation;
             if (previous?.state !== info.state || previous?.headSha !== info.headRefOid || previous?.mergeable !== info.mergeable) {
@@ -1969,9 +2026,133 @@ export class Engine extends EventEmitter {
         "view",
         gate.pr,
         "--json",
-        "number,url,title,headRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt",
+        "number,url,title,headRefOid,baseRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt",
       ]),
     );
+  }
+  externalPrIdentity(project: RecordData, url: string, info: any) {
+    if (!project.github || !project.branch ||
+        !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(url))
+      throw new Error("Import requires a GitHub PR in the configured repository.");
+    this.mergeTarget(url, info.number);
+    if (url !== info.url || !url.startsWith(`https://github.com/${project.github}/pull/`) ||
+        info.baseRefName !== project.branch || info.state !== "OPEN" ||
+        !/^[a-f0-9]{40}$/.test(info.headRefOid ?? "") ||
+        !/^[a-f0-9]{40}$/.test(info.baseRefOid ?? ""))
+      throw new Error("Imported PR must be open with a valid head and base in this project's configured repository.");
+    return { url, number: info.number, sha: info.headRefOid, baseSha: info.baseRefOid, base: info.baseRefName };
+  }
+  async externalPrInfo(url: string) {
+    return JSON.parse(await this.mergeBroker(["pr", "view", url, "--json",
+      "number,url,title,headRefOid,baseRefOid,statusCheckRollup,mergeable,state,body,files,baseRefName,mergeCommit,mergedAt"]));
+  }
+  async importExternalPr(projectId: string, url: string) {
+    const project = this.store.get(projectId, "project");
+    // Validate the requested repository before asking GitHub to resolve it.
+    if (!project.github || !project.branch ||
+        !/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(url) ||
+        !url.startsWith(`https://github.com/${project.github}/pull/`))
+      throw new Error("PR URL must belong to this project's configured GitHub repository.");
+    const first = await this.externalPrInfo(url);
+    const identity = this.externalPrIdentity(project, url, first);
+    const second = await this.externalPrInfo(url);
+    const confirmed = this.externalPrIdentity(project, url, second);
+    if (JSON.stringify(identity) !== JSON.stringify(confirmed))
+      throw new Error("PR revision or base changed during import. Refresh and retry.");
+    if (this.closed) throw new Error("Coordinator closed during PR import.");
+    const importedAt = new Date().toISOString();
+    const imported = this.store.transaction(() => {
+      const currentProject = this.store.get(projectId, "project");
+      if (currentProject.github !== project.github || currentProject.branch !== project.branch)
+        throw new Error("Project repository settings changed during PR import.");
+      const matches = this.store.all("task", projectId).filter(task => task.pr === url || task.externalPr?.url === url);
+      if (matches.length > 1 || matches.some(task => task.kind !== "external-pr"))
+        throw new Error("This PR is already owned by another Looproom task.");
+      let task = matches[0];
+      if (task && ["completed", "cancelled"].includes(task.status))
+        throw new Error("This PR has already reached a terminal Looproom state.");
+      const gates = task ? this.store.all("gate", projectId).filter(g => g.taskId === task.id && g.type === "pr" && g.importedFromGitHub) : [];
+      const active = gates.find(g => g.status === "open" || g.status === "merging");
+      if (active?.mergeAttempt || active?.status === "merging")
+        throw new Error("An earlier merge attempt must be reconciled before refreshing this PR.");
+      if (active && active.sha === identity.sha && active.baseSha === identity.baseSha && active.base === identity.base)
+        return { task: task!, gate: active };
+      if (task?.externalPr?.sha === identity.sha && task?.externalPr?.baseSha === identity.baseSha &&
+          gates.some(g => g.status === "resolved" && g.sha === identity.sha && g.baseSha === identity.baseSha))
+        throw new Error("Changes were requested for this revision. Wait for a new PR head or base before importing again.");
+      if (active) this.store.patch(active.id, { status: "superseded", resolvedAt: importedAt,
+        remoteObservation: { url, number: identity.number, state: "OPEN", headSha: identity.sha,
+          baseSha: identity.baseSha, base: identity.base, mergeable: second.mergeable, observedAt: importedAt } });
+      const externalPr = { ...identity, importedAt, provenance: "imported-from-github" };
+      if (task) task = this.store.patch(task.id, { status: "awaiting_human", sha: identity.sha,
+        externalPr, title: second.title || task.title, feedback: null });
+      else task = this.store.put("task", { projectId, kind: "external-pr", status: "awaiting_human",
+        title: second.title || `GitHub PR #${identity.number}`, description: `External GitHub PR ${url}`,
+        acceptance: [], dependencies: [], pr: url, sha: identity.sha, checks: [], review: null,
+        externalPr, createdAt: importedAt });
+      const gate = this.store.put("gate", { projectId, taskId: task.id, type: "pr", scope: "task",
+        status: "open", importedFromGitHub: true, title: `Review GitHub PR #${identity.number}`,
+        detail: `External GitHub PR ${url} at head ${identity.sha} against base ${identity.baseSha}. Looproom has no originating implementation, configured checks, or independent review for this import. Review the exact GitHub diff and checks before human approval.`,
+        pr: url, sha: identity.sha, base: identity.base, baseSha: identity.baseSha,
+        authorRole: "coordinator", createdAt: importedAt, judgeStatus: "pending",
+        remoteObservation: { url, number: identity.number, state: "OPEN", headSha: identity.sha,
+          baseSha: identity.baseSha, base: identity.base, mergeable: second.mergeable, observedAt: importedAt } });
+      this.store.recordEscalation(gate);
+      return { task, gate };
+    });
+    this.changed("external-pr-imported", { taskId: imported.task.id, gateId: imported.gate.id,
+      sha: identity.sha, baseSha: identity.baseSha }, projectId);
+    return imported;
+  }
+  async importedPrDiff(gateId: string) {
+    const gate = this.store.get(gateId, "gate");
+    if (!gate.importedFromGitHub || gate.type !== "pr" || gate.status !== "open")
+      throw new Error("This imported PR revision is no longer open for review.");
+    const project = this.store.get(gate.projectId, "project");
+    const first = this.externalPrIdentity(project, gate.pr, await this.externalPrInfo(gate.pr));
+    if (first.sha !== gate.sha || first.baseSha !== gate.baseSha || first.base !== gate.base)
+      throw new Error("Imported PR revision or base changed. Refresh its Review gate.");
+    const target = this.mergeTarget(gate.pr, first.number).replace(/\/pulls\/\d+\/merge$/, "");
+    const diff = await this.mergeBroker(["api", "-H", "Accept: application/vnd.github.diff",
+      `${target}/compare/${first.baseSha}...${first.sha}`]);
+    if (!diff.trim()) throw new Error("GitHub returned no diff for this imported PR revision.");
+    if (Buffer.byteLength(diff) > 2_000_000)
+      throw new Error("Imported PR diff exceeds the 2 MB review limit; inspect it directly on GitHub.");
+    const second = this.externalPrIdentity(project, gate.pr, await this.externalPrInfo(gate.pr));
+    if (JSON.stringify(first) !== JSON.stringify(second) || this.closed)
+      throw new Error("Imported PR changed while its diff was captured.");
+    const current = this.store.get(gateId, "gate");
+    if (current.status !== "open" || current.sha !== first.sha || current.baseSha !== first.baseSha ||
+        current.pr !== gate.pr || !current.importedFromGitHub)
+      throw new Error("Imported PR Review gate changed during diff capture.");
+    return { diff, sha: first.sha, baseSha: first.baseSha,
+      diffSha256: createHash("sha256").update(diff).digest("hex") };
+  }
+  async importedPrJudgeContext(project: RecordData, task: RecordData, gate: RecordData) {
+    if (task.kind !== "external-pr" || !gate.importedFromGitHub ||
+        task.projectId !== project.id || task.externalPr?.url !== gate.pr ||
+        task.externalPr?.sha !== gate.sha || task.externalPr?.baseSha !== gate.baseSha ||
+        !/^[a-f0-9]{40}$/.test(gate.sha ?? "") || !/^[a-f0-9]{40}$/.test(gate.baseSha ?? ""))
+      throw new Error("Imported PR judge context has stale task or gate provenance.");
+    const captured = await this.importedPrDiff(gate.id);
+    const current = this.store.get(gate.id, "gate");
+    if (current.status !== "open" || current.sha !== captured.sha || current.baseSha !== captured.baseSha)
+      throw new Error("Imported PR gate changed during judge context capture.");
+    const cwd = join(this.dataDir, "external-pr-context", gate.id, `${captured.baseSha}-${captured.sha}`);
+    await mkdir(cwd, { recursive: true });
+    const canonicalRoot = await realpath(this.dataDir);
+    if (!(await realpath(cwd)).startsWith(canonicalRoot + "/external-pr-context/"))
+      throw new Error("Imported PR context directory escaped coordinator storage.");
+    const path = join(cwd, `review-${captured.diffSha256}.diff`);
+    try { await writeFile(path, captured.diff, { flag: "wx" }); }
+    catch (error) {
+      const existing = await lstat(path).catch(() => null);
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" ||
+          !existing?.isFile() || existing.isSymbolicLink() ||
+          createHash("sha256").update(await readFile(path)).digest("hex") !== captured.diffSha256)
+        throw error;
+    }
+    return { cwd, filename: `review-${captured.diffSha256}.diff`, ...captured };
   }
   mergeTarget(pr: string, number: number) {
     const match = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/([1-9]\d*)$/.exec(pr);
@@ -2096,7 +2277,7 @@ export class Engine extends EventEmitter {
       throw new Error("This PR approval is no longer open.");
     if (gate.mergeAttempt)
       throw new Error("A prior merge attempt needs manual reconciliation before another approval.");
-    const info = await this.prInfo(gateId);
+    let info = await this.prInfo(gateId);
     if (reviewedSha !== gate.sha)
       throw new Error(
         "Review the currently displayed revision before approving.",
@@ -2106,6 +2287,16 @@ export class Engine extends EventEmitter {
       throw new Error("Pull request identity changed. Refresh and review.");
     if (this.closed) throw new Error("Coordinator closed during PR approval.");
     this.validateRemotePr(gate, this.store.get(gate.projectId), info);
+    if (gate.importedFromGitHub) {
+      if (info.baseRefOid !== gate.baseSha)
+        throw new Error("Imported PR base changed. Refresh its Review gate before approval.");
+      const confirmed = await this.prInfo(gateId);
+      this.validateRemotePr(gate, this.store.get(gate.projectId), confirmed);
+      if (confirmed.state !== "OPEN" || confirmed.headRefOid !== info.headRefOid ||
+          confirmed.baseRefOid !== info.baseRefOid || confirmed.baseRefOid !== gate.baseSha)
+        throw new Error("Imported PR changed during approval. Refresh its Review gate.");
+      info = confirmed;
+    }
     const target = this.mergeTarget(gate.pr, info.number);
     checkApproval(
       reviewedSha,
@@ -2117,18 +2308,27 @@ export class Engine extends EventEmitter {
     const task = this.store.get(gate.taskId, "task");
     if (task.projectId !== project.id || task.status !== "awaiting_human")
       throw new Error("This PR task is no longer awaiting human review.");
+    if (gate.importedFromGitHub && (task.kind !== "external-pr" || task.externalPr?.url !== gate.pr ||
+        task.externalPr?.sha !== gate.sha || task.externalPr?.baseSha !== gate.baseSha))
+      throw new Error("Imported PR task provenance changed before approval.");
     const run = this.prEvidenceRun(gate, reviewedSha, true);
+    if (gate.importedFromGitHub && (run || gate.prRunId))
+      throw new Error("Imported PR has unexpected native implementation evidence; review provenance before merging.");
     const intent = run && this.store.all("wiki-ingest", project.id).find((item) => item.runId === run.id && item.taskId === gate.taskId);
     const existingPr = intent?.pendingEvidence?.prEvidence;
     if (intent && (existingPr?.url !== gate.pr || existingPr?.headSha !== reviewedSha))
       throw new Error("Wiki PR evidence does not match the approved revision.");
     this.store.transaction(() => {
       const current = this.store.get(gateId);
-      if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha)
+      if (current.status !== "open" || current.mergeAttempt || current.sha !== reviewedSha ||
+          (gate.importedFromGitHub && (!current.importedFromGitHub || current.baseSha !== gate.baseSha ||
+            current.pr !== gate.pr || this.store.get(gate.taskId, "task").externalPr?.baseSha !== gate.baseSha)))
         throw new Error("This revision already has a merge attempt or is no longer open.");
       this.store.patch(gateId, {
         status: "merging",
-        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, base: info.baseRefName, prRunId: run?.id, requestedAt: new Date().toISOString() },
+        mergeAttempt: { reviewedSha, pr: info.url, number: info.number, base: info.baseRefName,
+          ...(gate.importedFromGitHub ? { baseSha: gate.baseSha, importedFromGitHub: true } : {}),
+          prRunId: run?.id, requestedAt: new Date().toISOString() },
       });
     });
     let result: any;
@@ -2186,6 +2386,7 @@ export class Engine extends EventEmitter {
         gateId,
         taskId: gate.taskId,
         reviewedSha,
+        ...(gate.importedFromGitHub ? { importedFromGitHub: true, baseSha: gate.baseSha } : {}),
         mergedSha: result.sha,
         createdAt: new Date().toISOString(),
       });
@@ -2221,18 +2422,27 @@ export class Engine extends EventEmitter {
       if (info.state !== "OPEN") throw new Error("Pull request is not open.");
       if (info.headRefOid !== reviewedSha)
         throw new Error("PR revision changed. Refresh and review the new commit.");
+      if (gate.importedFromGitHub && info.baseRefOid !== gate.baseSha)
+        throw new Error("Imported PR base changed. Refresh its Review gate before requesting changes.");
       const resolvedAt = new Date().toISOString();
       this.store.transaction(() => {
         const current = this.store.get(gateId, "gate");
         const currentTask = this.store.get(gate.taskId, "task");
-        if (current.status !== "open" || currentTask.status !== "awaiting_human")
+        if (current.status !== "open" || currentTask.status !== "awaiting_human" ||
+            (gate.importedFromGitHub && (!current.importedFromGitHub || current.sha !== reviewedSha ||
+              current.baseSha !== gate.baseSha || current.pr !== gate.pr ||
+              currentTask.kind !== "external-pr" || currentTask.externalPr?.baseSha !== gate.baseSha)))
           throw new Error("This PR review is no longer open.");
         this.store.patch(gateId, {
           status: "resolved", answer, resolvedBy: "human", resolvedAt,
           reviewedSha,
         });
         this.store.recordGateResponse(gate, answer, "human", resolvedAt);
-        this.store.patch(task.id, {
+        this.store.patch(task.id, gate.importedFromGitHub ? {
+          status: "blocked", externalPr: { ...currentTask.externalPr, awaitingUpdate: true,
+            requestedChangesAt: resolvedAt, requestedChangesSha: reviewedSha },
+          feedback: `Human requested changes to external PR revision ${reviewedSha}: ${answer}`,
+        } : {
           status: "ready", attempt: 0, judgeRetries: 0,
           feedback: `Human requested changes to revision ${reviewedSha}: ${answer}`,
         });
@@ -2286,6 +2496,8 @@ export class Engine extends EventEmitter {
         throw new Error("An exhausted experiment requires judge authorization of a distinct round before retry.");
       if (current.type === "pr" && current.mergeAttempt)
         throw new Error("Reconcile the outstanding merge attempt before resolving this PR gate.");
+      if (current.type === "pr" && current.importedFromGitHub)
+        throw new Error("Imported PRs require Approve, Request changes, or remote reconciliation.");
       if (
         actor === "judge" &&
         (escalationMode(project) === "human" || project.status !== "running")
@@ -2704,10 +2916,12 @@ export class Engine extends EventEmitter {
         (gate.originRunId ?? gate.runId)
           ? this.store.get(gate.originRunId ?? gate.runId)
           : undefined;
+      const externalContext = task?.kind === "external-pr"
+        ? await this.importedPrJudgeContext(project, task, gate) : undefined;
       let result = await this.run(
         project,
         "judge",
-        `You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request fixed coordinator recipes via verificationRequests: "configured-checks", "refresh-baseline", or "browser-baseline". Request "browser-baseline" only when actual read-only project records and controlled browser measurements are needed; the coordinator snapshots records, runs a private browser against a separate viewer, and returns an immutable report. An unavailable report is diagnostic, not a measured baseline. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs disposable isolated verification; the worker permissions stay unchanged. If recorded evidence is missing for an available recipe, request it instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
+        `${externalContext ? `External GitHub PR provenance: imported, with no Looproom implementation run, configured checks, or independent review. This judge is read-only. Read only ${externalContext.filename} in the isolated external PR context as the diff of base ${externalContext.baseSha} to head ${externalContext.sha}; SHA-256 ${externalContext.diffSha256}. Do not treat the local project checkout as this PR source. Give a sourced review note only and keep human merge approval.\n` : ""}You are Looproom's independent escalation judge. Craft a precise, useful response to THIS escalation, ready to send to its originating agent. Current mode: ${escalationMode(project)}. Human mode prepares a draft; bypass submits retry/skip; YOLO submits every non-PR response. In YOLO you can request fixed coordinator recipes via verificationRequests: "configured-checks", "refresh-baseline", or "browser-baseline". Request "browser-baseline" only when actual read-only project records and controlled browser measurements are needed; the coordinator snapshots records, runs a private browser against a separate viewer, and returns an immutable report. An unavailable report is diagnostic, not a measured baseline. If old test scratch fixtures cannot be removed by the worker, request "cleanup-test-fixtures": the coordinator removes only the reserved .looproom-test-fixtures directory without following symlinks, records that action, then runs the configured checks. These are predefined recipes, never arbitrary shell commands. The coordinator runs disposable isolated verification; the worker permissions stay unchanged. If recorded evidence is missing for an available recipe, request it instead of repeatedly attempting denied commands. Otherwise return verificationRequests: []. Never impersonate a human.
 Goal: ${project.goal}
 Scope/exclusions: ${project.constraints}
 Repository: ${project.path}
@@ -2724,6 +2938,8 @@ Action retry: your specific decision permits continuing within existing capabili
         Judgment,
         task,
         false,
+        undefined,
+        externalContext?.cwd,
       );
       const judgeIntegrityError = this.store.all("run", project.id)
         .filter(run => run.role === "judge" && run.taskId === task?.id).at(-1)?.browserBaselineIntegrityError;
@@ -3006,7 +3222,10 @@ Action retry: your specific decision permits continuing within existing capabili
     for (const project of this.store.all("project")) {
       if (!project.github || !project.branch || this.syncingProjects.has(project.id) ||
           (this.nextRemoteSync.get(project.id) ?? 0) > Date.now()) continue;
-      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" && (["open", "merging"].includes(g.status) || (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id))))
+      if (project.status === "running" || this.store.all("gate", project.id).some(g => g.type === "pr" &&
+          (["open", "merging"].includes(g.status) ||
+           (g.importedFromGitHub && g.status === "resolved" && this.store.get(g.taskId).externalPr?.awaitingUpdate) ||
+           (g.status === "superseded" && this.store.get(g.taskId).prRepair?.gateId === g.id))))
         void this.syncProject(project.id);
     }
     const limit = this.settings().concurrency;
@@ -3072,7 +3291,7 @@ Action retry: your specific decision permits continuing within existing capabili
         if (this.busy.size >= limit) break;
         const key = "task:" + task.id;
         if (
-          task.status !== "ready" ||
+          task.status !== "ready" || task.kind === "external-pr" ||
           this.busy.has(key) ||
           this.store.all("gate", project.id).some((gate) =>
             gate.taskId === task.id && gate.judgeStatus === "running" &&

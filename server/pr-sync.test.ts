@@ -46,6 +46,201 @@ test("external merges clear stale review and immediately dispatch a dependent ex
   } finally { await f.close(); }
 });
 
+async function importedFixture() {
+  const dir = await testFixture("external-pr-import-");
+  const store = new Store(join(dir, "db"));
+  const engine = new Engine(store, Object.assign(new EventEmitter(), { close() {} }) as Runtime, dir);
+  store.put("settings", { concurrency: 1 }, "settings");
+  const project = store.put("project", { status: "paused", path: dir, github: "example/repo",
+    branch: "main", planned: true, escalationMode: "human" });
+  const baseSha = "d".repeat(40);
+  let info: any = { number: 1, url, title: "External fix", baseRefName: "main",
+    baseRefOid: baseSha, headRefOid: head, state: "OPEN", mergeable: "MERGEABLE",
+    statusCheckRollup: [], mergedAt: null, mergeCommit: null };
+  let diff = "diff --git a/file b/file\n+external change\n";
+  let onDiff: (() => void) | undefined;
+  const calls: string[][] = [];
+  engine.mergeBroker = async args => {
+    calls.push(args);
+    if (args[0] === "pr") return JSON.stringify(info);
+    if (args[0] === "api" && args.includes("Accept: application/vnd.github.diff")) {
+      onDiff?.();
+      return diff;
+    }
+    throw new Error("Unexpected GitHub mutation in external PR fixture.");
+  };
+  engine.gitRunner = async () => baseSha;
+  return { dir, store, engine, project, calls, baseSha,
+    setInfo(patch: any) { info = { ...info, ...patch }; },
+    setDiff(value: string) { diff = value; },
+    onDiff(callback?: () => void) { onDiff = callback; },
+    async close() { engine.close(); store.close(); await rm(dir, { recursive: true, force: true }); } };
+}
+
+test("external PR import is idempotent, attributed, and never creates native run or local check claims", async () => {
+  const f = await importedFixture();
+  try {
+    const first = await f.engine.importExternalPr(f.project.id, url);
+    const second = await f.engine.importExternalPr(f.project.id, url);
+    assert.equal(first.task.id, second.task.id);
+    assert.equal(first.gate.id, second.gate.id);
+    assert.equal(first.task.kind, "external-pr");
+    assert.equal(first.task.status, "awaiting_human");
+    assert.equal(first.gate.importedFromGitHub, true);
+    assert.equal(first.gate.sha, head);
+    assert.equal(first.gate.baseSha, f.baseSha);
+    assert.deepEqual(first.task.checks, []);
+    assert.equal(first.task.review, null);
+    assert.equal(f.store.all("run").length, 0);
+    assert.equal(f.store.all("approval").length, 0);
+    assert.equal(f.store.all("gate").length, 1);
+    assert.equal(f.calls.filter(args => args[0] === "pr").length, 4);
+  } finally { await f.close(); }
+});
+
+test("external PR head and base changes get fresh human gates; conflicts never queue worker repair", async () => {
+  const f = await importedFixture();
+  try {
+    const first = await f.engine.importExternalPr(f.project.id, url);
+    f.setInfo({ mergeable: "CONFLICTING" });
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(first.gate.id).status, "open");
+    assert.equal(f.store.get(first.gate.id).remoteObservation.mergeable, "CONFLICTING");
+    assert.equal(f.store.get(first.task.id).status, "awaiting_human");
+    assert.equal(f.store.get(first.task.id).prRepair, undefined);
+    f.setInfo({ baseRefOid: "e".repeat(40), mergeable: "MERGEABLE" });
+    await f.engine.syncProject(f.project.id);
+    const second = f.store.all("gate", f.project.id).find(g => g.status === "open")!;
+    assert.notEqual(second.id, first.gate.id);
+    assert.equal(second.sha, head);
+    assert.equal(second.baseSha, "e".repeat(40));
+    assert.equal(f.store.get(first.gate.id).status, "superseded");
+    f.setInfo({ headRefOid: "f".repeat(40) });
+    const third = await f.engine.importExternalPr(f.project.id, url);
+    assert.equal(third.task.id, first.task.id);
+    assert.notEqual(third.gate.id, second.id);
+    assert.equal(f.store.get(second.id).status, "superseded");
+    assert.equal(f.store.get(third.task.id).status, "awaiting_human");
+    assert.equal(f.store.get(third.task.id).prRepair, undefined);
+    assert.equal(f.store.all("run").length, 0);
+  } finally { await f.close(); }
+});
+
+test("external request changes waits for GitHub revision and does not dispatch a native worker", async () => {
+  const f = await importedFixture();
+  try {
+    const imported = await f.engine.importExternalPr(f.project.id, url);
+    await f.engine.requestChanges(imported.gate.id, head, "Please revise the documentation.");
+    assert.equal(f.store.get(imported.gate.id).status, "resolved");
+    assert.equal(f.store.get(imported.task.id).status, "blocked");
+    assert.equal(f.store.get(imported.task.id).externalPr.awaitingUpdate, true);
+    await assert.rejects(f.engine.importExternalPr(f.project.id, url), /Wait for a new PR head or base/);
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(imported.task.id).status, "blocked");
+    f.setInfo({ headRefOid: "f".repeat(40) });
+    f.engine.nextRemoteSync.set(f.project.id, 0);
+    f.engine.tick();
+    await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(f.store.get(imported.task.id).status, "awaiting_human");
+    assert.equal(f.store.get(imported.task.id).externalPr.awaitingUpdate, undefined);
+    assert.equal(f.store.all("run").length, 0);
+  } finally { await f.close(); }
+});
+
+test("external import rejects remote drift and imported approval rejects an advanced base", async () => {
+  const f = await importedFixture();
+  try {
+    const original = f.engine.mergeBroker;
+    let reads = 0;
+    f.engine.mergeBroker = async args => {
+      const value = await original(args);
+      if (args[0] === "pr" && ++reads === 1) f.setInfo({ headRefOid: "f".repeat(40) });
+      return value;
+    };
+    await assert.rejects(f.engine.importExternalPr(f.project.id, url), /changed during import/);
+    assert.equal(f.store.all("task").length, 0);
+    f.engine.mergeBroker = original;
+    const imported = await f.engine.importExternalPr(f.project.id, url);
+    f.setInfo({ baseRefOid: "e".repeat(40) });
+    await assert.rejects(f.engine.approve(imported.gate.id, "f".repeat(40)), /base changed/);
+    assert.equal(f.store.get(imported.gate.id).status, "open");
+    assert.equal(f.store.all("approval").length, 0);
+    assert.equal(f.calls.filter(args => args[0] === "api" && args.includes("PUT")).length, 0);
+  } finally { await f.close(); }
+});
+
+test("imported diff is pinned to the exact base and head; stale or empty captures fail closed", async () => {
+  const f = await importedFixture();
+  try {
+    const imported = await f.engine.importExternalPr(f.project.id, url);
+    const captured = await f.engine.importedPrDiff(imported.gate.id);
+    assert.match(captured.diff, /external change/);
+    assert.equal(captured.sha, head);
+    assert.equal(captured.baseSha, f.baseSha);
+    assert.ok(f.calls.some(args => args[0] === "api" &&
+      args.some(arg => arg.includes(`/compare/${f.baseSha}...${head}`))));
+    const context = await f.engine.importedPrJudgeContext(f.project, imported.task, imported.gate);
+    assert.notEqual(context.cwd, f.project.path);
+    assert.equal(await readFile(join(context.cwd, context.filename), "utf8"), captured.diff);
+    await writeFile(join(context.cwd, context.filename), "tampered");
+    await assert.rejects(f.engine.importedPrJudgeContext(f.project, imported.task, imported.gate));
+    f.setDiff(" ");
+    await assert.rejects(f.engine.importedPrDiff(imported.gate.id), /no diff/);
+    f.setDiff("diff --git a/file b/file\n+changed\n");
+    f.onDiff(() => f.setInfo({ headRefOid: "f".repeat(40) }));
+    await assert.rejects(f.engine.importedPrDiff(imported.gate.id), /changed while its diff/);
+  } finally { await f.close(); }
+});
+
+test("external close and merge observations preserve their actual provenance without approvals", async () => {
+  const closed = await importedFixture();
+  try {
+    const imported = await closed.engine.importExternalPr(closed.project.id, url);
+    closed.setInfo({ state: "CLOSED", mergeable: "UNKNOWN" });
+    await closed.engine.syncProject(closed.project.id);
+    assert.equal(closed.store.get(imported.gate.id).status, "reconciled");
+    assert.equal(closed.store.get(imported.task.id).status, "cancelled");
+    assert.equal(closed.store.all("approval").length, 0);
+    assert.equal(closed.store.all("run").length, 0);
+  } finally { await closed.close(); }
+  const mergedFixture = await importedFixture();
+  try {
+    const imported = await mergedFixture.engine.importExternalPr(mergedFixture.project.id, url);
+    mergedFixture.setInfo({ state: "MERGED", mergeable: "UNKNOWN", mergedAt: new Date().toISOString(),
+      mergeCommit: { oid: merged } });
+    await mergedFixture.engine.syncProject(mergedFixture.project.id);
+    assert.equal(mergedFixture.store.get(imported.gate.id).status, "reconciled");
+    assert.equal(mergedFixture.store.get(imported.task.id).status, "completed");
+    assert.match(mergedFixture.store.get(imported.gate.id).mergeRecovery, /actor unverified/);
+    assert.equal(mergedFixture.store.all("approval").length, 0);
+    assert.equal(mergedFixture.store.all("run").length, 0);
+  } finally { await mergedFixture.close(); }
+});
+
+test("synthetic exact-head human approval uses the broker with no invented implementation evidence", async () => {
+  const f = await importedFixture();
+  try {
+    const imported = await f.engine.importExternalPr(f.project.id, url);
+    const original = f.engine.mergeBroker;
+    let merges = 0;
+    f.engine.mergeBroker = async args => {
+      if (args.includes("PUT")) {
+        merges++;
+        assert.ok(args.includes("sha=" + head));
+        return JSON.stringify({ merged: true, sha: merged });
+      }
+      return original(args);
+    };
+    await assert.rejects(f.engine.approve(imported.gate.id, "f".repeat(40)), /displayed revision/);
+    assert.equal(merges, 0);
+    await f.engine.approve(imported.gate.id, head);
+    assert.equal(merges, 1);
+    assert.equal(f.store.get(imported.gate.id).status, "approved");
+    assert.equal(f.store.all("approval").length, 1);
+    assert.equal(f.store.all("run").length, 0);
+  } finally { await f.close(); }
+});
+
 test("paused projects reconcile external facts and retain conflict repair until resumed", async () => {
   const f = await fixture("paused");
   try {
