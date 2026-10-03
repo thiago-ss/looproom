@@ -13,10 +13,18 @@ import { runBrowserBaseline, validateBrowserReport, type BrowserAuditReport } fr
 import { loadBrowserSnapshot } from "./browser-snapshot.ts";
 import { inspectRepo, checkApproval, createWorktree, git, gh } from "./git.ts";
 
+// Only the frozen refresh recipe is model-facing. Its explicit keys keep the
+// structured output schema compatible; experiments.ts checks the exact
+// contract again before any candidate or successor is accepted.
+const RefreshThresholds = z.object({
+  minMedianImprovementPercent: z.number(),
+  maxOtherMedianRegressionPercent: z.number(),
+  requiredChecks: z.string(),
+});
 const ExperimentContract = z.object({
   evaluator: z.string().trim().min(1), workload: z.string().trim().min(1),
   runtimeBudget: z.string().trim().min(1),
-  thresholds: z.record(z.string(), z.union([z.string(), z.number()])),
+  thresholds: RefreshThresholds,
   candidateLimit: z.number().int().min(1).max(3),
 });
 const TaskPlan = z.object({
@@ -50,7 +58,7 @@ const Result = z.object({
     outcome: z.enum(["keep", "discard"]), measurement: z.string().trim().min(1),
     evidence: z.array(z.string().trim().min(1)).min(1),
     evaluator: z.string(), workload: z.string(), runtimeBudget: z.string(),
-    thresholds: z.record(z.string(), z.union([z.string(), z.number()])),
+    thresholds: RefreshThresholds,
   }).optional(),
 });
 const Review = z.object({
@@ -222,9 +230,16 @@ export class Engine extends EventEmitter {
     purpose?: "pr-repair" | "merged-pr-followup",
   ) {
     if (task) task = this.store.get(task.id, "task");
+    let browserBaselineIntegrityError: string | undefined;
     if (task?.worktree) {
       await this.handoffBaselineEvidence(project, task);
-      await this.handoffBrowserBaselineEvidence(project, task);
+      try {
+        await this.handoffBrowserBaselineEvidence(project, task);
+      } catch (error) {
+        if (role !== "judge") throw error;
+        browserBaselineIntegrityError = error instanceof Error ? error.message : String(error);
+        prompt += `\nCoordinator browser baseline integrity check failed: ${browserBaselineIntegrityError}. The pinned report, snapshot or artifacts cannot establish a measurement. Treat any existing browser baseline file in this worktree as untrusted; report the exact repair needed without claiming capability success.`;
+      }
     }
     const settings = this.settings(),
       profile =
@@ -288,6 +303,7 @@ export class Engine extends EventEmitter {
         status: "running",
         workflowVersion: "looproom-v1",
         requestedProfile: profile,
+        ...(browserBaselineIntegrityError ? { browserBaselineIntegrityError } : {}),
         output: "",
         createdAt: new Date().toISOString(),
       });
@@ -2234,6 +2250,7 @@ export class Engine extends EventEmitter {
   ) {
     const gate = this.store.get(gateId, "gate");
     if (gate.status !== "open") throw new Error("Gate is already resolved.");
+    if (gate.publicationIntentSha) throw new Error("Coordinator publication confirmation owns this wait.");
     if (actor === "judge" && gate.type === "interrupted")
       throw new Error("Interrupted work requires explicit human resolution.");
     if (gate.type === "pr" && gate.mergeAttempt)
@@ -2259,6 +2276,8 @@ export class Engine extends EventEmitter {
         project = this.store.get(gate.projectId);
       if (current.status !== "open")
         throw new Error("Gate is already resolved.");
+      if (current.publicationIntentSha)
+        throw new Error("Coordinator publication confirmation owns this wait.");
       if (current.type === "experiment" && retry &&
           (!authorizedRoundId || current.experimentRoundId !== this.store.get(authorizedRoundId, "experiment-round").previousRoundId ||
            this.store.get(current.taskId, "task").experimentRoundId !== authorizedRoundId))
@@ -2629,7 +2648,11 @@ export class Engine extends EventEmitter {
     }
   }
   async judge(project: RecordData, gate: RecordData) {
-    if (gate.status !== "open" || this.store.hasOpenInterruption(project.id)) return;
+    gate = this.store.get(gate.id, "gate");
+    // Only the remote publication observer may settle a pushed revision's
+    // machine wait and register its exact-head human PR gate.
+    if (gate.status !== "open" || gate.publicationIntentSha ||
+        this.store.hasOpenInterruption(project.id)) return;
     const task = gate.taskId ? this.store.get(gate.taskId) : undefined;
     if (
       escalationMode(project) === "yolo" &&
@@ -2639,12 +2662,13 @@ export class Engine extends EventEmitter {
       task
     )
       this.store.patch(task.id, { judgeRetries: 0 });
+    const ownedAttempt = (gate.judgeAttempts ?? 0) + 1;
     this.store.patch(gate.id, {
       judgeStatus: "running",
       judgeError: null,
       judgeRecoveryStatus: null,
       judgeRecoveryError: null,
-      judgeAttempts: (gate.judgeAttempts ?? 0) + 1,
+      judgeAttempts: ownedAttempt,
     });
     this.changed("judge-started", { gateId: gate.id }, project.id);
     try {
@@ -2699,6 +2723,12 @@ Action retry: your specific decision permits continuing within existing capabili
         task,
         false,
       );
+      const judgeIntegrityError = this.store.all("run", project.id)
+        .filter(run => run.role === "judge" && run.taskId === task?.id).at(-1)?.browserBaselineIntegrityError;
+      if (judgeIntegrityError)
+        result = { ...result, action: "wait", verificationRequests: [], nextRound: undefined,
+          answer: (result.answer + "\nThe frozen browser baseline failed coordinator integrity checks: " +
+            judgeIntegrityError + ". Preserve the diagnostic and repair the pinned evidence before relying on it.").slice(0, 6000) };
       let browserMeasurementIncomplete = result.verificationRequests.includes("browser-baseline");
       if (
         result.verificationRequests.length &&
@@ -2763,6 +2793,7 @@ Action retry: your specific decision permits continuing within existing capabili
       if (
         result.action === "wait" &&
         gate.type !== "pr" &&
+        !judgeIntegrityError &&
         !browserMeasurementIncomplete &&
         escalationMode(this.store.get(project.id)) === "yolo"
       )
@@ -2776,7 +2807,7 @@ Action retry: your specific decision permits continuing within existing capabili
         .at(-1)!;
       const current = this.store.get(gate.id),
         currentProject = this.store.get(project.id);
-      if (current.status !== "open") return;
+      if (current.status !== "open" || current.publicationIntentSha) return;
       let action = gate.type === "pr" ? "wait" : result.action,
         answer = result.answer;
       if (result.nextRound) {
@@ -2785,7 +2816,7 @@ Action retry: your specific decision permits continuing within existing capabili
             currentProject.status !== "running")
           throw new Error("Next round authorization requires an active YOLO experiment gate and retry decision.");
         const next = this.store.transaction(() => {
-          if (this.store.get(gate.id).status !== "open")
+          if (this.store.get(gate.id).status !== "open" || this.store.get(gate.id).publicationIntentSha)
             throw new Error("Gate is already resolved.");
           const round = authorizeNextRound(this.store, gate.experimentRoundId!, run.id,
             result.nextRound!.hypothesis, result.nextRound!.retryInstruction,
@@ -2820,6 +2851,7 @@ Action retry: your specific decision permits continuing within existing capabili
           "\nThree judge retries did not clear this task. This task remains blocked until its failed prerequisite or unavailable capability changes; independent tasks may continue. Do not repeat the same attempt.";
       }
       this.store.transaction(() => {
+        if (this.store.get(gate.id).publicationIntentSha) return;
         this.store.patch(gate.id, {
           judgeStatus: "answered",
           judgeAnswer: answer,
@@ -2839,6 +2871,7 @@ Action retry: your specific decision permits continuing within existing capabili
           "escalation_draft",
         );
       });
+      if (this.store.get(gate.id).publicationIntentSha) return;
       if (
         gate.type !== "pr" &&
         action !== "wait" &&
@@ -2863,6 +2896,7 @@ Action retry: your specific decision permits continuing within existing capabili
             latestGate = this.store.get(gate.id);
           if (
             latestGate.status !== "open" ||
+            latestGate.publicationIntentSha ||
             escalationMode(latestProject) !== "yolo" ||
             latestProject.status !== "running"
           )
@@ -2906,7 +2940,7 @@ Action retry: your specific decision permits continuing within existing capabili
       );
     } catch (error) {
       const current = this.store.get(gate.id);
-      if (current.status === "open")
+      if (current.status === "open" && !current.publicationIntentSha)
         this.store.patch(gate.id, {
           judgeStatus:
             escalationMode(this.store.get(project.id)) === "yolo" &&
@@ -2924,6 +2958,10 @@ Action retry: your specific decision permits continuing within existing capabili
       this.changed("judge-failed", { gateId: gate.id }, project.id);
     } finally {
       const current = this.store.get(gate.id);
+      if (current.status === "open" && current.publicationIntentSha &&
+          current.judgeStatus === "running" && current.judgeAttempts === ownedAttempt)
+        this.store.patch(gate.id, { judgeStatus: "pending", judgeRecoveryStatus: null,
+          judgeNextAttemptAt: null });
       if (current.status !== "open" && current.judgeStatus === "running")
         this.store.patch(gate.id, {
           judgeStatus: "answered",
@@ -2978,6 +3016,7 @@ Action retry: your specific decision permits continuing within existing capabili
       const judgeKey = "judge:" + project.id;
       if (this.busy.size < limit && !this.busy.has(judgeKey)) {
         const candidate = gates.find((gate) => {
+          if (gate.publicationIntentSha) return false;
           if (gate.judgeStatus === "running") return false;
           if (gate.judgeNextAttemptAt && gate.judgeNextAttemptAt > Date.now())
             return false;

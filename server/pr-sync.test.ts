@@ -377,6 +377,62 @@ test("restart retains publication intent and a changed source cannot gain a revi
   }
 });
 
+test("coordinator publication waits cannot be judged while ordinary gates still dispatch", async () => {
+  const f = await fixture();
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo" });
+    f.store.patch(f.gate.id, { status: "superseded" });
+    const wait = f.store.put("gate", { projectId: f.project.id, taskId: f.task.id,
+      type: "runtime", status: "open", detail: "GitHub has not confirmed the pushed PR revision; preserve it and recheck publication.",
+      awaitingCapability: true, publicationIntentSha: "c".repeat(40) });
+    let judged = 0;
+    await f.engine.judge(f.store.get(f.project.id), wait);
+    assert.equal(f.store.get(wait.id).judgeStatus, undefined);
+    await assert.rejects(f.engine.resolve(wait.id, "skip", false, "judge"), /publication confirmation owns/);
+    const ordinary = f.store.put("gate", { projectId: f.project.id, taskId: f.task.id,
+      type: "decision", status: "open", detail: "Ordinary task decision" });
+    f.engine.nextRemoteSync.set(f.project.id, Date.now() + 60_000);
+    f.engine.judge = async (_project, gate) => { judged++; assert.equal(gate.id, ordinary.id); };
+    f.engine.tick();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(judged, 1);
+    assert.equal(f.store.get(wait.id).status, "open");
+    assert.equal(f.store.all("approval").length, 0);
+  } finally { await f.close(); }
+});
+
+test("a late coordinator publication marker prevents an in-flight judge response", async () => {
+  const f = await publicationFixture();
+  let release!: () => void;
+  try {
+    f.store.patch(f.project.id, { escalationMode: "yolo" });
+    await f.engine.publish(f.store.get(f.project.id), f.store.get(f.task.id));
+    const pushed = await git(f.tree.path, ["rev-parse", "HEAD"]);
+    const gate = f.store.all("gate").find(g => g.type === "runtime" && g.status === "open")!;
+    f.store.patch(gate.id, { publicationIntentSha: null });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    f.engine.run = async () => {
+      await held;
+      f.store.put("run", { projectId: f.project.id, taskId: f.task.id, role: "judge", status: "completed" });
+      return { action: "retry", answer: "Retry", summary: "Retry", sources: [], verificationRequests: [] };
+    };
+    const judging = f.engine.judge(f.store.get(f.project.id), gate);
+    f.store.patch(gate.id, { publicationIntentSha: pushed });
+    f.store.patch(gate.id, { judgeRecoveryStatus: "verifying" });
+    release(); await judging;
+    assert.equal(f.store.get(gate.id).status, "open");
+    assert.equal(f.store.get(gate.id).judgeStatus, "pending");
+    assert.equal(f.store.get(gate.id).judgeRecoveryStatus, null);
+    assert.equal(f.store.all("message").filter(r => r.gateId === gate.id && r.kind === "escalation_response").length, 0);
+    assert.equal(f.store.all("approval").length, 0);
+    f.setObserved(pushed);
+    await f.engine.syncProject(f.project.id);
+    assert.equal(f.store.get(gate.id).status, "resolved");
+    assert.equal(f.store.get(f.task.id).status, "awaiting_human");
+    assert.equal(f.store.all("gate").filter(g => g.type === "pr" && g.status === "open").length, 1);
+  } finally { release?.(); await f.close(); }
+});
+
 test("retargeted approvals and incomplete interrupted merge facts fail closed without a merge PUT", async () => {
   const f = await fixture("paused");
   try {

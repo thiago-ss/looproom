@@ -268,6 +268,39 @@ test("corrupt pinned browser report hash refuses candidate handoff", async () =>
   } finally { await f.close(); }
 });
 
+test("damaged pinned browser evidence reaches judge as a recorded diagnostic while worker and review fail closed", async () => {
+  const f = await fixture();
+  try {
+    const baseline = report(f.project.id, f.dir, true);
+    f.engine.browserAuditRunner = async () => persist(f, baseline);
+    await f.engine.verifyBrowserBaseline(f.project, f.task, f.gate);
+    f.store.patch(f.project.id, { escalationMode: "human", browserBaseline: {
+      ...f.store.get(f.project.id).browserBaseline, reportHash: "0".repeat(64) } });
+    const candidateTree = join(f.dir, "candidate-judge");
+    await mkdir(candidateTree);
+    const candidate = f.store.put("task", { projectId: f.project.id, worktree: candidateTree,
+      status: "blocked", title: "Candidate", acceptance: [], dependencies: [] });
+    const candidateGate = f.engine.gate(f.project.id, "Candidate evidence", "Assess browser evidence", "review", candidate.id);
+    let prompt = "";
+    f.engine.runtime.run = async (options: any) => {
+      prompt = options.prompt;
+      return JSON.stringify({ action: "retry", answer: "Claim measured success", summary: "Untrusted report",
+        sources: [], verificationRequests: [] });
+    };
+    await assert.rejects(f.engine.run(f.store.get(f.project.id), "implementation", "Worker", z.object({}), candidate, true), /pinned hash/);
+    await assert.rejects(f.engine.run(f.store.get(f.project.id), "review", "Review", z.object({}), candidate), /pinned hash/);
+    assert.equal(f.store.all("run").length, 0);
+    await f.engine.judge(f.store.get(f.project.id), candidateGate);
+    const judgeRun = f.store.all("run").findLast(run => run.role === "judge")!;
+    assert.match(judgeRun.browserBaselineIntegrityError, /pinned hash/);
+    assert.match(prompt, /Coordinator browser baseline integrity check failed/);
+    assert.equal(f.store.get(candidateGate.id).judgeAction, "wait");
+    assert.equal(f.store.get(candidateGate.id).status, "open");
+    assert.equal(f.store.all("approval").length, 0);
+    await assert.rejects(readFile(join(candidateTree, ".looproom-verification", "baseline-browser.json")), /ENOENT/);
+  } finally { await f.close(); }
+});
+
 test("candidate handoff rejects corrupted or deleted pinned browser artifacts", async () => {
   const f = await fixture();
   try {
