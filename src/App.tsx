@@ -176,6 +176,11 @@ export default function App() {
   );
   const [view, setView] = useState<View>("goal"),
     [onboarding, setOnboarding] = useState(false);
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const roomFetchRef = useRef(false);
+  const [roomHistoryStatus, setRoomHistoryStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [roomHistoryError, setRoomHistoryError] = useState("");
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
     [inspect, setInspect] = useState<any>(null);
@@ -188,14 +193,27 @@ export default function App() {
   useEffect(() => {
     let loaded = false;
     const stateStream = createStateStream(
-      () => api<Data>("/state"),
+      () => {
+        roomFetchRef.current = viewRef.current === "room";
+        return api<Data>(roomFetchRef.current ? "/state?events=1" : "/state");
+      },
       (state) => {
         setData(state);
         setConnectionError("");
+        if (roomFetchRef.current && viewRef.current === "room") {
+          setRoomHistoryStatus("ready");
+          setRoomHistoryError("");
+        }
         if (!loaded && !state.projects.length) setOnboarding(true);
         loaded = true;
       },
-      (error) => setConnectionError(error.message),
+      (error) => {
+        setConnectionError(error.message);
+        if (roomFetchRef.current && viewRef.current === "room") {
+          setRoomHistoryStatus("error");
+          setRoomHistoryError(error.message);
+        }
+      },
       (onMessage, onError, onOpen) => {
         const events = new EventSource("/api/events");
         events.onmessage = onMessage;
@@ -214,6 +232,15 @@ export default function App() {
       clearInterval(timer);
     };
   }, []);
+  useLayoutEffect(() => {
+    if (view === "room") {
+      setRoomHistoryStatus("loading");
+      setRoomHistoryError("");
+      void refreshRef.current();
+    } else {
+      setRoomHistoryStatus("idle");
+    }
+  }, [view]);
   const project =
     data?.projects.find((project) => project.id === selectedId) ??
     data?.projects[0];
@@ -487,6 +514,13 @@ export default function App() {
                       events={data.events.filter(
                         (event) => event.project_id === project.id,
                       )}
+                      historyStatus={roomHistoryStatus === "idle" ? "loading" : roomHistoryStatus}
+                      historyError={roomHistoryError}
+                      retryHistory={() => {
+                        setRoomHistoryStatus("loading");
+                        setRoomHistoryError("");
+                        void refreshRef.current();
+                      }}
                     />
                   </Suspense>
                 ) : null}

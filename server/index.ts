@@ -169,15 +169,14 @@ runtime.on("disconnected", (error) => {
 app.get("/api/health", (_req, res) =>
   res.json({ app: "looproom", status: "ok", root: appRoot, dataDir: canonicalDataDir }),
 );
-let stateCache:
-  | { storeRevision: number; runtimeRevision: number; json: string }
-  | undefined;
-function stateJson() {
+const stateCache = new Map<boolean, { storeRevision: number; runtimeRevision: number; json: string }>();
+function stateJson(includeEvents: boolean) {
+  const cached = stateCache.get(includeEvents);
   if (
-    stateCache?.storeRevision === store.revision &&
-    stateCache.runtimeRevision === runtimeRevision
+    cached?.storeRevision === store.revision &&
+    cached.runtimeRevision === runtimeRevision
   )
-    return stateCache.json;
+    return cached.json;
   const json = JSON.stringify({
     projects: store.all("project"),
     tasks: store.all("task"),
@@ -186,14 +185,16 @@ function stateJson() {
     messages: store.conversation(),
     runs: store.all("run").map(({ output, ...run }) => run),
     memory: store.all("memory"),
-    events: store.events(),
+    events: includeEvents ? store.events() : [],
     settings: store.get("settings"),
     runtime: runtimeState,
   });
-  stateCache = { storeRevision: store.revision, runtimeRevision, json };
+  stateCache.set(includeEvents, { storeRevision: store.revision, runtimeRevision, json });
   return json;
 }
-app.get("/api/state", (_req, res) => res.type("json").send(stateJson()));
+app.get("/api/state", (req, res) =>
+  res.type("json").send(stateJson(req.query.events === "1")),
+);
 // All SSE clients observe the same invalidation signal. One engine listener and
 // one heartbeat suffice regardless of the number of open browser windows.
 const eventClients = new Set<express.Response>();
