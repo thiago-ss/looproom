@@ -101,10 +101,17 @@ export async function captureBrowserSnapshot(options: { databasePath: string; pr
   if (options.capturePrReview) for (const gate of state.gates) {
     const binding = reviewBinding(gate, state.projects[0]);
     if (!binding) continue;
-    const captured = await options.capturePrReview(binding);
-    const frozen = { ...binding, info: scrub(captured?.info, options.databasePath), diff: scrub(captured?.diff, options.databasePath) } as FrozenPrReview;
-    if (!validReview(binding, frozen)) throw new Error("PR review capture does not match the selected gate URL, head, and base, or exceeds snapshot limits.");
-    review[gate.id] = frozen;
+    try {
+      const captured = await options.capturePrReview(binding);
+      const frozen = { ...binding, info: scrub(captured?.info, options.databasePath), diff: scrub(captured?.diff, options.databasePath) } as FrozenPrReview;
+      if (validReview(binding, frozen)) review[gate.id] = frozen;
+      // An invalid revision is never frozen. Its viewer route remains 404, so
+      // only this gate's Review detail is unavailable; other project records
+      // and successfully bound PR reviews are still captured.
+    } catch {
+      // A read failure has the same scoped unavailable outcome. Do not save
+      // exception text, which may contain credentials or private paths.
+    }
   }
   const base = { id: randomUUID(), projectId: options.projectId, capturedAt: new Date().toISOString(), counts, eventSequence, state, ...(Object.keys(review).length ? { review } : {}) };
   const snapshot: BrowserSnapshot = { ...base, hash: digest(base) };

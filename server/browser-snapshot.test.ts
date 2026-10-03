@@ -56,17 +56,36 @@ test("freezes only revision-matched selected-project PR review and never forward
       assert.equal((await fetch(base + `/api/gates/${gate.id}/pr`, { method: "POST", headers: { cookie } })).status, 405);
       assert.equal(calls, 1, "viewer must use frozen bytes, never call the capture source");
     } finally { await viewer.close(); }
+    const largeDiff = "diff --git a/x b/x\n" + "+x\n".repeat(500_000);
+    const large = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
+      capturePrReview: async () => ({ info: { number: 9, url: pr, headRefOid: "c".repeat(40), baseRefName: "main", baseRefOid: "b".repeat(40), state: "OPEN" }, diff: largeDiff }) });
+    assert.equal(large.review?.[gate.id].diff, largeDiff, "valid diff above one MiB must remain available");
+    assert.equal((await loadBrowserSnapshot(directory, large.id, project.id)).review?.[gate.id].diff.length, largeDiff.length);
+    const largeViewer = await startBrowserViewer({ snapshot: large, distDir: dist });
+    try {
+      const entry = await fetch(largeViewer.url, { redirect: "manual" });
+      const cookie = entry.headers.get("set-cookie")!.split(";")[0];
+      const response = await fetch(new URL(largeViewer.url).origin + `/api/gates/${gate.id}/diff`, { headers: { cookie } });
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).diff, largeDiff);
+    } finally { await largeViewer.close(); }
     const invalid = async (change: Record<string, unknown>) => {
-      await assert.rejects(() => captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
-        capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main", ...change }, diff: "diff" }) }), /does not match/);
+      const unavailable = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
+        capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main", ...change }, diff: "diff" }) });
+      assert.equal(unavailable.review?.[gate.id], undefined, "mismatched revision must never be frozen");
+      assert.equal(unavailable.state.gates.find((item: any) => item.id === gate.id)?.sha, "c".repeat(40));
     };
     await invalid({ url: "https://github.com/example/other/pull/4" });
     await invalid({ headRefOid: sha });
     await invalid({ baseRefName: "other" });
     await invalid({ number: 8 });
     await invalid({ state: "CLOSED" });
-    await assert.rejects(() => captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
-      capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main" }, diff: "" }) }), /does not match/);
+    const missingDiff = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
+      capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main" }, diff: "" }) });
+    assert.equal(missingDiff.review?.[gate.id], undefined);
+    const oversized = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory,
+      capturePrReview: async () => ({ info: { number: 9, state: "OPEN", baseRefOid: "b".repeat(40), url: pr, headRefOid: "c".repeat(40), baseRefName: "main" }, diff: "x".repeat(2_000_001) }) });
+    assert.equal(oversized.review?.[gate.id], undefined);
     const file = join(directory, snapshot.id + ".json");
     const tampered = JSON.parse(await readFile(file, "utf8"));
     tampered.review[gate.id].sha = "c".repeat(40);
@@ -75,6 +94,45 @@ test("freezes only revision-matched selected-project PR review and never forward
     await chmod(file, 0o600);
     await writeFile(file, JSON.stringify(tampered));
     await assert.rejects(() => loadBrowserSnapshot(directory, snapshot.id, project.id), /PR review does not match/);
+  } finally { store.close(); }
+});
+
+test("one PR read failure leaves other actual project records and bound PR review available", async () => {
+  const dir = await testFixture("browser-pr-read-failure-");
+  const databasePath = join(dir, "live.sqlite"), directory = join(dir, "snapshots"), dist = join(dir, "dist");
+  await mkdir(dist);
+  await writeFile(join(dist, "index.html"), "<!doctype html><title>Review</title>");
+  const store = new Store(databasePath);
+  try {
+    const project = store.put("project", { name: "Selected goal", github: "example/project", branch: "main" });
+    const task = store.put("task", { projectId: project.id, title: "Preserved work", status: "running", dependencies: [] });
+    store.put("message", { projectId: project.id, text: "Preserved conversation", createdAt: "2026-10-03T00:00:00Z" });
+    const memory = store.memory(project.id, "Preserved outcome", "Cited project result", ["source-a"]);
+    const sha = "a".repeat(40), baseRefOid = "b".repeat(40);
+    const failed = store.put("gate", { projectId: project.id, taskId: task.id, type: "pr", status: "open", pr: "https://github.com/example/project/pull/9", sha });
+    const available = store.put("gate", { projectId: project.id, taskId: task.id, type: "pr", status: "open", pr: "https://github.com/example/project/pull/10", sha });
+    const snapshot = await captureBrowserSnapshot({ databasePath, projectId: project.id, directory, capturePrReview: async binding => {
+      if (binding.gateId === failed.id) throw new Error("private credential-bearing read failure");
+      return { info: { number: 10, url: available.pr, headRefOid: sha, baseRefName: "main", baseRefOid, state: "OPEN" }, diff: "diff --git a/x b/x\n+one change\n" };
+    } });
+    assert.equal(snapshot.review?.[failed.id], undefined);
+    assert.equal(snapshot.review?.[available.id].info.number, 10);
+    assert.equal(snapshot.state.tasks[0].id, task.id);
+    assert.equal(snapshot.state.messages[0].text, "Preserved conversation");
+    assert.equal(snapshot.state.memory[0].id, memory.id);
+    assert.equal(snapshot.state.gates.length, 2);
+    assert.ok(!JSON.stringify(snapshot).includes("private credential-bearing"));
+    assert.deepEqual(await loadBrowserSnapshot(directory, snapshot.id, project.id), snapshot);
+    const viewer = await startBrowserViewer({ snapshot, distDir: dist });
+    try {
+      const entry = await fetch(viewer.url, { redirect: "manual" });
+      const cookie = entry.headers.get("set-cookie")!.split(";")[0];
+      const base = new URL(viewer.url).origin;
+      const get = (path: string) => fetch(base + path, { headers: { cookie } });
+      assert.equal((await get(`/api/gates/${failed.id}/pr`)).status, 404);
+      assert.equal((await get(`/api/gates/${available.id}/pr`)).status, 200);
+      assert.equal((await get("/api/state")).status, 200);
+    } finally { await viewer.close(); }
   } finally { store.close(); }
 });
 
