@@ -8,6 +8,7 @@ import { Engine } from "./engine.ts";
 import { Runtime } from "./runtime.ts";
 import { createRepo } from "./git.ts";
 import { testFixture } from "./test-fixtures.ts";
+import { sourceFingerprint } from "./verification.ts";
 
 class FixtureRuntime extends EventEmitter {
   binary = "";
@@ -514,7 +515,7 @@ test("planner → isolated worker → check → reviewer preserves artifacts and
     assert.deepEqual(commands, ["test -f result.txt"]);
     assert.equal(await readFile(join(cwd, "result.txt"), "utf8"), "useful work");
     return {
-      id: "fixture-check", sourceHash: "fixture-source", sourceUnchanged: true,
+      id: "fixture-check", sourceHash: await sourceFingerprint(cwd), sourceUnchanged: true,
       reportPath: "fixture-check.json", createdAt: new Date().toISOString(),
       results: [{ command: commands[0], code: 0, output: "Fixture content verified", timedOut: false, durationMs: 1 }],
     };
