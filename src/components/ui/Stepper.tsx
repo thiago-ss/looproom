@@ -78,8 +78,8 @@ export default function Stepper({
         </div>
         {!completed && <div className={`px-8 pb-8 ${footerClassName}`}>
           <div className={`mt-10 flex ${currentStep > 1 ? "justify-between" : "justify-end"}`}>
-            {currentStep > 1 && <Button variant="ghost" {...backRest} className={`setup-back ${backClass}`} onClick={(event) => { backClick?.(event); if (!event.defaultPrevented) goTo(currentStep - 1); }}>{backButtonText}</Button>}
-            <Button variant="ghost" {...nextRest} className={`setup-next ${nextClass}`} onClick={(event) => { nextClick?.(event); if (!event.defaultPrevented) goTo(currentStep + 1); }}>{currentStep === steps.length ? finalButtonText : nextButtonText}</Button>
+            {currentStep > 1 && <Button variant="ghost" {...backRest} className={`setup-back ${backClass}`} onClick={backClick ?? (() => goTo(currentStep - 1))}>{backButtonText}</Button>}
+            <Button variant="ghost" {...nextRest} className={`setup-next ${nextClass}`} onClick={nextClick ?? (() => goTo(currentStep + 1))}>{currentStep === steps.length ? finalButtonText : nextButtonText}</Button>
           </div>
         </div>}
       </div>
