@@ -53,7 +53,7 @@ export function PendingDots({
     query.addEventListener("change", update);
     return () => query.removeEventListener("change", update);
   }, []);
-  const activeAnimation = !reducedMotion && (animated || (hoverAnimated && hovered));
+  const activeAnimation = !reducedMotion && (hoverAnimated ? hovered : animated);
   const dotFill = colorPreset ? presetFills[colorPreset] : color;
   const width = Math.max(minSize ?? 0, boxSize ?? size);
   const visible = (row: number, col: number) => {
