@@ -1,31 +1,7 @@
-/* ReactBits Shiny Text's CSS sweep, mapped to Looproom's text colors. */
-.judge-shine {
-  display: inline-block;
-  color: var(--lr-ink-soft);
-  background: linear-gradient(
-    115deg,
-    var(--lr-ink-soft) 35%,
-    var(--lr-ink) 50%,
-    var(--lr-ink-soft) 65%
-  );
-  background-size: 240% 100%;
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: judge-shine-sweep 2.8s linear infinite;
+/* Original Looproom activity emphasis for a pending judge response. */
+.judge-shine { color: var(--lr-ink-soft); animation: looproom-judging 2.4s ease-in-out infinite; }
+@keyframes looproom-judging {
+  0%, 100% { color: var(--lr-ink-soft); }
+  50% { color: var(--lr-ink); }
 }
-@keyframes judge-shine-sweep {
-  from {
-    background-position: 150% 0;
-  }
-  to {
-    background-position: -50% 0;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .judge-shine {
-    animation: none;
-    background: none;
-    -webkit-text-fill-color: currentColor;
-  }
-}
+@media (prefers-reduced-motion: reduce) { .judge-shine { animation: none; } }

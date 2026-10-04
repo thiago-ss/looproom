@@ -1,0 +1,27 @@
+/* Original Looproom pending indicator. */
+.looproom-dots {
+  display: inline-grid;
+  grid-template-columns: repeat(5, 1fr);
+  grid-template-rows: repeat(5, 1fr);
+  place-items: center;
+  vertical-align: middle;
+  flex: none;
+}
+.looproom-dot {
+  display: block;
+  border-radius: 50%;
+  background: var(--dots-fill, currentColor);
+  opacity: var(--dots-rest);
+  box-shadow: var(--dots-glow);
+}
+.looproom-dots-square .looproom-dot { border-radius: 0; }
+.looproom-dots-diamond .looproom-dot { border-radius: 0; transform: rotate(45deg) scale(.75); }
+.looproom-dots-hearts .looproom-dot { clip-path: path('M 2.5 5 C -2 -1 2 -1 2.5 1 C 3 -1 7 -1 5 3 Z'); }
+.looproom-dot.is-animated { animation: looproom-dot-pulse var(--dots-duration) ease-in-out infinite; }
+@keyframes looproom-dot-pulse {
+  0%, 25%, 100% { opacity: var(--dots-rest); }
+  10% { opacity: var(--dots-peak); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .looproom-dot.is-animated { animation: none; }
+}

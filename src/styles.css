@@ -1,5 +1,5 @@
 @import "tailwindcss";
-@import "./components/dotmatrix-loader.css";
+@import "./components/pending-dots.css";
 @theme inline {
   --color-background: var(--lr-canvas);
   --color-foreground: var(--lr-ink);

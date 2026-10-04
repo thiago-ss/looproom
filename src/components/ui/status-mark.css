@@ -1,0 +1,7 @@
+.status-mark { display: inline-flex; align-items: center; gap: calc(var(--status-size) * .5); vertical-align: middle; line-height: 1; }
+.status-mark svg { flex: none; overflow: visible; }
+.status-mark-spin { transform-origin: 12px 12px; animation: status-mark-rotate var(--status-spin) linear infinite; }
+.status-mark-label { position: relative; font-size: var(--status-font); line-height: 1.25; }
+.status-mark-struck { text-decoration: line-through; text-decoration-thickness: 1px; }
+@keyframes status-mark-rotate { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .status-mark-spin { animation: none; } }

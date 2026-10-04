@@ -1,16 +1,7 @@
+import "./stepper-local.css";
+import { Children, useEffect, useRef, useState, type ButtonHTMLAttributes, type HTMLAttributes, type ReactNode } from "react";
 import { Stepper as ArcStepper } from "../arc/stepper/stepper";
 import { Button } from "./button";
-("use client");
-
-import React, {
-  useState,
-  Children,
-  useRef,
-  useLayoutEffect,
-  type HTMLAttributes,
-  type ReactNode,
-} from "react";
-import { motion, AnimatePresence, type Variants } from "motion/react";
 
 interface StepperProps extends HTMLAttributes<HTMLDivElement> {
   children: ReactNode;
@@ -21,235 +12,81 @@ interface StepperProps extends HTMLAttributes<HTMLDivElement> {
   stepContainerClassName?: string;
   contentClassName?: string;
   footerClassName?: string;
-  backButtonProps?: React.ButtonHTMLAttributes<HTMLButtonElement>;
-  nextButtonProps?: React.ButtonHTMLAttributes<HTMLButtonElement>;
+  backButtonProps?: ButtonHTMLAttributes<HTMLButtonElement>;
+  nextButtonProps?: ButtonHTMLAttributes<HTMLButtonElement>;
   backButtonText?: string;
   nextButtonText?: string;
   finalButtonText?: string;
   disableStepIndicators?: boolean;
-  renderStepIndicator?: (props: {
-    step: number;
-    currentStep: number;
-    onStepClick: (clicked: number) => void;
-  }) => ReactNode;
+  renderStepIndicator?: (props: { step: number; currentStep: number; onStepClick: (clicked: number) => void }) => ReactNode;
 }
 
+const SETUP_LABELS = ["Project", "Runtime", "Goal", "Ready"];
+
 export default function Stepper({
-  children,
-  initialStep = 1,
-  onStepChange = () => {},
-  onFinalStepCompleted = () => {},
-  stepCircleContainerClassName = "",
-  stepContainerClassName = "",
-  contentClassName = "",
-  footerClassName = "",
-  backButtonProps = {},
-  nextButtonProps = {},
-  backButtonText = "Back",
-  nextButtonText = "Continue",
-  finalButtonText = "Complete",
-  disableStepIndicators = false,
-  ...rest
+  children, initialStep = 1, onStepChange, onFinalStepCompleted,
+  stepCircleContainerClassName = "", stepContainerClassName = "",
+  contentClassName = "", footerClassName = "", backButtonProps = {},
+  nextButtonProps = {}, backButtonText = "Back", nextButtonText = "Continue",
+  finalButtonText = "Complete", disableStepIndicators = false,
+  renderStepIndicator, className = "", ...rest
 }: StepperProps) {
-  const [currentStep, setCurrentStep] = useState<number>(initialStep);
-  const [direction, setDirection] = useState<number>(0);
-  const stepsArray = Children.toArray(children);
-  const totalSteps = stepsArray.length;
-  const isCompleted = currentStep > totalSteps;
-  const isLastStep = currentStep === totalSteps;
+  const steps = Children.toArray(children);
+  const [currentStep, setCurrentStep] = useState(initialStep);
+  const [direction, setDirection] = useState<"forward" | "back">("forward");
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [height, setHeight] = useState<number>();
+  const completed = currentStep > steps.length;
 
-  const updateStep = (newStep: number) => {
-    setCurrentStep(newStep);
-    if (newStep > totalSteps) {
-      onFinalStepCompleted();
-    } else {
-      onStepChange(newStep);
-    }
-  };
+  useEffect(() => {
+    const content = contentRef.current;
+    if (!content || completed) return;
+    const measure = () => setHeight(content.getBoundingClientRect().height);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [currentStep, completed]);
 
-  const handleBack = () => {
-    if (currentStep > 1) {
-      setDirection(-1);
-      updateStep(currentStep - 1);
-    }
-  };
+  function goTo(next: number) {
+    if (next < 1 || next > steps.length + 1 || next === currentStep) return;
+    setDirection(next < currentStep ? "back" : "forward");
+    setCurrentStep(next);
+    if (next > steps.length) onFinalStepCompleted?.();
+    else onStepChange?.(next);
+  }
 
-  const handleNext = () => {
-    if (!isLastStep) {
-      setDirection(1);
-      updateStep(currentStep + 1);
-    }
-  };
-
-  const handleComplete = () => {
-    setDirection(1);
-    updateStep(totalSteps + 1);
-  };
+  const { className: backClass = "", onClick: backClick, ...backRest } = backButtonProps;
+  const { className: nextClass = "", onClick: nextClick, ...nextRest } = nextButtonProps;
+  const progressSteps = steps.map((_, index) => ({ id: String(index), label: SETUP_LABELS[index] ?? `Step ${index + 1}` }));
 
   return (
-    <div className="setup-wizard" {...rest}>
+    <div {...rest} className={`setup-wizard ${className}`.trim()}>
       <div className={stepCircleContainerClassName}>
-        <div
-          className={`${stepContainerClassName} flex w-full items-center p-8`}
-        >
-          <ArcStepper
-            current={currentStep - 1}
-            compact
-            label="Project setup progress"
-            steps={["Project", "Runtime", "Goal", "Ready"].map(
-              (label, index) => ({ id: String(index), label }),
-            )}
-          />
+        <div className={`${stepContainerClassName} flex w-full items-center p-8`}>
+          <ArcStepper current={Math.min(currentStep - 1, steps.length - 1)} compact label="Project setup progress" steps={progressSteps} />
         </div>
-
-        <StepContentWrapper
-          isCompleted={isCompleted}
-          currentStep={currentStep}
-          direction={direction}
-          className={`space-y-2 px-8 ${contentClassName}`}
-        >
-          {stepsArray[currentStep - 1]}
-        </StepContentWrapper>
-
-        {!isCompleted && (
-          <div className={`px-8 pb-8 ${footerClassName}`}>
-            <div
-              className={`mt-10 flex ${currentStep !== 1 ? "justify-between" : "justify-end"}`}
-            >
-              {currentStep !== 1 && (
-                <Button
-                  variant="ghost"
-                  onClick={handleBack}
-                  className={`duration-350 rounded px-2 py-1 transition ${
-                    currentStep === 1
-                      ? "pointer-events-none opacity-50 text-neutral-400"
-                      : "text-neutral-400 hover:text-neutral-700"
-                  }`}
-                  {...backButtonProps}
-                >
-                  {backButtonText}
-                </Button>
-              )}
-              <Button
-                variant="ghost"
-                onClick={isLastStep ? handleComplete : handleNext}
-                className="duration-350 flex items-center justify-center rounded-full bg-green-500 py-1.5 px-3.5 font-medium tracking-tight text-white transition hover:bg-green-600 active:bg-green-700"
-                {...nextButtonProps}
-              >
-                {isLastStep ? finalButtonText : nextButtonText}
-              </Button>
-            </div>
-          </div>
+        {!disableStepIndicators && renderStepIndicator && (
+          <div className="flex gap-2 px-8">{steps.map((_, index) => (
+            <span key={index}>{renderStepIndicator({ step: index + 1, currentStep, onStepClick: goTo })}</span>
+          ))}</div>
         )}
+        <div className={`stepper-content space-y-2 px-8 ${contentClassName}`} style={{ height: completed ? 0 : height }}>
+          {!completed && <div key={currentStep} ref={contentRef} className="stepper-panel" data-direction={direction}>
+            {steps[currentStep - 1]}
+          </div>}
+        </div>
+        {!completed && <div className={`px-8 pb-8 ${footerClassName}`}>
+          <div className={`mt-10 flex ${currentStep > 1 ? "justify-between" : "justify-end"}`}>
+            {currentStep > 1 && <Button variant="ghost" {...backRest} className={`setup-back ${backClass}`} onClick={backClick ?? (() => goTo(currentStep - 1))}>{backButtonText}</Button>}
+            <Button variant="ghost" {...nextRest} className={`setup-next ${nextClass}`} onClick={nextClick ?? (() => goTo(currentStep + 1))}>{currentStep === steps.length ? finalButtonText : nextButtonText}</Button>
+          </div>
+        </div>}
       </div>
     </div>
   );
 }
 
-interface StepContentWrapperProps {
-  isCompleted: boolean;
-  currentStep: number;
-  direction: number;
-  children: ReactNode;
-  className?: string;
-}
-
-function StepContentWrapper({
-  isCompleted,
-  currentStep,
-  direction,
-  children,
-  className = "",
-}: StepContentWrapperProps) {
-  const [parentHeight, setParentHeight] = useState<number>(0);
-
-  return (
-    <motion.div
-      style={{ position: "relative", overflow: "hidden" }}
-      animate={{ height: isCompleted ? 0 : parentHeight }}
-      transition={{ type: "spring", duration: 0.4 }}
-      className={className}
-    >
-      <AnimatePresence initial={false} mode="sync" custom={direction}>
-        {!isCompleted && (
-          <SlideTransition
-            key={currentStep}
-            direction={direction}
-            onHeightReady={(h) => setParentHeight(h)}
-          >
-            {children}
-          </SlideTransition>
-        )}
-      </AnimatePresence>
-    </motion.div>
-  );
-}
-
-interface SlideTransitionProps {
-  children: ReactNode;
-  direction: number;
-  onHeightReady: (height: number) => void;
-}
-
-function SlideTransition({
-  children,
-  direction,
-  onHeightReady,
-}: SlideTransitionProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-
-  useLayoutEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
-    const measure = () => onHeightReady(container.offsetHeight);
-    const observer = new ResizeObserver(measure);
-    observer.observe(container);
-    measure();
-    return () => observer.disconnect();
-  }, [onHeightReady]);
-
-  return (
-    <motion.div
-      ref={containerRef}
-      custom={direction}
-      variants={stepVariants}
-      initial="enter"
-      animate="center"
-      exit="exit"
-      transition={{ duration: 0.4 }}
-      style={{
-        position: "absolute",
-        left: 0,
-        right: 0,
-        top: 0,
-        display: "flow-root",
-        paddingBottom: 4,
-      }}
-    >
-      {children}
-    </motion.div>
-  );
-}
-
-const stepVariants: Variants = {
-  enter: (dir: number) => ({
-    x: dir >= 0 ? "-100%" : "100%",
-    opacity: 0,
-  }),
-  center: {
-    x: "0%",
-    opacity: 1,
-  },
-  exit: (dir: number) => ({
-    x: dir >= 0 ? "50%" : "-50%",
-    opacity: 0,
-  }),
-};
-
-interface StepProps {
-  children: ReactNode;
-}
-
-export function Step({ children }: StepProps) {
+export function Step({ children }: { children: ReactNode }) {
   return <div className="px-8">{children}</div>;
 }
